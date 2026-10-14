@@ -1,0 +1,17 @@
+{
+  "version": "0.1.0",
+  "kind": "source-and-binary-distribution",
+  "platform": "Nintendo Switch",
+  "technology": [
+    "ReXGlue",
+    "ARM64",
+    "Vulkan",
+    "NVK/Mesa"
+  ],
+  "game_data_included": false,
+  "ready_files": [
+    "Prototype2-NX.zip",
+    "Prototype2-forwarder.nsp"
+  ],
+  "binary_distribution": "GitHub Releases"
+}

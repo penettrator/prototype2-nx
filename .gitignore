@@ -1,0 +1,25 @@
+# Prototype 2 0.1.0: commercial data and generated game code are never published.
+assets/
+project/generated/
+reference/
+tools/bin/
+build/
+out/
+logs/
+release/
+*.iso
+*.xex
+*.rcf
+*.nro
+*.nsp
+*.elf
+*.keys
+prod.keys
+title.keys
+__pycache__/
+.idea/
+.vscode/
+
+# Ready-to-use public launcher, explicitly included in this repository.
+!/Prototype2-forwarder.nsp
+!/Prototype2-NX.zip
