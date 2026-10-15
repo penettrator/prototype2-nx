@@ -1,4 +1,4 @@
-# Prototype 2 / Nintendo Switch — version 0.1.0
+# Prototype 2 / Nintendo Switch — version 0.2.0
 # Release settings; diagnostics disabled. / Диагностика выключена.
 render_target_path_vulkan = "fsi"
 user_language = 12
@@ -74,17 +74,20 @@ p2_skinning_helper_mask = 8
 p2_shadow_range_scale = 0.3
 p2_gpu_wait_diagnostics = false
 p2_native_async_present = false
-p2_render_width = 640
-p2_render_height = 352
+p2_render_width = 800
+p2_render_height = 448
 present_effect = "fsr"
 p2_native_texture_lod_bias = 1.0
 p2_skin_dup_stats = false
 p2_audio_engine_mask = 8
 p2_audio_engine_priority = 41
+p2_skin_trace_frames = 0
+p2_skin_half_rate = false
+achievement_notifications = false
+input_screenshot_shortcut = true
+p2_native_texture_cache_mb = 128
 p2_occlusion_native_verify = 0
 present_painted_profile = false
-vulkan_log_debug_messages = false
-vulkan_validation_enabled = false
 log_verbose = false
 log_noisy = false
 log_level = "warn"
@@ -94,5 +97,4 @@ p2_native_capture_combo = false
 p2_native_water_sim_trace = false
 p2_native_trace_vs = ""
 p2_native_trace_ps = ""
-p2_skin_cache = true
-p2_native_skin_unique = true
+p2_native_sync_color_lut = true

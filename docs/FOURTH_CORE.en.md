@@ -1,4 +1,4 @@
-# Fourth CPU core — Prototype 2, 0.1.0
+# Fourth CPU core — Prototype 2, 0.2.0
 
 [Русский](FOURTH_CORE.ru.md)
 

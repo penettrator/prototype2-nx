@@ -73652,20 +73652,23 @@ diff --git a/sdk/src/graphics/vulkan/render_target_cache.cpp b/sdk/src/graphics/
 diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch/switch_input_driver.cpp
 --- a/sdk/src/input/switch/switch_input_driver.cpp
 +++ b/sdk/src/input/switch/switch_input_driver.cpp
-@@ -40,6 +40,12 @@
+@@ -40,6 +40,15 @@
                        "Record pad 1 to this file (e.g. sdmc:/switch/masseffect-nx/route.tsv) between two MINUS presses");
  REXCVAR_DEFINE_STRING(input_play, "", "Input",
                        "Play this recorded file (input_record) back as pad 1, starting at the next MINUS press");
 +
 +// Release builds ship with this off: players press L+R with the D-pad in normal play and would open the
 +// debug overlay, console, settings, A/B lap or screenshot by accident (see DispatchMenuShortcuts).
++REXCVAR_DEFINE_BOOL(input_screenshot_shortcut, true, "Input",
++                    "Allow L+R+ZR screenshots independently of debug menu shortcuts");
++
 +REXCVAR_DEFINE_BOOL(input_menu_shortcuts, false, "Input",
 +                    "L+R combinations open the debug overlay, settings, console, achievements, GPU A/B lap "
 +                    "and screenshot. false = off (release)");
  
  namespace rex::ui {
  // rex/ui/overlay/debug_overlay.h (not included here because it pulls in ImGui).
-@@ -457,6 +463,8 @@
+@@ -457,6 +466,8 @@
  }
  
  
@@ -73674,29 +73677,19 @@ diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch
  /* From the profiler (switch_perf.cpp): turns the GPU A/B test lap on and off. */
  extern "C" void RexSwitchPerfToggleAb(void);
  /*
-@@ -479,6 +487,10 @@
+@@ -479,11 +490,30 @@
   * slot.menu_shortcuts with the state from the previous poll.
   */
  void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
-+  if (!REXCVAR_GET(input_menu_shortcuts)) {
-+    slot.menu_shortcuts = 0;
-+    return;
-+  }
-   struct Shortcut {
-     uint64_t button;
-     rex::ui::VirtualKey keystroke;
-@@ -531,6 +543,21 @@
-   }
-   slot.menu_shortcuts = ab_now ? (slot.menu_shortcuts | kBitAb)
-                                  : (slot.menu_shortcuts & ~kBitAb);
-+
++  constexpr uint64_t kModifier = HidNpadButton_L | HidNpadButton_R;
++  const bool modifier = (held & kModifier) == kModifier;
 +  /*
 +   * L+R+ZR asks the app for a screenshot (RexSwitchScreenshotRequest, weak: titles
 +   * without it ignore the combo). Called on this thread: an app thread of its own
 +   * failed to start (the process is at its thread limit).
 +   */
 +  const uint64_t kBitShot = uint64_t(1) << 9;
-+  const bool shot_now = modifier && (held & HidNpadButton_ZR) != 0;
++  const bool shot_now = REXCVAR_GET(input_screenshot_shortcut) && modifier && (held & HidNpadButton_ZR) != 0;
 +  const bool shot_before = (slot.menu_shortcuts & kBitShot) != 0;
 +  if (shot_now && !shot_before && RexSwitchScreenshotRequest) {
 +    RexSwitchScreenshotRequest();
@@ -73704,6 +73697,32 @@ diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch
 +  }
 +  slot.menu_shortcuts = shot_now ? (slot.menu_shortcuts | kBitShot)
 +                                 : (slot.menu_shortcuts & ~kBitShot);
++  if (!REXCVAR_GET(input_menu_shortcuts)) {
++    slot.menu_shortcuts &= uint64_t(1) << 9;
++    return;
++  }
+   struct Shortcut {
+     uint64_t button;
+     rex::ui::VirtualKey keystroke;
+   };
+-  constexpr uint64_t kModifier = HidNpadButton_L | HidNpadButton_R;
+   static const Shortcut kShortcuts[] = {
+       {HidNpadButton_Up, rex::ui::VirtualKey::kF3},
+       {HidNpadButton_Right, rex::ui::VirtualKey::kF4},
+@@ -491,7 +521,6 @@
+       {HidNpadButton_Left, rex::ui::VirtualKey::kF7},
+   };
+ 
+-  const bool modifier = (held & kModifier) == kModifier;
+   for (size_t i = 0; i < std::size(kShortcuts); ++i) {
+     const uint64_t bit = uint64_t(1) << i;
+     const bool now = modifier && (held & kShortcuts[i].button) != 0;
+@@ -531,6 +560,8 @@
+   }
+   slot.menu_shortcuts = ab_now ? (slot.menu_shortcuts | kBitAb)
+                                  : (slot.menu_shortcuts & ~kBitAb);
++
++
  }
  
  SwitchInputDriver::Slot* SwitchInputDriver::FindSlot(DeviceId id) {
@@ -74540,3 +74559,42 @@ diff --git a/sdk/src/ui/vulkan/vulkan_submission_tracker.cpp b/sdk/src/ui/vulkan
    // The tracker itself can't give a submission index for a submission that
    // hasn't even started being recorded yet, the client has provided a
    // completely invalid value or has done overly optimistic math if such an
+diff --git a/sdk/src/ui/rex_app.cpp b/sdk/src/ui/rex_app.cpp
+--- a/sdk/src/ui/rex_app.cpp
++++ b/sdk/src/ui/rex_app.cpp
+@@ -68,6 +68,16 @@
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++#if REX_PLATFORM_SWITCH
++REXCVAR_DEFINE_BOOL(achievement_notifications, false, "UI",
++                    "Show achievement popups (requires restart)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#else
++REXCVAR_DEFINE_BOOL(achievement_notifications, true, "UI",
++                    "Show achievement popups (requires restart)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#endif
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -87,7 +97,7 @@
+ }
+ 
+ std::unique_ptr<ui::AchievementNotificationDialog> ReXApp::CreateAchievementNotificationDialog() {
+-  if (!imgui_drawer_ || !immediate_drawer_ || !runtime_) {
++  if (!REXCVAR_GET(achievement_notifications) || !imgui_drawer_ || !immediate_drawer_ || !runtime_) {
+     return nullptr;
+   }
+   return std::make_unique<ui::AchievementToastDialog>(imgui_drawer_.get(), immediate_drawer_.get(),
+@@ -481,7 +491,8 @@
+      * session. By creating it only when the first event arrives, the game presents every frame it
+      * renders.
+      */
+-    if (achievement_notification_listener_ == 0 && runtime_ && runtime_->kernel_state()) {
++    if (REXCVAR_GET(achievement_notifications) && achievement_notification_listener_ == 0 &&
++        runtime_ && runtime_->kernel_state()) {
+       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
+           [this](const rex::system::AchievementEvent& event) {
+             rex::system::AchievementEvent copy = event;

@@ -1,4 +1,4 @@
-# Prototype 2 for Nintendo Switch — 0.1.0
+# Prototype 2 for Nintendo Switch — 0.2.0
 
 [Русский](README.md)
 
@@ -61,8 +61,10 @@ File: **`SD:/switch/Prototype2/prototype2.toml`**. Fully close and restart the g
 | Setting | Default | Meaning |
 |---|---|---|
 | `user_language` | `12` | `12` — Russian, `1` — English; availability depends on your game edition |
-| `p2_render_width`, `p2_render_height` | `640`, `352` | Internal resolution |
+| `p2_render_width`, `p2_render_height` | `800`, `448` | Internal resolution |
 | `present_effect` | `"fsr"` | FSR 1 upscaling |
+| `achievement_notifications` | `false` | Achievement popups are disabled |
+| `p2_native_texture_cache_mb` | `128` | Retention budget for idle texture payload, MiB |
 
 When updating, replace the port files. You do not need to copy `game_root` again. Back up your edited settings before replacing the TOML.
 

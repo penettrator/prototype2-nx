@@ -1,4 +1,4 @@
-# Сборка Prototype 2 — 0.1.0
+# Сборка Prototype 2 — 0.2.0
 
 [English](BUILD.en.md)
 
@@ -23,7 +23,7 @@ git -C reference/mesa-switch-src apply ../../patches/mesa-switch.patch
 python tools/materialize_dependency_links.py
 ```
 
-SDK-патч включает56 изменённых/добавленных файлов, в том числе совместимые ARM64/потоки/рендерер/очередь вывода. SDK и Mesa не входят готовыми библиотеками в исходный пакет. Сохраняйте глобальное определение `REX_HAS_FIDELITYFX_SDK=1` в switch/CMakeLists: оно влияет на layout класса Presenter, поэтому при изменении требуется полная пересборка всех зависимых целей.
+SDK-патч включает57 изменённых/добавленных файлов, в том числе совместимые ARM64/потоки/рендерер/очередь вывода. SDK и Mesa не входят готовыми библиотеками в исходный пакет. Сохраняйте глобальное определение `REX_HAS_FIDELITYFX_SDK=1` в switch/CMakeLists: оно влияет на layout класса Presenter, поэтому при изменении требуется полная пересборка всех зависимых целей.
 
 ## 2. Данные и кодогенерация
 
@@ -51,17 +51,17 @@ Docker создаёт toolchain image и статический драйвер �
 bash tools/build_switch.sh
 ```
 
-По умолчанию8compile jobs, изменить можно `JOBS=4 bash tools/build_switch.sh`. Используются guest LTO, защищённые direct calls, ARM integer VMX и leaf locals; stack audit выключен. Скрипт создаёт `build/switch/prototype2.nro` версии0.1.0. Производный hot-код генерируется перед сборкой. Для full-rebuild удаляйте только собственный каталог build, а не игровые данные.
+По умолчанию8compile jobs, изменить можно `JOBS=4 bash tools/build_switch.sh`. Используются guest LTO, защищённые direct calls, ARM integer VMX и leaf locals; stack audit выключен. Скрипт создаёт `build/switch/prototype2.nro` версии0.2.0. Производный hot-код генерируется перед сборкой. Для full-rebuild удаляйте только собственный каталог build, а не игровые данные.
 
 ## 5. Пакет
 
-Поместите NRO и `config/prototype2.toml` в `switch/Prototype2/`, добавьте VERSION0.1.0, лицензии и двуязычные инструкции. Для публичного релиза не добавляйте game_root, prod.keys/title.keys, личные сохранения/журналы. Для собственной установки добавьте данные своего диска отдельно. Метод title takeover не требует NSP-форвардера. Готовые пакеты пользователей выпускаются с контрольными суммами.
+Поместите NRO и `config/prototype2.toml` в `switch/Prototype2/`, добавьте VERSION0.2.0, лицензии и двуязычные инструкции. Для публичного релиза не добавляйте game_root, prod.keys/title.keys, личные сохранения/журналы. Для собственной установки добавьте данные своего диска отдельно. Метод title takeover не требует NSP-форвардера. 
 
 ## Структура исходников
 
-`project/src` — ручные хуки/нативный renderer; `switch` — CMake/Horizon; `tools` — кодогенерация/сборка/проверки; `patches` — изменения SDK/Mesa; `config` — профиль0.1.0; `docs` — RU/EN. Ни одна сборка автоматически не подключается к Switch и не перезаписывает SD.
+`project/src` — ручные хуки/нативный renderer; `switch` — CMake/Horizon; `tools` — кодогенерация/сборка/проверки; `patches` — изменения SDK/Mesa; `config` — профиль0.2.0; `docs` — RU/EN. Ни одна сборка автоматически не подключается к Switch и не перезаписывает SD.
 
-## NSP-форвардер 0.1.0
+## NSP-форвардер 0.2.0
 
 После сборки NRO с иконкой/NACP используйте Git Bash, Git, Docker и собственный prod.keys:
 
@@ -69,6 +69,13 @@ bash tools/build_switch.sh
 SWITCH_PROD_KEYS=/path/to/your/prod.keys bash tools/build_forwarder.sh build/switch/prototype2.nro build/forwarder
 ```
 
-Получится `build/forwarder/Prototype2-forwarder.nsp`. Title ID `0150524F54320000`, путь `sdmc:/switch/Prototype2/prototype2.nro`, 39-bit, ядра0–3. Скрипт проверяет обе таблицы NPDM и версию NACP0.1.0. Ключи подключаются к контейнеру только для чтения и не входят в релиз; вывод упаковщика с ключами не печатается. Исходники Forwarder-Mod/hacBrewPack закреплены на коммитах в скрипте.
+Получится `build/forwarder/Prototype2-forwarder.nsp`. Title ID `0150524F54320000`, путь `sdmc:/switch/Prototype2/prototype2.nro`, 39-bit, ядра0–3. Скрипт проверяет обе таблицы NPDM и версию NACP0.2.0. Ключи подключаются к контейнеру только для чтения и не входят в релиз; вывод упаковщика с ключами не печатается. Исходники Forwarder-Mod/hacBrewPack закреплены на коммитах в скрипте.
 
 По умолчанию используются `P2_RELEASE_DIAGNOSTICS_OFF=ON`, `P2_TASK_LIFETIME_AUDIT=OFF` и `P2_GUEST_STACK_AUDIT=OFF`. Модуль `switch/release_perf.cpp` передаёт только базовый FPS/режим; записи профилей и sampler не запускаются. Защищённые функции перечислены в `config/strong-overrides.json`; приватный архив NRO для сборки не требуется.
+
+
+## PGO
+
+`tools/build_switch.sh` по умолчанию использует `PGO=USE` и 222 профиля GCC из `config/pgo-data`. Оптимизируются гостевой код и нативная часть приложения; в готовом NRO нет обучающего дампера gcov. Для совместимости профилей используйте GCC 15.2 и Docker-разметку `/work`, заданную скриптом. Файлы профилей содержат счётчики компилятора, игровых данных в них нет.
+
+Обычная сборка без PGO: `PGO=OFF bash tools/build_switch.sh`. Для самостоятельного обучения: `PGO=GEN bash tools/build_switch.sh`, запустите полученный NRO и поиграйте в разных сценах; профили записываются в `SD:/pgo/` раз в три минуты. Скопируйте `.gcda` в `config/pgo-data/` и повторите сборку с `PGO=USE`. Стадии GEN/USE должны использовать совместимые исходники, компилятор и один каталог сборки. GEN использует только счётчики переходов (`-fno-profile-values`), а USE — коррекцию непоследовательных счётчиков. Обучающая запись может надолго задерживать игру; её FPS не сравнивают с готовой сборкой.

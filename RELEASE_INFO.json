@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "kind": "source-and-binary-distribution",
   "platform": "Nintendo Switch",
   "technology": [
@@ -13,5 +13,12 @@
     "Prototype2-NX.zip",
     "Prototype2-forwarder.nsp"
   ],
-  "binary_distribution": "GitHub Releases"
+  "binary_distribution": "GitHub Releases",
+  "resolution": [
+    800,
+    448
+  ],
+  "upscaling": "FSR 1",
+  "optimization": "PGO USE",
+  "achievement_notifications": false
 }
