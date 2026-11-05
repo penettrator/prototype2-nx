@@ -8,6 +8,8 @@
 
 #include "native_textures.h"
 #include "texture_eviction.h"
+#include "staging_reuse_pool.h"
+#include "staging_reuse_stats.h"
 #include "native_vk_extra.h"
 #include "native_hash.h"
 #include "composite_tile_index.h"
@@ -496,6 +498,10 @@ struct StreamJob {
   VkBuffer staging_buffer = VK_NULL_HANDLE;
   VkDeviceMemory staging_memory = VK_NULL_HANDLE;
   VkDeviceSize staging_size = 0;
+  VkDeviceSize staging_capacity = 0;
+  VkDeviceSize staging_bytes = 0;
+  void* staging_mapping = nullptr;
+  uint32_t staging_memory_type = 0;
   std::atomic<bool> done{false};
   bool ok = false;
 };
@@ -515,6 +521,9 @@ REXCVAR_DEFINE_BOOL(p2_native_targeted_memo, true, "Prototype2",
 REXCVAR_DEFINE_BOOL(p2_native_sync_color_lut, true, "Prototype2",
                     "Upload small RGBA 3D grading LUTs immediately after a long menu, "
                     "instead of drawing a black scene while ordinary textures stream");
+REXCVAR_DEFINE_BOOL(p2_native_sync_video_planes, false, "Prototype2",
+                    "Create the cutscene video planes (linear 8-bit, one mip) immediately instead of streaming "
+                    "them: streamed, the first video frame was drawn with empty planes (a green flash)");
 REXCVAR_DEFINE_BOOL(p2_native_3d_textures, true, "Prototype2",
                     "Upload 3D (volume) textures as Vulkan 3D images (Prototype 2 colour grading LUT). "
                     "false = drawn with an empty texture, as before");
@@ -545,6 +554,13 @@ REXCVAR_DEFINE_UINT32(p2_native_sync_texture_creates, kSyncCreatesPerFrame, "Pro
                       "missing for a frame or two)");
 REXCVAR_DEFINE_UINT32(p2_native_sync_texture_kb, 32, "Prototype2",
                       "Largest new texture (KB of host data) made on the spot");
+REXCVAR_DEFINE_BOOL(p2_frame_pacing_report, false, "Prototype2",
+    "Optional 10-second frame-interval and staging-reuse CSV report; no stack sampling");
+extern "C" bool P2LightFrameReportEnabled() { return staging_reuse_counters.report_enabled.load(std::memory_order_acquire); }
+REXCVAR_DEFINE_UINT32(p2_native_staging_pool_mb, 0, "Prototype2",
+    "MiB of GPU-complete texture upload buffers retained for reuse; 0 = old allocation path. "
+    "Restart required; active uploads are additional")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(p2_native_texture_pool, false, "Prototype2",
                     "HANDOFF B:131: guest textures share 64 MB device memory blocks instead of one "
                     "allocation each (an allocation is several kernel round trips, ~3 ms per new "
@@ -559,6 +575,9 @@ REXCVAR_DEFINE_UINT32(p2_native_sync_texture_frame_kb, 0, "Prototype2",
 // Every one beyond the per-frame budget, however small: under 1 KB they were
 // all made on the spot, and a level load made 116 in one frame (180 ms).
 constexpr VkDeviceSize kStreamBytes = 0;
+
+REXCVAR_DEFINE_BOOL(p2_native_reap_unused_streams, true, "Prototype2",
+    "Release completed, never-submitted texture uploads unused for 600 frames; rollback=false");
 
 REXCVAR_DEFINE_UINT32(p2_native_texture_cache_mb, 128, "Prototype2",
     "Keep idle material textures while the cached host payload is below this many MiB; "
@@ -802,32 +821,87 @@ struct TextureCache::Impl {
         stream_jobs.pop_front();
       }
       job->ok = CreateTextureImage(job->info, job->image, job->memory);
+      if (job->ok) job->ok = AcquireStreamStaging(*job);
       if (job->ok) {
-        job->ok = rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            device, job->staging_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            rex::ui::vulkan::util::MemoryPurpose::kUpload, job->staging_buffer,
-            job->staging_memory);
-      }
-      void* mapping = nullptr;
-      if (job->ok && device->functions().vkMapMemory(device->device(), job->staging_memory, 0,
-                                                     VK_WHOLE_SIZE, 0, &mapping) != VK_SUCCESS) {
-        job->ok = false;
-      }
-      if (job->ok) {
-        job->untile.staging = static_cast<uint8_t*>(mapping);
+        job->untile.staging = static_cast<uint8_t*>(job->staging_mapping);
         RunUntile(job->untile);
+        rex::ui::vulkan::util::FlushMappedMemoryRange(device, job->staging_memory,
+            job->staging_memory_type, 0, job->staging_bytes, job->staging_size);
       }
       job->done.store(true, std::memory_order_release);
     }
   }
 
-  void DestroyStreamJob(StreamJob& job) {
+  struct StagingBlock {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapping = nullptr;
+    uint64_t capacity = 0;
+    uint64_t bytes = 0;
+    uint32_t memory_type = 0;
+  };
+  std::mutex staging_pool_mutex;
+  StagingReusePool<StagingBlock> staging_pool;
+  uint64_t staging_pool_budget = 0;
+  bool staging_pool_stopping = false;
+
+  bool AcquireStreamStaging(StreamJob& job) {
+    StagingBlock block;
+    if (staging_pool_budget) {
+      std::lock_guard<std::mutex> lock(staging_pool_mutex);
+      if (staging_pool.Take(job.staging_size, block)) {
+        job.staging_buffer = block.buffer;
+        job.staging_memory = block.memory;
+        job.staging_mapping = block.mapping;
+        job.staging_capacity = block.capacity;
+        job.staging_bytes = block.bytes;
+        job.staging_memory_type = block.memory_type;
+        staging_reuse_counters.reused.fetch_add(1, std::memory_order_relaxed);
+        staging_reuse_counters.idle_bytes.store(staging_pool.bytes(), std::memory_order_relaxed);
+        return true;
+      }
+    }
+    job.staging_capacity = StagingBucketSize(job.staging_size, staging_pool_budget);
+    if (!rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            device, job.staging_capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            rex::ui::vulkan::util::MemoryPurpose::kUpload, job.staging_buffer,
+            job.staging_memory, &job.staging_memory_type, &job.staging_bytes)) return false;
+    void* mapping = nullptr;
+    if (device->functions().vkMapMemory(device->device(), job.staging_memory, 0,
+        VK_WHOLE_SIZE, 0, &mapping) != VK_SUCCESS) return false;
+    job.staging_mapping = mapping;
+    staging_reuse_counters.created.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  void DestroyStagingBlock(const StagingBlock& block) {
     const auto& dfn = device->functions();
     VkDevice d = device->device();
-    if (job.staging_buffer) dfn.vkDestroyBuffer(d, job.staging_buffer, nullptr);
-    if (job.staging_memory) dfn.vkFreeMemory(d, job.staging_memory, nullptr);
+    if (block.mapping) dfn.vkUnmapMemory(d, block.memory);
+    if (block.buffer) dfn.vkDestroyBuffer(d, block.buffer, nullptr);
+    if (block.memory) dfn.vkFreeMemory(d, block.memory, nullptr);
+  }
+
+  // Only called after the entire upload frame has completed, on a failed
+  // unsubmitted job, or after device idle during shutdown. A submitted buffer
+  // must never become writable again just because its CPU untile is done.
+  void DestroyStreamJob(StreamJob& job) {
+    StagingBlock block{job.staging_buffer, job.staging_memory, job.staging_mapping,
+                       job.staging_capacity, job.staging_bytes, job.staging_memory_type};
     job.staging_buffer = VK_NULL_HANDLE;
     job.staging_memory = VK_NULL_HANDLE;
+    job.staging_mapping = nullptr;
+    job.staging_capacity = job.staging_bytes = 0;
+    job.untile.staging = nullptr;
+    if (block.mapping && block.capacity <= 4 * 1024 * 1024 && staging_pool_budget) {
+      std::lock_guard<std::mutex> lock(staging_pool_mutex);
+      if (!staging_pool_stopping && staging_pool.Put(block, staging_pool_budget)) {
+        staging_reuse_counters.returned.fetch_add(1, std::memory_order_relaxed);
+        staging_reuse_counters.idle_bytes.store(staging_pool.bytes(), std::memory_order_relaxed);
+        return;
+      }
+    }
+    DestroyStagingBlock(block);
   }
 
   struct RetiredStaging {
@@ -906,6 +980,16 @@ struct TextureCache::Impl {
   }
 
   bool CreateTextureImage(const VkImageCreateInfo& info, VkImage& image, VkDeviceMemory& memory) {
+    if (CreateTextureImageRaw(info, image, memory)) return true;
+    const uint64_t n = stream_lifetime_counters.image_failures.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Every ERROR flushes to SD: report first failures and sparse recurrences.
+    if (n <= 8 || (n & 4095) == 0)
+      REXLOG_ERROR("[native-memory] image creation failed count={} extent={}x{}x{} vk_format={}",
+          n, info.extent.width, info.extent.height, info.extent.depth, uint32_t(info.format));
+    return false;
+  }
+
+  bool CreateTextureImageRaw(const VkImageCreateInfo& info, VkImage& image, VkDeviceMemory& memory) {
     using rex::ui::vulkan::util::MemoryPurpose;
     if (!texture_pool) {
       return rex::ui::vulkan::util::CreateDedicatedAllocationImage(
@@ -1072,6 +1156,11 @@ void TextureCache::WaitForUploads() { impl_->WaitForUploads(); }
 
 bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* memory) {
   Impl& im = *impl_;
+  // Publish immutable pool settings before either streaming worker can use them.
+  im.staging_pool_budget = uint64_t(std::min(REXCVAR_GET(p2_native_staging_pool_mb), 64u)) << 20;
+  im.staging_pool_stopping = false;
+  staging_reuse_counters.budget_bytes.store(im.staging_pool_budget, std::memory_order_relaxed);
+  staging_reuse_counters.report_enabled.store(REXCVAR_GET(p2_frame_pacing_report), std::memory_order_release);
   im.upload_thread = std::thread([&im]() { im.UploadThread(); });
   for (std::thread& thread : im.stream_threads) {
     thread = std::thread([&im]() { im.StreamThread(); });
@@ -1199,6 +1288,12 @@ void TextureCache::Shutdown() {
     im.reap_cv.notify_all();
     im.reap_thread.join();  // runs what is still queued first
   }
+  // Workers have joined and the renderer waited device idle before Shutdown.
+  // Remaining jobs are destroyed directly instead of refilling the idle pool.
+  im.staging_pool_stopping = true;
+  im.staging_pool.Clear([&im](const auto& block) { im.DestroyStagingBlock(block); });
+  staging_reuse_counters.idle_bytes.store(0, std::memory_order_relaxed);
+  im.stream_jobs.clear();  // remaining jobs are owned by their pending textures
   for (auto& retired : im.retired_staging) {
     im.DestroyStreamJob(*retired.job);
   }
@@ -1279,16 +1374,49 @@ void TextureCache::BeginFrame(uint64_t frame, uint64_t completed_frame) {
     uint64_t payload = 0;
     struct Candidate { uint64_t key, last_used; };
     std::vector<Candidate> candidates;
-    for (const auto& [key, texture] : im.textures) {
-      payload += texture->payload_bytes;
-      if (IdleTextureExpired(frame, texture->last_used_frame, bool(texture->stream)))
-        candidates.push_back({key, texture->last_used_frame});
+    std::unordered_set<const void*> evicted;
+    uint64_t pending_count = 0, ready_count = 0, ready_staging_bytes = 0;
+    const bool reap_unused = REXCVAR_GET(p2_native_reap_unused_streams);
+    for (auto t = im.textures.begin(); t != im.textures.end();) {
+      const uint64_t key = t->first;
+      Texture& texture = *t->second;
+      if (texture.stream) {
+        const bool done = texture.stream->done.load(std::memory_order_acquire);
+        if (reap_unused && DiscardUnusedStream(frame, texture.last_used_frame, done,
+                                               bool(texture.image), !texture.views.empty())) {
+          // Still owned by the worker until done/acquire. No GPU copy has been
+          // recorded while stream!=null and texture.image/views are empty.
+          auto job = std::move(texture.stream);
+          im.Reap([&im, job]() {
+            im.DestroyStreamJob(*job);
+            im.DestroyNow(job->image, job->memory, {});
+            job->image = VK_NULL_HANDLE;
+            job->memory = VK_NULL_HANDLE;
+            stream_lifetime_counters.reaped.fetch_add(1, std::memory_order_relaxed);
+          });
+          evicted.insert(&texture);
+          t = im.textures.erase(t);
+          stream_lifetime_counters.discarded.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+        ++pending_count;
+        if (done) {
+          ++ready_count;
+          ready_staging_bytes += texture.stream->staging_bytes;
+        }
+      }
+      payload += texture.payload_bytes;
+      if (IdleTextureExpired(frame, texture.last_used_frame, bool(texture.stream)))
+        candidates.push_back({key, texture.last_used_frame});
+      ++t;
     }
+    stream_lifetime_counters.pending.store(pending_count, std::memory_order_relaxed);
+    stream_lifetime_counters.ready.store(ready_count, std::memory_order_relaxed);
+    stream_lifetime_counters.ready_staging_bytes.store(ready_staging_bytes, std::memory_order_relaxed);
     const uint64_t budget = uint64_t(REXCVAR_GET(p2_native_texture_cache_mb)) << 20;
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
       return a.last_used < b.last_used;
     });
-    std::unordered_set<const void*> evicted;
     for (const auto& candidate : candidates) {
       if (payload <= budget) break;
       auto t = im.textures.find(candidate.key);
@@ -2232,6 +2360,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
   auto existing = im.textures.find(key_hash);
   if (existing != im.textures.end() && existing->second->stream) {
     Texture& pending = *existing->second;
+    pending.last_used_frame = im.frame;  // A requested pending upload is not abandoned.
     StreamJob& job = *pending.stream;
     if (!job.done.load(std::memory_order_acquire)) {
       // Still streaming in: drawn without it for now.
@@ -2355,6 +2484,11 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     if (REXCVAR_GET(p2_native_sync_color_lut) &&
         IsSmallColorLut(is_3d,format==xenos::TextureFormat::k_8_8_8_8,width,height,layers,total)) {
       force_upload_now=true;
+    }
+    if (REXCVAR_GET(p2_native_sync_video_planes) &&
+        IsVideoPlane(is_3d, fetch.tiled, format == xenos::TextureFormat::k_8, level_count, layers, width, height,
+                     total)) {
+      force_upload_now = true;
     }
 
     // New large textures are created and untiled by the streaming worker, so
@@ -2491,8 +2625,6 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
       info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
     if (!im.CreateTextureImage(info, created->image, created->memory)) {
-      REXLOG_ERROR("[native] Could not create a {}x{}x{} texture of format {}", width, height,
-                   layers, uint32_t(format));
       return null_view;
     }
     created->level_count = level_count;

@@ -29,12 +29,35 @@ REXCVAR_DEFINE_DOUBLE(p2_shadow_range_scale, 1.0, "Prototype2",
                       "WORKLOG #103: multiplier of the game's shadow range (rm_SetGlobalShadowRangeHack, float at "
                       "0x82DC5864, 300 m in the image): below 1 = shadows of far objects not drawn (fewer shadow-map "
                       "draws for the ring thread and the GPU). 1.0 = the game's own");
+// PERF pass 11: in-run A/B of the three scales above (user agreed to lower them; pedestrians stay). With
+// p2_quality_ab_period_s > 0, odd periods of the system clock (frame_pacing.csv tick_s) use the *_alt values.
+REXCVAR_DEFINE_UINT32(p2_quality_ab_period_s, 0, "Prototype2",
+    "Measurement: alternate LOD bias / vehicle / shadow range scales with their _alt values every this many "
+    "seconds (odd periods = alt); 0 = off");
+REXCVAR_DEFINE_DOUBLE(p2_geo_lod_bias_scale_alt, 1.0, "Prototype2", "p2_geo_lod_bias_scale of odd A/B periods");
+REXCVAR_DEFINE_DOUBLE(p2_vehicle_max_scale_alt, 1.0, "Prototype2", "p2_vehicle_max_scale of odd A/B periods");
+REXCVAR_DEFINE_DOUBLE(p2_shadow_range_scale_alt, 1.0, "Prototype2", "p2_shadow_range_scale of odd A/B periods");
 REX_EXTERN(__imp__sub_8247A288);
 
 namespace {
 std::atomic<uint8_t*> g_base{nullptr};
 std::atomic<uint32_t> g_ambient{0};
 
+bool QualityAlt() {
+  const uint32_t period = REXCVAR_GET(p2_quality_ab_period_s);
+  if (!period) return false;
+#if defined(__SWITCH__) && defined(__aarch64__)
+  uint64_t tick, freq;
+  __asm__ volatile("mrs %0, cntpct_el0" : "=r"(tick));
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+  return freq && ((tick / freq / period) & 1);
+#else
+  return false;
+#endif
+}
+double VehicleScale() { return QualityAlt() ? REXCVAR_GET(p2_vehicle_max_scale_alt) : REXCVAR_GET(p2_vehicle_max_scale); }
+double LodScale() { return QualityAlt() ? REXCVAR_GET(p2_geo_lod_bias_scale_alt) : REXCVAR_GET(p2_geo_lod_bias_scale); }
+double ShadowScale() { return QualityAlt() ? REXCVAR_GET(p2_shadow_range_scale_alt) : REXCVAR_GET(p2_shadow_range_scale); }
 inline uint32_t Load32(uint8_t* base, uint32_t a) { uint32_t v; std::memcpy(&v, base + a, 4); return __builtin_bswap32(v); }
 inline void Store32(uint8_t* base, uint32_t a, uint32_t v) { v = __builtin_bswap32(v); std::memcpy(base + a, &v, 4); }
 
@@ -102,10 +125,10 @@ void ApplyAmbient(uint8_t* base, uint32_t m) {
 
     const uint32_t cars = Load32(base, m + 1664);
     if (g_cars.Track(cars)) {
-      g_cars.written = ScaleCount(cars, REXCVAR_GET(p2_vehicle_max_scale));
+      g_cars.written = ScaleCount(cars, VehicleScale());
       REXLOG_INFO("[p2-quality] {}: game {} -> {}", g_cars.name, cars, g_cars.written);
     }
-    const uint32_t want_cars = ScaleCount(g_cars.game, REXCVAR_GET(p2_vehicle_max_scale));
+    const uint32_t want_cars = ScaleCount(g_cars.game, VehicleScale());
     if (want_cars != g_cars.written) g_cars.written = want_cars;
     if (cars != g_cars.written) Store32(base, m + 1664, g_cars.written);
   }
@@ -127,16 +150,16 @@ extern "C" void p2_quality_frame() {
   uint8_t* base = g_base.load(std::memory_order_relaxed);
   if (!base) return;
   ApplyAmbient(base, g_ambient.load(std::memory_order_acquire));
-  ScaleFloat(base, 0x82DC5864, g_shadow, REXCVAR_GET(p2_shadow_range_scale));
+  ScaleFloat(base, 0x82DC5864, g_shadow, ShadowScale());
   constexpr uint32_t kLodBias = 0x82DC1E6C;
   const uint32_t lod = Load32(base, kLodBias);
   float game_lod;
   if (g_lod.Track(lod)) {
     std::memcpy(&game_lod, &g_lod.game, 4);
-    REXLOG_INFO("[p2-quality] {}: game {} x {}", g_lod.name, game_lod, REXCVAR_GET(p2_geo_lod_bias_scale));
+    REXLOG_INFO("[p2-quality] {}: game {} x {}", g_lod.name, game_lod, LodScale());
   }
   std::memcpy(&game_lod, &g_lod.game, 4);
-  const float want = float(double(game_lod) * REXCVAR_GET(p2_geo_lod_bias_scale));
+  const float want = float(double(game_lod) * LodScale());
   std::memcpy(&g_lod.written, &want, 4);
   if (lod != g_lod.written) Store32(base, kLodBias, g_lod.written);
 }

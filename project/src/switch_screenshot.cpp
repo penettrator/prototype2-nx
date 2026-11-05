@@ -40,6 +40,10 @@ extern "C" void RexSwitchScreenshotRequest() {
   char line[160];
   if (!initialized) {
     initialized = true;
+    // 2026-11-04: the directory was made only by prototype2_EnableSystemScreenshots; when that did not run, every
+    // L+R+ZR capture and its log line failed silently (no screens/ folder on the SD card).
+    mkdir("sdmc:/switch/Prototype2/logs", 0777);
+    mkdir(kScreensDir, 0777);
     Result rc = capsscInitialize();
     std::snprintf(line, sizeof(line), "caps:sc init 0x%08X", rc);
     Log(line);

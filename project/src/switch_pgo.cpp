@@ -7,6 +7,9 @@
 #include <thread>
 #include <sys/stat.h>
 #include <rex/logging.h>
+#ifndef P2_PGO_GEN_DIR_STR
+#define P2_PGO_GEN_DIR_STR "/pgo"
+#endif
 
 extern "C" void __gcov_dump(void);
 extern "C" void __gcov_reset(void);
@@ -17,11 +20,11 @@ struct PgoDumper {
     new std::thread([] {
       for (int i = 1;; ++i) {
         std::this_thread::sleep_for(std::chrono::minutes(3));
-        mkdir("sdmc:/pgo", 0777);  // libgcov does not create directories here
+        mkdir("sdmc:" P2_PGO_GEN_DIR_STR, 0777);  // libgcov does not create directories here
         const auto begin = std::chrono::steady_clock::now();
         __gcov_dump();
         __gcov_reset();
-        REXLOG_INFO("[p2-pgo] profile dump {} written to sdmc:/pgo in {} ms", i,
+        REXLOG_INFO("[p2-pgo] profile dump {} written to sdmc:{} in {} ms", i, P2_PGO_GEN_DIR_STR,
                     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin)
                         .count());
       }

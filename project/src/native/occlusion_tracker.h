@@ -10,7 +10,7 @@ namespace p2::native {
 template <std::size_t N> class OcclusionTracker {
  public:
   static constexpr uint32_t invalid = UINT32_MAX;
-  struct Result { uint32_t address=0,samples=0;bool fallback=false,superseded=false; };
+  struct Result { uint32_t address=0,samples=0;bool fallback=false,superseded=false;uint32_t draws=0,noz=0,begin=0; };
   uint32_t active() const {return active_;}
   bool pending() const {return used_!=0;}
   uint32_t address(uint32_t id) const {return records_[id].address;}
@@ -35,7 +35,7 @@ template <std::size_t N> class OcclusionTracker {
     if(open_.count==max_active || FindBegin(address)!=invalid)return false;
     for(uint32_t i=0;i<N;++i){uint32_t id=(cursor_+i)%N;if(records_[id].valid)continue;
       for(auto& old:records_)if(old.valid && old.begin_address==address)old.superseded=true;
-      records_[id]={address,0,0,true,false,false,++issued_,address};open_.ids[open_.count++]=id;active_=id;cursor_=(id+1)%N;++used_;return true;}
+      records_[id]={address,0,0,true,false,false,++issued_,address};records_[id].draws=0;records_[id].noz=0;open_.ids[open_.count++]=id;active_=id;cursor_=(id+1)%N;++used_;return true;}
     return false;
   }
   Owners OpenOwners() const {
@@ -55,6 +55,9 @@ template <std::size_t N> class OcclusionTracker {
     }
     return owners;
   }
+  // Diagnostics (2026-11-04, sun through buildings): draws counted into every open query.
+  void CountDraw(bool no_ztest){for(uint32_t i=0;i<open_.count;++i){auto& r=records_[open_.ids[i]];++r.draws;if(no_ztest)++r.noz;}}
+  uint32_t open_begin(uint32_t i) const {return i<open_.count?records_[open_.ids[i]].begin_address:0;}
   bool AddPiece(uint32_t id) {
     if(id>=N || !records_[id].valid || records_[id].ended)return false;
     ++records_[id].pieces;return true;
@@ -85,10 +88,10 @@ template <std::size_t N> class OcclusionTracker {
     if(id>=N)return false;auto& r=records_[id];if(!r.valid || !r.ended || r.pieces)return false;
     bool superseded=r.superseded;
     for(const auto& other:records_)if(other.valid && other.serial>r.serial && (other.ended?other.address:other.begin_address-32u)==r.address){superseded=true;break;}
-    result={r.address,r.samples,r.fallback,superseded};r.valid=false;--used_;return true;
+    result={r.address,r.samples,r.fallback,superseded,r.draws,r.noz,r.begin_address};r.valid=false;--used_;return true;
   }
  private:
-  struct Record {uint32_t address=0,samples=0,pieces=0;bool valid=false,ended=false,fallback=false;uint64_t serial=0;uint32_t begin_address=0;bool superseded=false;};
+  struct Record {uint32_t address=0,samples=0,pieces=0;bool valid=false,ended=false,fallback=false;uint64_t serial=0;uint32_t begin_address=0;bool superseded=false;uint32_t draws=0,noz=0;};
   std::array<Record,N> records_{};uint32_t active_=invalid,cursor_=0,used_=0;uint64_t issued_=0;Owners open_{};
 };
 }

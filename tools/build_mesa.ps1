@@ -1,4 +1,4 @@
-# Prototype 2 0.2.0
+# Prototype 2 0.3.0
 $ErrorActionPreference='Stop'
 $projectRoot=Split-Path -Parent $PSScriptRoot
 Push-Location $projectRoot

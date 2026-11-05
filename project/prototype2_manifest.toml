@@ -8,7 +8,7 @@ game_root = "../assets/game_root"
 [entrypoint]
 file_path = "../assets/game_root/default.xex"
 out_directory_path = "generated/default"
-includes = []
+includes = ["perf_locals.toml"]
 
 # Statically linked XAPI fibers (Radical job system) -> SDK host-fiber hooks (rex/kernel/crt/threading.cpp).
 # Identified from disassembly, see docs/fiber_xapi_disasm.txt and WORKLOG #10. Context size 0xA50 = X_FIBER_CONTEXT.

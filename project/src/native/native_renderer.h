@@ -123,6 +123,13 @@ class Renderer {
 
   // Asynchronous native sample queries. Guest counters complete after a GPU fence.
   bool OcclusionQueryEvent(uint32_t address, bool end);
+  // Last measured samples of a query (end) address; false if none (2026-11-04, B-007).
+  bool OcclusionLastSamples(uint32_t address, uint32_t& samples) const;
+  // B-007: Xenos VIZ queries (PM4_VIZ_QUERY) measured like occlusion queries; draws conditional on one are dropped
+  // when its last measured result was 0 samples.
+  void VizBegin(uint32_t id);
+  void VizEnd(uint32_t id);
+  bool VizHidden(uint32_t id) const;
   void PollOcclusionQueries(bool demand = false);
   bool IsOcclusionResultAddress(uint32_t address) const;
 

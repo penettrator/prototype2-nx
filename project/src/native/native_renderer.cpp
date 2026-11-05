@@ -34,6 +34,7 @@ extern "C" void RexSwitchPerfSceneFrame(uint32_t draws);
 #include <deque>
 #include <mutex>
 #include <unordered_set>
+#include <string>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -213,6 +214,28 @@ REXCVAR_DEFINE_BOOL(p2_native_gpu_profile_draw_kinds, false, "Prototype2",
                     "textures) instead of by shader pair");
 REXCVAR_DEFINE_BOOL(p2_native_occlusion_queries, true, "Prototype2",
                     "Measure guest occlusion queries on the GPU instead of faking visibility");
+// Sun/moon through buildings (2026-11-04): a query that cannot be measured (abandoned, over the per-submission
+// budget, failed readback) was published as 1000 samples, i.e. fully visible, which shows the sun/moon flare
+// through whatever covers it. With this, such a query repeats the last measured result of the same query address
+// (0 if none yet). Plus a 10-second summary of query outcomes (p2_occlusion_report) to tell the causes apart.
+REXCVAR_DEFINE_BOOL(p2_occlusion_fallback_last, false, "Prototype2",
+                    "An occlusion query that could not be measured repeats the last measured result of its "
+                    "address instead of reporting fully visible (1000 samples)");
+// B-007 (bisection, 2026-11-05): the moon/sun glow through bridges went away only when the moon-disc query draw
+// (ps 0F20D907) was not drawn, i.e. when that query's result was available at once. The game's GetData
+// (sub_822C67D0) answers a query still holding its 0xFFFFFEED marker with 1 sample (and S_FALSE); our results
+// come a frame or more later, after the GPU fence, so the glow saw "visible" whenever it read early. With this, a
+// query's end snapshot gets the last measured result of its address at once (0 if none), replaced by the real
+// one when it completes.
+REXCVAR_DEFINE_BOOL(p2_occlusion_provisional, false, "Prototype2",
+                    "Occlusion queries: publish the last measured result of the address at the query's end at "
+                    "once (0 if none), then the real result when the GPU has it (instead of 'not ready' = 1 sample)");
+REXCVAR_DEFINE_BOOL(p2_sun_probe_flip, false, "Prototype2",
+                    "B-007 experiment: the sun occlusion probe draws test depth LESS_OR_EQUAL instead of the "
+                    "game's GREATER (pipeline state; restart recommended)");
+REXCVAR_DEFINE_BOOL(p2_occlusion_report, false, "Prototype2",
+                    "Every 10 s: a warning line with occlusion query outcomes (measured, zero, fallback, not "
+                    "written) and the draws inside queries without a depth buffer or depth test");
 REXCVAR_DEFINE_BOOL(p2_native_record_thread, false, "Prototype2",
                     "Make the Vulkan calls of draws on a second thread, so the command ring "
                     "thread prepares the next draw meanwhile");
@@ -601,10 +624,28 @@ struct Renderer::Impl {
   };
   std::array<VisualFrame,96> visual_frames{};
   uint32_t visual_cursor=0;
+  // B-007 step 4 (2026-11-04): on a user marker (L+R+ZR), the next whole frame's draws, clears, resolves and query
+  // events in order go to logs/rex/frame_dump_N.txt (with p2_occlusion_report).
+  bool fd_active = false;
+  std::string fd_buf;
+  uint32_t fd_files = 0, fd_draws = 0;
+  void FdLine(const std::string& line) {
+    if (fd_active && fd_buf.size() < (4u << 20)) { fd_buf += line; fd_buf += '\n'; }
+  }
   void RecordVisualFrame(const VisualFrame& entry) {
     visual_frames[visual_cursor++%visual_frames.size()]=entry;
+    if (fd_active) {
+      fd_active = false;
+      char path[160];
+      std::snprintf(path, sizeof(path), "sdmc:/switch/Prototype2/logs/rex/frame_dump_%u.txt", ++fd_files);
+      if (FILE* f = std::fopen(path, "wb")) { std::fwrite(fd_buf.data(), 1, fd_buf.size(), f); std::fclose(f); }
+      REXLOG_WARN("[occlusion-report] frame dump {} written: {} lines of draws", path, fd_draws);
+      fd_buf.clear();
+    }
     const uint32_t requests=p2_visual_snapshot_requests.exchange(0,std::memory_order_relaxed);
     if(!requests)return;
+    if (REXCVAR_GET(p2_occlusion_report) && fd_files < 8) { fd_active = true; fd_draws = 0; fd_buf.clear();
+      fd_buf = "frame dump at frame " + std::to_string(entry.frame) + "\n"; }
     REXLOG_INFO("[p2-visual] USER MARKER {} at frame {}; query batches={} coalesced draws={} open={}",
                 requests,entry.frame,occlusion_batches,occlusion_batched_draws,occlusion.open_count());
     const uint32_t count=std::min<uint32_t>(visual_cursor,visual_frames.size());
@@ -1559,16 +1600,134 @@ struct Renderer::Impl {
   }
 
   uint64_t occlusion_abandoned = 0;
+  // Sun/moon diagnostics and the fallback-last option (2026-11-04).
+  std::unordered_map<uint32_t, uint32_t> occlusion_last_samples;
+  std::unordered_map<uint32_t, uint32_t> occlusion_provisional;  // end address -> provisional samples written
+  uint64_t oq_provisional = 0;
+  uint64_t oq_done = 0, oq_zero = 0, oq_fallback = 0, oq_not_written = 0, oq_superseded = 0, oq_fallback_last = 0;
+  uint64_t oq_pieces = 0, oq_pieces_no_depth = 0, oq_pieces_no_ztest = 0, oq_skipped = 0, oq_report_ns = 0;
+  uint64_t oq_unmatched_reported = 0, oq_begin_failed = 0, oq_unmatched_logged = 0, sun_probe_flips = 0;
+  struct OqAddr { uint64_t n = 0, draws = 0, noz = 0, samples = 0, zero = 0, nw = 0; uint32_t begin = 0; };
+  std::unordered_map<uint32_t, OqAddr> oq_by_address;
+  // B-007 step 3: which depth buffer the draws inside queries test against, vs the frame's busiest depth buffer.
+  std::unordered_set<uint64_t> oq_draw_seen;
+  uint32_t oq_draw_logged = 0;
+  std::unordered_map<uint64_t, uint64_t> oq_depth_draws;
+  static uint64_t OqTargetId(const RenderTarget* t) {
+    return t ? (uint64_t(t->key.base_tiles) << 40) ^ (uint64_t(t->key.pitch) << 24) ^ (uint64_t(t->key.format) << 8) ^
+                   t->key.msaa
+             : 0;
+  }
+  void OcclusionReport() {
+    if (!REXCVAR_GET(p2_occlusion_report)) return;
+    const uint64_t now = NowNs();
+    if (!oq_report_ns) { oq_report_ns = now; return; }
+    if (now - oq_report_ns < 10000000000ull) return;
+    oq_report_ns = now;
+    REXLOG_WARN("[occlusion-report] done {} zero {} fallback {} (as last {}) not_written {} superseded {} | draws in "
+                "queries {} without depth buffer {} without depth test {} skipped {} | abandoned total {} | "
+                "unmatched ends (faked visible) {} failed begins (faked) {} open now {} | sun probe flips {}",
+                oq_done, oq_zero, oq_fallback, oq_fallback_last, oq_not_written, oq_superseded, oq_pieces,
+                oq_pieces_no_depth, oq_pieces_no_ztest, oq_skipped, occlusion_abandoned,
+                occlusion_unmatched_ends - oq_unmatched_reported, oq_begin_failed, occlusion.open_count(),
+                sun_probe_flips);
+    REXLOG_WARN("[occlusion-report] viz queries measured {} zero {} | provisional results {}", viz_measured, viz_zero,
+                oq_provisional);
+    oq_provisional = 0;
+    viz_measured = viz_zero = 0;
+    oq_unmatched_reported = occlusion_unmatched_ends;
+    oq_begin_failed = 0;
+    {
+      std::vector<std::pair<uint32_t, OqAddr>> v(oq_by_address.begin(), oq_by_address.end());
+      std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.n > b.second.n; });
+      for (size_t i = 0; i < v.size() && i < 8; ++i) {
+        const OqAddr& a = v[i].second;
+        REXLOG_WARN("[occlusion-report]   query {:08X} (begin {:08X}): {} results, {:.1f} draws, {:.1f} without "
+                    "depth test, {:.0f} samples avg, {} zero, {} not written",
+                    v[i].first, a.begin, a.n, double(a.draws) / a.n, double(a.noz) / a.n, double(a.samples) / a.n,
+                    a.zero, a.nw);
+      }
+      oq_by_address.clear();
+      std::vector<std::pair<uint64_t, uint64_t>> dv(oq_depth_draws.begin(), oq_depth_draws.end());
+      std::sort(dv.begin(), dv.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+      for (size_t i = 0; i < dv.size() && i < 4; ++i)
+        REXLOG_WARN("[occlusion-report]   depth buffer {:016X}: {} draws", dv[i].first, dv[i].second);
+      oq_depth_draws.clear();
+    }
+    oq_done = oq_zero = oq_fallback = oq_not_written = oq_superseded = oq_fallback_last = 0;
+    oq_pieces = oq_pieces_no_depth = oq_pieces_no_ztest = oq_skipped = 0;
+  }
+  // B-007: VIZ query records use addresses outside guest memory (kVizBase + id * 64, begin at +32).
+  static constexpr uint32_t kVizBase = 0xFFFF0000u;
+  uint32_t viz_samples[64] = {};
+  bool viz_known[64] = {};
+  uint64_t viz_measured = 0, viz_zero = 0;
+  void VizBeginImpl(uint32_t id) {
+    if (!occlusion_pool) return;
+    const uint32_t begin = kVizBase + (id & 63) * 64 + 32;
+    const uint32_t previous = occlusion.FindBegin(begin);
+    if (previous != QueryTracker::invalid) {
+      occlusion.FailRecord(previous);
+      occlusion.EndRecord(previous, begin - 32);
+      WriteOcclusionReady(previous);
+    }
+    occlusion.BeginOverlapping(begin);
+    if (fd_active) { char line[64]; std::snprintf(line, sizeof(line), "V begin %u", id & 63); FdLine(line); }
+  }
+  void VizEndImpl(uint32_t id) {
+    if (!occlusion_pool) return;
+    const uint32_t rec = occlusion.EndMatching(kVizBase + (id & 63) * 64);
+    if (fd_active) { char line[64]; std::snprintf(line, sizeof(line), "V end %u", id & 63); FdLine(line); }
+    if (rec != QueryTracker::invalid) WriteOcclusionReady(rec);
+  }
   void WriteOcclusionReady(uint32_t id) {
     QueryTracker::Result result;
     if (!occlusion.TakeReady(id, result)) return;
+    if (result.address >= kVizBase) {
+      const uint32_t v = ((result.address - kVizBase) / 64) & 63;
+      if (!result.fallback) {
+        viz_samples[v] = result.samples; viz_known[v] = true; ++viz_measured; viz_zero += result.samples == 0;
+      }
+      return;
+    }
+    OcclusionReport();
     auto* counts = memory->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(result.address);
     const uint32_t finished = rex::byte_swap(UINT32_C(0xFFFFFEED));
     // The game may have reused/destroyed the query while the GPU was working.
     // Do not overwrite a new begin counter or unrelated data.
-    const bool awaiting = !result.superseded && counts && (counts->ZPass_A == finished || counts->ZPass_B == finished ||
+    bool awaiting = !result.superseded && counts && (counts->ZPass_A == finished || counts->ZPass_B == finished ||
                                      counts->ZFail_A == finished || counts->ZFail_B == finished);
-    const uint32_t samples = result.fallback ? 1000u : result.samples;
+    {
+      auto pv = occlusion_provisional.find(result.address);
+      if (pv != occlusion_provisional.end() && !result.superseded) {
+        // Still holding the provisional value written at the end: this result replaces it.
+        if (!awaiting && !result.superseded && counts && counts->ZPass_A == pv->second && !counts->ZPass_B &&
+            !counts->ZFail_A && !counts->ZFail_B)
+          awaiting = true;
+        occlusion_provisional.erase(pv);
+      }
+    }
+    uint32_t samples = result.fallback ? 1000u : result.samples;
+    ++oq_done;
+    if (result.fallback) {
+      ++oq_fallback;
+      if (REXCVAR_GET(p2_occlusion_fallback_last)) {
+        auto it = occlusion_last_samples.find(result.address);
+        samples = it != occlusion_last_samples.end() ? it->second : 0u;
+        ++oq_fallback_last;
+      }
+    } else {
+      if (!result.samples) ++oq_zero;
+      if (occlusion_last_samples.size() < 4096 || occlusion_last_samples.count(result.address))
+        occlusion_last_samples[result.address] = result.samples;
+    }
+    if (result.superseded) ++oq_superseded;
+    if (!awaiting) ++oq_not_written;
+    if (REXCVAR_GET(p2_occlusion_report) && (oq_by_address.size() < 512 || oq_by_address.count(result.address))) {
+      OqAddr& a = oq_by_address[result.address];
+      ++a.n; a.draws += result.draws; a.noz += result.noz; a.samples += samples; a.zero += samples == 0;
+      a.nw += !awaiting; a.begin = result.begin;
+    }
     if (awaiting) {
       std::memset(counts, 0, sizeof(*counts));
       counts->Total_A = samples; counts->ZPass_A = samples;
@@ -1603,10 +1762,35 @@ struct Renderer::Impl {
     // D3D Issue (822DB378): begin snapshot = base+32, end snapshot = base.
     // Match the command-stream addresses before inspecting mutable guest memory.
     const bool paired_end=occlusion.IsEndAddress(address);
+    if (fd_active) { char line[96]; std::snprintf(line, sizeof(line), "Q %08X %s", address,
+                                                 (paired_end || sentinel_end) ? "end" : "begin"); FdLine(line); }
     if (paired_end || sentinel_end) {
       const uint32_t id=occlusion.EndMatching(address);
-      if(id==QueryTracker::invalid){++occlusion_unmatched_ends;return false;}
+      if(id==QueryTracker::invalid){
+        ++occlusion_unmatched_ends;
+        if (REXCVAR_GET(p2_occlusion_report) && oq_unmatched_logged < 24) {
+          ++oq_unmatched_logged;
+          REXLOG_WARN("[occlusion-report] unmatched end {:08X} sentinel={} open {}: {:08X} {:08X} {:08X} {:08X}",
+                      address, sentinel_end, occlusion.open_count(), occlusion.open_begin(0), occlusion.open_begin(1),
+                      occlusion.open_begin(2), occlusion.open_begin(3));
+        }
+        return false;
+      }
       if(!sentinel_end)++occlusion_address_ends;
+      if (REXCVAR_GET(p2_occlusion_provisional) && address < kVizBase) {
+        auto* counts = memory->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(address);
+        const uint32_t finished = rex::byte_swap(UINT32_C(0xFFFFFEED));
+        if (counts && (counts->ZPass_A == finished || counts->ZPass_B == finished || counts->ZFail_A == finished ||
+                       counts->ZFail_B == finished)) {
+          auto it = occlusion_last_samples.find(address);
+          const uint32_t v = it != occlusion_last_samples.end() ? it->second : 0u;
+          std::memset(counts, 0, sizeof(*counts));
+          counts->Total_A = v; counts->ZPass_A = v;
+          if (occlusion_provisional.size() < 4096 || occlusion_provisional.count(address))
+            occlusion_provisional[address] = v;
+          ++oq_provisional;
+        }
+      }
       // No submission or fence scan here. Swap submits normally; an actual wait
       // or idle command producer flushes ended queries to guarantee GetData progress.
       WriteOcclusionReady(id);
@@ -1625,6 +1809,7 @@ struct Renderer::Impl {
       (void)abandoned;
     }else if(occlusion.open_count())++occlusion_overlaps;
     const bool begun=occlusion.BeginOverlapping(address);
+    if(!begun)++oq_begin_failed;
     if(begun){
       auto* counts=memory->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(address);
       std::memset(counts,0,sizeof(*counts));
@@ -1812,8 +1997,12 @@ struct Renderer::Impl {
     submit.pCommandBuffers = buffers;
     {
       auto queue = p2::gpuwait::Measure(p2::gpuwait::QueueLock,[&]{return device->AcquireQueue(device->queue_family_graphics_compute(), 0);});
-      if (p2::gpuwait::Measure(p2::gpuwait::QueueSubmit,[&]{return dfn().vkQueueSubmit(queue.queue(), 1, &submit, s.fence);}) != VK_SUCCESS) {
-        REXLOG_ERROR("[native] vkQueueSubmit failed");
+      const VkResult result = p2::gpuwait::Measure(p2::gpuwait::QueueSubmit,[&]{return dfn().vkQueueSubmit(queue.queue(), 1, &submit, s.fence);});
+      if (result != VK_SUCCESS) {
+        static uint64_t submit_failures = 0;  // ring thread only
+        const uint64_t n = ++submit_failures;
+        if (n <= 8 || (n & 4095) == 0)
+          REXLOG_ERROR("[native] vkQueueSubmit failed result={} count={} submission={}", int32_t(result), n, submission_number);
       }
     }
     s.pending = true;
@@ -5781,6 +5970,16 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
       key.depth_test = 1;
       key.depth_write = depth_control.z_write_enable;
       key.depth_compare = uint32_t(VK_COMPARE_OP_NEVER) + uint32_t(depth_control.zfunc);
+      // B-007 experiment (p2_sun_probe_flip): the sun occlusion probe (pixel shaders DC21BE9225B9013A /
+      // 0710D5C1E7C8E133, GREATER, no depth write) counted many samples under a bridge and few in open sky, the
+      // reverse of what the game draws its glow from. Flipped to LESS_OR_EQUAL it counts the other side.
+      if (REXCVAR_GET(p2_sun_probe_flip) && depth_control.zfunc == xenos::CompareFunction::kGreater &&
+          !depth_control.z_write_enable && active_ps &&
+          (active_ps->ucode_data_hash() == UINT64_C(0xDC21BE9225B9013A) ||
+           active_ps->ucode_data_hash() == UINT64_C(0x0710D5C1E7C8E133))) {
+        key.depth_compare = uint32_t(VK_COMPARE_OP_LESS_OR_EQUAL);
+        ++sun_probe_flips;
+      }
     }
     if (water_draw && (water_debug_mode & 1)) {
       key.depth_test = 0;
@@ -5903,6 +6102,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   // 10 layout, 11 descriptors, 12 geometry shader, 13 pipeline, 14 pass,
   // 15 immediate indices.
   auto skip = [&](uint32_t reason) {
+    if (occlusion.open_count()) ++oq_skipped;
+    if (fd_active) FdLine("S skipped reason " + std::to_string(reason));
     ++stats().draws_skipped;
     ++stats().skipped_by_reason[reason & 15];
   };
@@ -6758,6 +6959,53 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       ProfileMark((kProfileDraw << 60) | ((vs_hash & 0x3FFFFFFF) << 30) | (ps_hash & 0x3FFFFFFF));
     }
   }
+  if (REXCVAR_GET(p2_occlusion_report) && oq_depth_draws.size() < 256) ++oq_depth_draws[OqTargetId(targets.depth)];
+  if (fd_active) {
+    const reg::RB_DEPTHCONTROL fdc = draw_util::GetNormalizedDepthControl(r);
+    char line[480];
+    float gzs, gzo;
+    {
+      const uint32_t zs = r[rex::graphics::XE_GPU_REG_PA_CL_VPORT_ZSCALE], zo = r[rex::graphics::XE_GPU_REG_PA_CL_VPORT_ZOFFSET];
+      std::memcpy(&gzs, &zs, 4); std::memcpy(&gzo, &zo, 4);
+    }
+    std::snprintf(line, sizeof(line),
+                  "D %u q%u:%08X z%u f%u w%u s%u | depth %016llX | c0 %016llX c1 %016llX | vs %016llX ps %016llX | n %u"
+                  " | vp z %.4f..%.4f ndc z*%.4f+%.4f | guest zscale %.6f zoffset %.6f vte %08X clip %08X",
+                  fd_draws++, occlusion.open_count(),
+                  occlusion.open_count() ? occlusion.open_begin(occlusion.open_count() - 1) : 0u,
+                  uint32_t(fdc.z_enable), uint32_t(fdc.zfunc), uint32_t(fdc.z_write_enable),
+                  uint32_t(fdc.stencil_enable), (unsigned long long)OqTargetId(targets.depth),
+                  (unsigned long long)OqTargetId(targets.color[0]), (unsigned long long)OqTargetId(targets.color[1]),
+                  (unsigned long long)(setup.active_vs ? setup.active_vs->ucode_data_hash() : 0),
+                  (unsigned long long)(setup.active_ps ? setup.active_ps->ucode_data_hash() : 0), d.count,
+                  st.viewport.z_min, st.viewport.z_max, st.viewport.ndc_scale[2], st.viewport.ndc_offset[2], gzs, gzo,
+                  r[rex::graphics::XE_GPU_REG_PA_CL_VTE_CNTL], r[rex::graphics::XE_GPU_REG_PA_CL_CLIP_CNTL]);
+    FdLine(line);
+  }
+  if (occlusion.open_count() && REXCVAR_GET(p2_occlusion_report)) {
+    ++oq_pieces;
+    const reg::RB_DEPTHCONTROL dc = draw_util::GetNormalizedDepthControl(r);
+    if (oq_draw_logged < 96) {
+      const uint32_t inner = occlusion.open_begin(occlusion.open_count() - 1);
+      const uint64_t vsh = setup.active_vs ? setup.active_vs->ucode_data_hash() : 0;
+      const uint64_t psh = setup.active_ps ? setup.active_ps->ucode_data_hash() : 0;
+      const RenderTarget* dt = targets.depth;
+      const RenderTarget* ct = targets.color[0];
+      const uint64_t sig = XXH3_64bits_withSeed(&vsh, 8, psh ^ (uint64_t(inner) << 32) ^ OqTargetId(dt) ^
+                                                (OqTargetId(ct) << 1) ^ (uint64_t(dc.value) << 7));
+      if (oq_draw_seen.insert(sig).second) {
+        ++oq_draw_logged;
+        REXLOG_WARN("[occlusion-draw] open {} inner {:08X} | z_enable {} zfunc {} zwrite {} | depth {:016X} {}x{} | "
+                    "color0 {:016X} {}x{} | vs {:016X} ps {:016X} | count {}",
+                    occlusion.open_count(), inner, uint32_t(dc.z_enable), uint32_t(dc.zfunc),
+                    uint32_t(dc.z_write_enable), OqTargetId(dt), dt ? dt->width : 0, dt ? dt->height : 0,
+                    OqTargetId(ct), ct ? ct->width : 0, ct ? ct->height : 0, vsh, psh, d.count);
+      }
+    }
+    occlusion.CountDraw(!dc.z_enable);
+    if (!dc.z_enable) ++oq_pieces_no_ztest;
+    else if (!targets.depth) ++oq_pieces_no_depth;
+  }
   AppendOcclusion(d);
   SubmitDraw(d);
   ProfileDraw(d.count);
@@ -6841,6 +7089,13 @@ void Renderer::Impl::Resolve() {
         r.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[copy_control.copy_src_select]);
     source_key.base_tiles = color_info.color_base;
     source_key.format = RtKeyColorFormat(color_info.color_format);
+  }
+  if (fd_active) {
+    char line[160];
+    std::snprintf(line, sizeof(line), "R %s src base %X pitch %u fmt %u msaa %u -> dest %08X",
+                  is_depth ? "depth" : "color", source_key.base_tiles, source_key.pitch, source_key.format,
+                  source_key.msaa, r[rex::graphics::XE_GPU_REG_RB_COPY_DEST_BASE] & 0x1FFFFFFF);
+    FdLine(line);
   }
   if (reflection_half_rate && !is_depth && reflection_texture &&
       (r[rex::graphics::XE_GPU_REG_RB_COPY_DEST_BASE] & 0x1FFFFFFF) == reflection_texture) {
@@ -7383,6 +7638,8 @@ void Renderer::Impl::Resolve() {
                            : VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT);
         uint32_t clear = r[rex::graphics::XE_GPU_REG_RB_DEPTH_CLEAR];
         uint32_t depth24 = clear >> 8;
+        if (fd_active) { char line[96]; std::snprintf(line, sizeof(line), "C depth %016llX value %06X",
+                         (unsigned long long)OqTargetId(depth_target), depth24); FdLine(line); }
         a.clearValue.depthStencil.depth =
             xenos::DepthRenderTargetFormat(depth_target->key.format) ==
                     xenos::DepthRenderTargetFormat::kD24FS8
@@ -8180,6 +8437,15 @@ void Renderer::SetGammaRamp256(const uint32_t* entries) {
 
 namespace p2::native {
 bool Renderer::OcclusionQueryEvent(uint32_t address,bool end){return impl_->OcclusionEvent(address,end);}
+void Renderer::VizBegin(uint32_t id){if(impl_)impl_->VizBeginImpl(id);}
+void Renderer::VizEnd(uint32_t id){if(impl_)impl_->VizEndImpl(id);}
+bool Renderer::VizHidden(uint32_t id) const{return impl_ && impl_->viz_known[id&63] && !impl_->viz_samples[id&63];}
+bool Renderer::OcclusionLastSamples(uint32_t address,uint32_t& samples) const{
+  if(!impl_)return false;
+  auto it=impl_->occlusion_last_samples.find(address);
+  if(it==impl_->occlusion_last_samples.end())return false;
+  samples=it->second;return true;
+}
 void Renderer::PollOcclusionQueries(bool demand){impl_->PollOcclusionQueries(demand);}
 }
 

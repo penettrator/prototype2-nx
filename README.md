@@ -1,4 +1,4 @@
-# Prototype 2 для Nintendo Switch — 0.2.0
+# Prototype 2 для Nintendo Switch — 0.3.0
 
 [English](README.en.md)
 

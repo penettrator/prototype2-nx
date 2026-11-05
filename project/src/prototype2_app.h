@@ -39,6 +39,9 @@ REXCVAR_DECLARE(std::string, render_target_path_vulkan);
 // rex_p2_msr_lock: defined in the generated prototype2_pch.h (tools/prepare_switch_codegen.py), included here.
 #if defined(__SWITCH__)
 REXCVAR_DECLARE(uint32_t, p2_msr_lock_mode);
+REXCVAR_DECLARE(bool, p2_msr_hot2_lockfree);
+extern bool p2_msr_hot2_free;  // switch_sim_priority.cpp, read by tools/prepare_hot2_free.py regions
+extern bool p2_msr_hot2_allowed;
 void prototype2_EnableTaskPumpTimeoutFix();
 #endif
 
@@ -64,6 +67,11 @@ class Prototype2App : public rex::ReXApp {
     // Native renderer (src/native, from Mercs2/project8-sw): replaces the SDK's emulated GPU when
     // p2_renderer = "native". Default stays the FSI emulation below.
     rex_p2_msr_lock = int(std::min<uint32_t>(REXCVAR_GET(p2_msr_lock_mode), 5u));
+    // PERF pass 4/8: second lock-free set only on top of mode 5. Boot keeps the lock (pass 7: one start-up hang);
+    // p2_on_sim_thread_start switches it on when the game's main loop starts.
+    p2_msr_hot2_allowed = rex_p2_msr_lock == 5 && REXCVAR_GET(p2_msr_hot2_lockfree);
+    p2_msr_hot2_free = false;
+    REXLOG_WARN("Prototype 2 msr hot2 set lock-free after boot: {}", p2_msr_hot2_allowed);
     REXLOG_INFO("Prototype 2 guest msr regions: {}",
                 rex_p2_msr_lock == 5 ? "global mutex except hot job functions" : rex_p2_msr_lock == 4 ? "global mutex, spin first" : rex_p2_msr_lock == 3 ? "guest spinlock" : rex_p2_msr_lock == 2 ? "global mutex" : rex_p2_msr_lock == 1 ? "lock per address" : "lock-free");
     prototype2_EnableGuestStackAudit();

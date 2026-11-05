@@ -3,7 +3,7 @@
 # separate host step (tools/codegen.ps1) because a cross-built rexglue cannot run here.
 # Scheme follows Mercenaries2-NX app/CMakeLists.txt (see X360_TO_SWITCH_PORTING_GUIDE.md stage 4).
 cmake_minimum_required(VERSION 3.25)
-project(prototype2 VERSION 0.2.0 LANGUAGES C CXX)
+project(prototype2 VERSION 0.3.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(P2_PROJECT "${CMAKE_CURRENT_SOURCE_DIR}/../project")
@@ -69,7 +69,7 @@ set_source_files_properties("${P2_PROJECT}/generated/default/prototype2_register
 foreach(t prototype2 prototype2_recomp)
     target_compile_options(${t} PRIVATE -ffp-contract=off -fno-strict-aliasing)
 endforeach()
-rexglue_switch_add_nro(prototype2 NAME "Prototype 2" AUTHOR "penettrator" VERSION "0.2.0" ICON "${CMAKE_CURRENT_SOURCE_DIR}/../extras/icon.jpg")
+rexglue_switch_add_nro(prototype2 NAME "Prototype 2" AUTHOR "penettrator" VERSION "0.3.0" ICON "${CMAKE_CURRENT_SOURCE_DIR}/../extras/icon.jpg")
 
 option(P2_GUEST_STACK_AUDIT "Instrument generated function returns (diagnostic overhead)" OFF)
 foreach(t prototype2 prototype2_recomp)
@@ -102,6 +102,58 @@ if(P2_GUEST_LTO)
       -ffp-contract=off -fno-strict-aliasing)
 endif()
 
+# PERF pass 10 (from sa2-nx docs/cpu-rounds.md, ReXGlue 0.10 family): compiler-only items for the recompiled guest
+# code, each exact by construction and each with its own switch (default OFF = previous build):
+#  - P2_OMIT_FRAME_POINTER: AArch64 GCC keeps the x29 chain in every non-leaf function (65,000 "mov x29, sp" in the
+#    release ELF); this frees x29 for the register-hungry recompiled code. Guest stack chains in the diagnostic
+#    sampler stop at guest frames (pc samples unaffected). PGO counters are not affected.
+#  - P2_NO_MATH_ERRNO: sqrt without the errno check and library branch; nothing reads errno (-ftrapping-math kept).
+#  - P2_GUEST_INLINE_AUTO / P2_GUEST_INLINE_GROWTH: the LTO inliner's limits for guest code with a profile (sa2-nx:
+#    64 / 12 % -> 41 % fewer executed calls). GCC keeps these per function, so they are compile options.
+option(P2_OMIT_FRAME_POINTER "Guest code without the x29 frame chain" OFF)
+option(P2_NO_MATH_ERRNO "-fno-math-errno on the guest code" OFF)
+set(P2_GUEST_INLINE_AUTO "" CACHE STRING "--param=max-inline-insns-auto for guest code (empty: compiler default)")
+set(P2_GUEST_INLINE_GROWTH "" CACHE STRING "--param=inline-unit-growth for guest code (empty: compiler default)")
+if(P2_OMIT_FRAME_POINTER)
+    target_compile_options(prototype2_recomp PRIVATE -fomit-frame-pointer)
+endif()
+if(P2_NO_MATH_ERRNO)
+    target_compile_options(prototype2_recomp PRIVATE -fno-math-errno)
+endif()
+if(P2_GUEST_INLINE_AUTO)
+    target_compile_options(prototype2_recomp PRIVATE --param=max-inline-insns-auto=${P2_GUEST_INLINE_AUTO})
+endif()
+if(P2_GUEST_INLINE_GROWTH)
+    target_compile_options(prototype2_recomp PRIVATE --param=inline-unit-growth=${P2_GUEST_INLINE_GROWTH})
+endif()
+# PERF pass 12: P2_GUEST_O2 builds the guest code at -O2 instead of -O3 (sa2-nx: smaller hot code, fewer i-cache misses
+# on the A57; the profile still fits: -O level does not change the instrumented CFG). P2_RO_CONSTANTS_OFF turns the
+# folded read-only constants (tools/p2_ro_constants.py) back into loads.
+option(P2_GUEST_O2 "Guest code at -O2 instead of -O3" OFF)
+option(P2_RO_CONSTANTS_OFF "Folded .rdata constants back to guest loads" OFF)
+if(P2_GUEST_O2)
+    target_compile_options(prototype2_recomp PRIVATE -O2)
+    target_link_options(prototype2 PRIVATE -O2)
+endif()
+if(P2_RO_CONSTANTS_OFF)
+    target_compile_definitions(prototype2_recomp PRIVATE REX_RO_CONSTANTS_OFF=1)
+endif()
+# PERF pass 13 (sa2-nx codegen rounds, tools/p2_*.py on the generated code): P2_ICALL_CENSUS counts every guest
+# indirect call (site, target) for tools/p2_indirect_calls.py --promote (measurement build only). Compile-time
+# switches back: REX_FLOAT_LOADS_INTEGER, REX_SINGLE_FLOATS_OFF, REX_INLINE_MEMCALLS_OFF, P2_PROMOTIONS_OFF,
+# REX_RO_CONSTANTS_OFF (P2_GUEST_EXTRA_DEFS, ;-list).
+option(P2_ICALL_CENSUS "Count guest indirect calls per site and target (measurement build)" OFF)
+set(P2_GUEST_EXTRA_DEFS "" CACHE STRING "Extra compile definitions for the guest code (;-list)")
+if(P2_ICALL_CENSUS)
+    target_compile_definitions(prototype2_recomp PRIVATE P2_ICALL_CENSUS=1)
+endif()
+if(P2_GUEST_EXTRA_DEFS)
+    target_compile_definitions(prototype2_recomp PRIVATE ${P2_GUEST_EXTRA_DEFS})
+endif()
+message(STATUS "P2 pass 13: icall census ${P2_ICALL_CENSUS}, extra defs '${P2_GUEST_EXTRA_DEFS}'")
+message(STATUS "P2 pass 12: guest -O2 ${P2_GUEST_O2}, ro-constants-off ${P2_RO_CONSTANTS_OFF}")
+message(STATUS "P2 guest codegen: omit-frame-pointer ${P2_OMIT_FRAME_POINTER}, no-math-errno ${P2_NO_MATH_ERRNO}, inline-auto '${P2_GUEST_INLINE_AUTO}', unit-growth '${P2_GUEST_INLINE_GROWTH}'")
+
 option(P2_LEAF_LOCALS "Cache complete register images in callback-free guest leaf functions" OFF)
 option(P2_ARM_VMX "Lower integer VMX permutes and partial stores directly to ARM64" OFF)
 foreach(t prototype2 prototype2_recomp)
@@ -118,15 +170,16 @@ target_link_options(prototype2 PRIVATE "LINKER:--wrap=bqQueueBuffer")
 # Both stages must use the same build directory layout (-fprofile-prefix-path strips it from the file names).
 set(P2_PGO "OFF" CACHE STRING "Application and guest code PGO stage: OFF, GEN or USE")
 set(P2_PGO_DATA "${CMAKE_CURRENT_SOURCE_DIR}/../config/pgo-data" CACHE STRING "Directory with the .gcda files for P2_PGO=USE")
+set(P2_PGO_GEN_DIR "/pgo" CACHE STRING "SD folder the GEN build writes its .gcda files to (PERF pass 13: a fresh one per session)")
 if(P2_PGO STREQUAL "GEN")
     # run97: the indirect-call value profiler uses a thread-local libgcov variable, null on guest threads (crash at
     # start): arc counts only.
-    target_compile_options(prototype2_recomp PRIVATE -fprofile-generate=/pgo -fno-profile-values -fprofile-update=single
+    target_compile_options(prototype2_recomp PRIVATE -fprofile-generate=${P2_PGO_GEN_DIR} -fno-profile-values -fprofile-update=single
       "-fprofile-prefix-path=${CMAKE_BINARY_DIR}")
-    target_link_options(prototype2 PRIVATE -fprofile-generate=/pgo)
-    target_compile_definitions(prototype2 PRIVATE P2_PGO_GEN=1)
+    target_link_options(prototype2 PRIVATE -fprofile-generate=${P2_PGO_GEN_DIR})
+    target_compile_definitions(prototype2 PRIVATE P2_PGO_GEN=1 "P2_PGO_GEN_DIR_STR=\"${P2_PGO_GEN_DIR}\"")
     # WORKLOG #127: the port's own code too (native renderer, skinning, culling: ring and sim thread work).
-    target_compile_options(prototype2 PRIVATE -fprofile-generate=/pgo -fno-profile-values -fprofile-update=single
+    target_compile_options(prototype2 PRIVATE -fprofile-generate=${P2_PGO_GEN_DIR} -fno-profile-values -fprofile-update=single
       "-fprofile-prefix-path=${CMAKE_BINARY_DIR}")
 elseif(P2_PGO STREQUAL "USE")
     target_compile_options(prototype2_recomp PRIVATE "-fprofile-use=${P2_PGO_DATA}" -fprofile-partial-training -fprofile-correction

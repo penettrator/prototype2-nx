@@ -10,6 +10,7 @@
 
 extern "C" bool RexSwitchSetCurrentThreadMask(uint32_t mask);  // SDK threading_switch
 extern "C" void RexSwitchSetCurrentThreadPriority(int priority);
+extern "C" void RexSwitchGuestWorkerForget(void);
 
 REXCVAR_DEFINE_UINT32(p2_audio_engine_mask, 0x8, "Prototype2",
                       "Core mask for the game's audio engine thread (sub_82CC1850; 0x8 = core 3, 0 = unchanged)");
@@ -25,6 +26,9 @@ extern "C" REX_FUNC(sub_82CC1850) {
   const uint32_t priority = REXCVAR_GET(p2_audio_engine_priority);
   if (priority && !done) RexSwitchSetCurrentThreadPriority(int(priority));
   if (mask && !done) {
+#if defined(__SWITCH__)
+    RexSwitchGuestWorkerForget();  // PERF pass 12: keeps its own mask through the workers' core A/B
+#endif
     const bool ok = RexSwitchSetCurrentThreadMask(mask);
     REXLOG_INFO("[p2-audio] audio engine thread core mask 0x{:X}: {}, priority 0x{:X}", mask, ok ? "set" : "refused",
                 priority);

@@ -1,5 +1,6 @@
 diff --git a/sdk/include/rex/graphics/edram_census.h b/sdk/include/rex/graphics/edram_census.h
 new file mode 100644
+index 0000000..4427f70
 --- /dev/null
 +++ b/sdk/include/rex/graphics/edram_census.h
 @@ -0,0 +1,43 @@
@@ -47,22 +48,23 @@ new file mode 100644
 +
 +}  // namespace rex::graphics::edram_census
 diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h b/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h
+index dbd6b01..d72a31a 100644
 --- a/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h
 +++ b/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h
-@@ -33,6 +33,12 @@
- 
+@@ -34,6 +34,12 @@ class SpirvBuilder : public spv::Builder {
    spv::Id createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id operand1, spv::Id operand2,
                         spv::Id operand3, spv::Id operand4);
-+
+ 
 +  // Mercenaries 2 (HANDOFF section 67): false while translating guest ALU instructions that do
 +  // not feed the vertex position, so the driver may fuse multiply-add there. The helpers below
 +  // then create plain operations.
 +  void SetNoContractionEnabled(bool enabled) { no_contraction_enabled_ = enabled; }
 +  bool IsNoContractionEnabled() const { return no_contraction_enabled_; }
- 
++
    spv::Id createNoContractionUnaryOp(spv::Op op_code, spv::Id type_id, spv::Id operand);
    spv::Id createNoContractionBinOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
-@@ -141,6 +147,9 @@
+                                    spv::Id operand2);
+@@ -141,6 +147,9 @@ class SpirvBuilder : public spv::Builder {
  
      Branch current_branch_ = Branch::kSelection;
    };
@@ -73,9 +75,10 @@ diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h b/sdk/incl
  
  }  // namespace rex::graphics
 diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h b/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h
+index 72cb03a..53d80d6 100644
 --- a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h
 +++ b/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h
-@@ -33,7 +33,12 @@
+@@ -33,7 +33,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
      // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
      // prototyping stage (easier to do small granular updates with an
      // incremental counter).
@@ -89,7 +92,7 @@ diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h b/sdk/i
  
      enum class DepthStencilMode : uint32_t {
        kNoModifiers,
-@@ -411,6 +416,17 @@
+@@ -411,6 +416,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
          draw_resolution_scale_x_(draw_resolution_scale_x ? draw_resolution_scale_x : 1),
          draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1) {}
  
@@ -107,7 +110,7 @@ diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h b/sdk/i
    uint64_t GetDefaultVertexShaderModification(
        uint32_t dynamic_addressable_register_count,
        Shader::HostVertexShaderType host_vertex_shader_type =
-@@ -709,7 +725,9 @@
+@@ -709,7 +725,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
    // 2x2 quads.
    bool FSI_IsDepthStencilEarly() const {
      assert_true(edram_fragment_shader_interlock_);
@@ -118,21 +121,21 @@ diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h b/sdk/i
             !current_shader().memexport_eM_written();
    }
    void FSI_LoadSampleMask(spv::Id msaa_samples);
-@@ -764,6 +782,13 @@
-   bool is_depth_only_fragment_shader_ = false;
+@@ -765,6 +783,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
  
    std::unique_ptr<SpirvBuilder> builder_;
-+
+ 
 +  // Mercenaries 2 (HANDOFF section 67, cvar gpu_vs_contraction_outside_position): per ucode
 +  // instruction index of a vertex shader, 1 if the ALU instruction may feed the position (or the
 +  // point size / vertex kill export) and keeps NoContraction; others may be fused by the driver.
 +  void PreparePositionSlice(bool enabled);
 +  std::vector<uint8_t> position_slice_alu_;
 +  bool position_slice_active_ = false;
- 
++
    std::vector<spv::Id> id_vector_temp_;
    // For helper functions like operand loading, so they don't conflict with
-@@ -881,6 +906,9 @@
+   // id_vector_temp_ usage in bigger callbacks.
+@@ -881,6 +906,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
      kSystemConstantEdramBlendConstant,
    };
    spv::Id uniform_system_constants_;
@@ -142,7 +145,7 @@ diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h b/sdk/i
    spv::Id uniform_float_constants_;
    spv::Id uniform_bool_loop_constants_;
    spv::Id uniform_fetch_constants_;
-@@ -1054,6 +1082,19 @@
+@@ -1054,6 +1082,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
    // main_loop_merge_.
    spv::Block* main_loop_exit_;
    spv::Id main_loop_pc_next_;
@@ -163,9 +166,10 @@ diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_translator.h b/sdk/i
    std::unique_ptr<spv::Instruction> main_switch_op_;
    spv::Block* main_switch_merge_;
 diff --git a/sdk/include/rex/graphics/pipeline/shader/translator.h b/sdk/include/rex/graphics/pipeline/shader/translator.h
+index 340ced5..1587057 100644
 --- a/sdk/include/rex/graphics/pipeline/shader/translator.h
 +++ b/sdk/include/rex/graphics/pipeline/shader/translator.h
-@@ -131,6 +131,10 @@
+@@ -131,6 +131,10 @@ class ShaderTranslator {
    virtual void ProcessAluInstruction(const ParsedAluInstruction& /*instr*/,
                                       uint8_t /*memexport_eM_potentially_written_before*/) {}
  
@@ -176,7 +180,7 @@ diff --git a/sdk/include/rex/graphics/pipeline/shader/translator.h b/sdk/include
   private:
    void TranslateControlFlowInstruction(const ucode::ControlFlowInstruction& cf);
    void TranslateExecInstructions(const ParsedExecInstruction& instr);
-@@ -149,6 +153,8 @@
+@@ -149,6 +153,8 @@ class ShaderTranslator {
  
    // Kept for supporting vfetch_mini.
    ucode::VertexFetchInstruction previous_vfetch_full_;
@@ -186,9 +190,10 @@ diff --git a/sdk/include/rex/graphics/pipeline/shader/translator.h b/sdk/include
  
  }  // namespace rex::graphics
 diff --git a/sdk/include/rex/graphics/vulkan/command_processor.h b/sdk/include/rex/graphics/vulkan/command_processor.h
+index 696ff48..d466653 100644
 --- a/sdk/include/rex/graphics/vulkan/command_processor.h
 +++ b/sdk/include/rex/graphics/vulkan/command_processor.h
-@@ -837,6 +837,29 @@
+@@ -837,6 +837,29 @@ class VulkanCommandProcessor : public CommandProcessor {
    // System shader constants.
    SpirvShaderTranslator::SystemConstants system_constants_;
  
@@ -219,23 +224,24 @@ diff --git a/sdk/include/rex/graphics/vulkan/command_processor.h b/sdk/include/r
    std::vector<draw_util::MemExportRange> memexport_ranges_;
  };
 diff --git a/sdk/include/rex/graphics/vulkan/deferred_command_buffer.h b/sdk/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a848..2f7d822 100644
 --- a/sdk/include/rex/graphics/vulkan/deferred_command_buffer.h
 +++ b/sdk/include/rex/graphics/vulkan/deferred_command_buffer.h
-@@ -27,6 +27,13 @@
-  public:
+@@ -28,6 +28,13 @@ class DeferredCommandBuffer {
    DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                          size_t initial_size_bytes = 1024 * 1024);
-+
+ 
 +  // Diagnostic GPU completion markers; the caller owns query pool lifetime.
 +  void CmdVkWriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool pool, uint32_t query) {
 +    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
 +        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
 +    args.stage = stage; args.pool = pool; args.query = query;
 +  }
- 
++
    void Reset();
    void Execute(VkCommandBuffer command_buffer);
-@@ -374,6 +381,7 @@
+ 
+@@ -374,6 +381,7 @@ class DeferredCommandBuffer {
      kVkPipelineBarrier,
      kVkPushConstants,
      kVkResetQueryPool,
@@ -243,7 +249,7 @@ diff --git a/sdk/include/rex/graphics/vulkan/deferred_command_buffer.h b/sdk/inc
      kVkSetBlendConstants,
      kVkSetDepthBias,
      kVkSetScissor,
-@@ -520,6 +528,11 @@
+@@ -520,6 +528,11 @@ class DeferredCommandBuffer {
      uint32_t query;
    };
  
@@ -256,6 +262,7 @@ diff --git a/sdk/include/rex/graphics/vulkan/deferred_command_buffer.h b/sdk/inc
      VkQueryPool query_pool;
      uint32_t first_query;
 diff --git a/sdk/include/rex/ppc/context.h b/sdk/include/rex/ppc/context.h
+index ebd8e96..3fc8e94 100644
 --- a/sdk/include/rex/ppc/context.h
 +++ b/sdk/include/rex/ppc/context.h
 @@ -14,6 +14,7 @@
@@ -266,7 +273,7 @@ diff --git a/sdk/include/rex/ppc/context.h b/sdk/include/rex/ppc/context.h
  #include <cstdint>
  #include <cstring>
  
-@@ -157,10 +158,18 @@
+@@ -157,10 +158,18 @@ constexpr uint32_t kRoundMask = 0x03;
  struct FPSCRRegister {
    uint32_t csr;
  
@@ -286,10 +293,107 @@ diff --git a/sdk/include/rex/ppc/context.h b/sdk/include/rex/ppc/context.h
    static constexpr size_t RoundMaskVal = Platform::RoundMaskVal;
    static constexpr size_t FlushMask = Platform::FlushMask;
  
+diff --git a/sdk/include/rex/ppc/memcalls.h b/sdk/include/rex/ppc/memcalls.h
+new file mode 100644
+index 0000000..ca952dc
+--- /dev/null
++++ b/sdk/include/rex/ppc/memcalls.h
+@@ -0,0 +1,90 @@
++/**
++ * @file        rex/ppc/memcalls.h
++ * @brief       The pure parts of the inline constant-size memcpy / memset (from sasrt-nx, 2026-10-14; banjo-nx's copy)
++ *
++ * tools/inline_memcalls.py writes the C runtime's memcpy / memset calls whose size is a constant of 1-64 bytes as
++ * REX_MEMCPY_CONST / REX_MEMSET_CONST (sa2-nx's idea 6, sonic-unleashed-nx's SWITCH_INLINE_MEMCPY). The helpers that
++ * touch guest memory live in the generated pch (they need its address macros); what they decide with lives here, so
++ * sdk/tests/memcalls_test.cpp tests the same code.
++ *
++ * banjo-nx's addition (the same test its hand-written memcpy, app/src/cpu/hot/banjo_hand_natives.h, makes): the CRT
++ * memcpy stores r3 at -8(r1) first and reloads r3 from there at every return, so a destination that covers that slot
++ * returns copied bytes in r3. CoversSlot declines it (the original runs).
++ */
++#pragma once
++
++#include <cstdint>
++
++namespace rex::ppc {
++
++/// A guest range of N bytes the inline helpers may handle: not in 0x7F000000-0x7FFFFFFF (hardware registers, where
++/// the width of each write matters) or from 0xA0000000 (the physical views, which alias each other: two different
++/// guest addresses can be the same memory), and not wrapping around 4 GB. Anything else runs the original routine.
++template <uint32_t N>
++[[gnu::always_inline]] inline bool PlainRange(uint32_t x) noexcept {
++  static_assert(N >= 1 && N <= 64);
++  const uint32_t e = x + (N - 1);
++  if (e < x) return false;
++  if (x < 0x7F000000u) return e < 0x7F000000u;
++  return x >= 0x80000000u && e < 0xA0000000u;
++}
++
++/// The CRT memcpy copies forward, unit by unit with each unit's loads before its stores: for dst <= src that is what
++/// memmove gives, for dst > src with overlapping ranges it smears already-copied bytes. The helper copies like
++/// memmove, so that case must run the original: true when dst > src and dst - src < N.
++template <uint32_t N>
++[[gnu::always_inline]] inline bool CopySmears(uint32_t dst, uint32_t src) noexcept {
++  return uint32_t(dst - src - 1u) < N - 1u;
++}
++
++/// True when [dst, dst + N) overlaps the 8-byte save slot [slot, slot + 8) (slot = r1 - 8).
++template <uint32_t N>
++[[gnu::always_inline]] inline bool CoversSlot(uint32_t dst, uint32_t slot) noexcept {
++  return uint64_t(uint32_t(slot + 7u - dst)) < uint64_t(N) + 7u;
++}
++
++/// N bytes, 1 <= N <= 64, every load before every store (two to eight loads and as many stores, overlapping where N
++/// is not a power of two).
++template <uint32_t N>
++[[gnu::always_inline]] inline void CopyConst(uint8_t* d, const uint8_t* s) noexcept {
++  static_assert(N >= 1 && N <= 64);
++  if constexpr (N > 32) {
++    uint8_t a[16], b[16], c[16], e[16];
++    __builtin_memcpy(a, s, 16);
++    __builtin_memcpy(b, s + 16, 16);
++    __builtin_memcpy(c, s + N - 32, 16);
++    __builtin_memcpy(e, s + N - 16, 16);
++    __builtin_memcpy(d, a, 16);
++    __builtin_memcpy(d + 16, b, 16);
++    __builtin_memcpy(d + N - 32, c, 16);
++    __builtin_memcpy(d + N - 16, e, 16);
++  } else if constexpr (N >= 16) {
++    uint8_t a[16], e[16];
++    __builtin_memcpy(a, s, 16);
++    __builtin_memcpy(e, s + N - 16, 16);
++    __builtin_memcpy(d, a, 16);
++    __builtin_memcpy(d + N - 16, e, 16);
++  } else if constexpr (N >= 8) {
++    uint64_t a, e;
++    __builtin_memcpy(&a, s, 8);
++    __builtin_memcpy(&e, s + N - 8, 8);
++    __builtin_memcpy(d, &a, 8);
++    __builtin_memcpy(d + N - 8, &e, 8);
++  } else if constexpr (N >= 4) {
++    uint32_t a, e;
++    __builtin_memcpy(&a, s, 4);
++    __builtin_memcpy(&e, s + N - 4, 4);
++    __builtin_memcpy(d, &a, 4);
++    __builtin_memcpy(d + N - 4, &e, 4);
++  } else if constexpr (N >= 2) {
++    uint16_t a, e;
++    __builtin_memcpy(&a, s, 2);
++    __builtin_memcpy(&e, s + N - 2, 2);
++    __builtin_memcpy(d, &a, 2);
++    __builtin_memcpy(d + N - 2, &e, 2);
++  } else {
++    *d = *s;
++  }
++}
++
++}  // namespace rex::ppc
 diff --git a/sdk/include/rex/system/kernel_state.h b/sdk/include/rex/system/kernel_state.h
+index 9b9cf9e..20b88ea 100644
 --- a/sdk/include/rex/system/kernel_state.h
 +++ b/sdk/include/rex/system/kernel_state.h
-@@ -171,6 +171,14 @@
+@@ -171,6 +171,14 @@ struct TerminateNotification {
    uint32_t priority;
  };
  
@@ -304,7 +408,7 @@ diff --git a/sdk/include/rex/system/kernel_state.h b/sdk/include/rex/system/kern
  /// Host-side metadata for a fiber managed by rexcrt hooks.
  struct FiberInfo {
    rex::thread::Fiber* host_fiber;  ///< Host OS fiber handle
-@@ -179,6 +187,7 @@
+@@ -179,6 +187,7 @@ struct FiberInfo {
    uint32_t guest_stack_base;       ///< Top of guest kernel stack (0 for thread fibers)
    uint32_t guest_stack_bottom;     ///< Bottom of guest kernel stack (0 for thread fibers)
    bool is_thread_fiber;            ///< true = ConvertThreadToFiber (don't free guest stack)
@@ -312,8 +416,21 @@ diff --git a/sdk/include/rex/system/kernel_state.h b/sdk/include/rex/system/kern
  };
  
  class KernelState {
+diff --git a/sdk/include/rex/system/xthread.h b/sdk/include/rex/system/xthread.h
+index a72911e..6694899 100644
+--- a/sdk/include/rex/system/xthread.h
++++ b/sdk/include/rex/system/xthread.h
+@@ -333,6 +333,7 @@ class XThread : public XObject {
+   bool is_running() const { return running_; }
+ 
+   uint32_t thread_id() const { return thread_id_; }
++  const std::string& thread_name() const { return thread_name_; }  // PERF pass 12 wait histogram
+   uint32_t last_error();
+   void set_last_error(uint32_t error_code);
+   void set_name(const std::string_view name);
 diff --git a/sdk/include/rex/ui/gpu_wait_diagnostics.h b/sdk/include/rex/ui/gpu_wait_diagnostics.h
 new file mode 100644
+index 0000000..1afb1fb
 --- /dev/null
 +++ b/sdk/include/rex/ui/gpu_wait_diagnostics.h
 @@ -0,0 +1,35 @@
@@ -354,6 +471,7 @@ new file mode 100644
 +}
 diff --git a/sdk/include/rex/ui/ordered_present.h b/sdk/include/rex/ui/ordered_present.h
 new file mode 100644
+index 0000000..38dce8b
 --- /dev/null
 +++ b/sdk/include/rex/ui/ordered_present.h
 @@ -0,0 +1,54 @@
@@ -412,6 +530,7 @@ new file mode 100644
 +};
 +} // namespace rex::ui
 diff --git a/sdk/include/rex/ui/presenter.h b/sdk/include/rex/ui/presenter.h
+index bc8e10a..2c54c5c 100644
 --- a/sdk/include/rex/ui/presenter.h
 +++ b/sdk/include/rex/ui/presenter.h
 @@ -38,6 +38,7 @@
@@ -422,7 +541,7 @@ diff --git a/sdk/include/rex/ui/presenter.h b/sdk/include/rex/ui/presenter.h
  #include <rex/ui/surface.h>
  #include <rex/ui/ui_drawer.h>
  
-@@ -999,6 +1000,8 @@
+@@ -999,6 +1000,8 @@ class Presenter {
    // The presenter's own thread. Only the UI thread (and ~Presenter()) touches the unique_ptr and the
    // name; the rest is under paint_thread_mutex_. `paint_thread_active_` is the only thing the game
    // thread checks to know whether there is anyone to notify.
@@ -433,6 +552,7 @@ diff --git a/sdk/include/rex/ui/presenter.h b/sdk/include/rex/ui/presenter.h
    std::mutex paint_thread_mutex_;
 diff --git a/sdk/include/rex/ui/vulkan/switch_shader_stats.h b/sdk/include/rex/ui/vulkan/switch_shader_stats.h
 new file mode 100644
+index 0000000..668d531
 --- /dev/null
 +++ b/sdk/include/rex/ui/vulkan/switch_shader_stats.h
 @@ -0,0 +1,23 @@
@@ -460,23 +580,24 @@ new file mode 100644
 +inline std::atomic<VkDevice> switch_shader_stats_device{VK_NULL_HANDLE};
 +}
 diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_switch.cpp
+index eb24fd7..ef02f70 100644
 --- a/sdk/src/core/guest_memory_switch.cpp
 +++ b/sdk/src/core/guest_memory_switch.cpp
-@@ -103,6 +103,13 @@
+@@ -102,6 +102,13 @@ struct State {
+      * the window, whether it is committed or not.
       */
      std::map<size_t, RexGmAccess> protection;
-     /*
++    /*
 +     * Pages the guest made read-only but that stay mapped (RexGmSetReadOnlyMapped,
 +     * from project8-sw SDK patch 0009). `protection` keeps meaning "unmapped on
 +     * purpose", so every mapping path is unchanged; only queries report these
 +     * pages as read-only.
 +     */
 +    std::set<size_t> readonly_logical;
-+    /*
+     /*
       * Which (view index, chunk offset) pairs are mapped. A chunk is not mapped into
       * all five views when it is committed: it enters each view the first time it is
-      * accessed there. The real ceiling on Horizon is the process limit on mappable
-@@ -120,7 +127,67 @@
+@@ -120,7 +127,67 @@ State& S() {
      return s;
  }
  
@@ -545,12 +666,10 @@ diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_sw
  
  bool Intersect(size_t a, size_t al, size_t b, size_t bl, size_t* lo, size_t* hi) {
      const size_t l = a > b ? a : b;
-@@ -153,6 +220,23 @@
- RexGmAccess AccessOf(State& s, size_t page_off) {
-     auto it = s.protection.find(page_off);
+@@ -155,6 +222,23 @@ RexGmAccess AccessOf(State& s, size_t page_off) {
      return it == s.protection.end() ? REX_GM_WRITE : it->second;
-+}
-+
+ }
+ 
 +/*
 + * Read-only guest pages kept mapped (project8-sw SDK patch 0009, for the native renderer).
 + *
@@ -566,10 +685,12 @@ diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_sw
 +    auto it = s.protection.find(page_off);
 +    if (it != s.protection.end()) return it->second;
 +    return s.readonly_logical.count(page_off) ? REX_GM_READ : REX_GM_WRITE;
- }
- 
++}
++
  /* Is there committed backing behind this window address? */
-@@ -352,6 +436,10 @@
+ bool IsCommittedWindowAddress(State& s, uint64_t addr) {
+     const View* v = ViewFor(s, addr);
+@@ -352,6 +436,10 @@ void ReleaseChunk(const Chunk& c) {
  extern "C" {
  
  uint8_t* RexGmInit(size_t size) {
@@ -580,7 +701,7 @@ diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_sw
      State& s = S();
      std::lock_guard<std::mutex> lock(s.mutex);
      if (s.base) return s.base;
-@@ -382,6 +470,7 @@
+@@ -382,6 +470,7 @@ void RexGmShutdown(void) {
      s.chunks.clear();
      s.views.clear();
      s.protection.clear();
@@ -588,12 +709,10 @@ diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_sw
      s.committed = 0;
      s.mapped = 0;
  
-@@ -587,6 +676,32 @@
-     if (!c) return false;                                       /* not committed */
-     if (s.view_mapped.count({vi, c->offset}) != 0) return false; /* already there */
+@@ -589,6 +678,32 @@ bool RexGmFaultIn(uint64_t window_address) {
      return MapChunkIntoView(s, vi, *c);
-+}
-+
+ }
+ 
 +bool RexGmMapCommittedRange(uint8_t* address, size_t length) {
 +    State& s = S();
 +    std::lock_guard<std::mutex> lock(s.mutex);
@@ -618,18 +737,19 @@ diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_sw
 +                              view_base + view.length - current));
 +    }
 +    return true;
- }
- 
++}
++
  bool RexGmDecommit(size_t offset, size_t length) {
-@@ -628,9 +743,15 @@
+     State& s = S();
+     std::lock_guard<std::mutex> lock(s.mutex);
+@@ -628,9 +743,15 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
      const size_t begin = AlignDown(static_cast<size_t>(addr - wbase), kPageSize);
      const size_t end   = AlignUp(static_cast<size_t>(addr - wbase) + length, kPageSize);
  
 -    if (out_old) *out_old = AccessOf(s, begin);
--
--    const bool must_be = (access == REX_GM_WRITE);
 +    if (out_old) *out_old = ReportedAccessOf(s, begin);
-+
+ 
+-    const bool must_be = (access == REX_GM_WRITE);
 +    const bool ro_mapped = g_ro_mapped && access == REX_GM_READ;
 +    for (size_t p = begin; p < end; p += kPageSize) {
 +        if (ro_mapped) s.readonly_logical.insert(p);
@@ -640,7 +760,7 @@ diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_sw
  
      /*
       * Fast path, and the common one: asking for full access on a range that has no
-@@ -722,7 +843,7 @@
+@@ -722,7 +843,7 @@ bool RexGmQueryProtect(uint8_t* address, size_t* length, RexGmAccess* out_access
          return true;
      }
  
@@ -649,7 +769,7 @@ diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_sw
      if (out_access) *out_access = a;
  
      /*
-@@ -734,7 +855,7 @@
+@@ -734,7 +855,7 @@ bool RexGmQueryProtect(uint8_t* address, size_t* length, RexGmAccess* out_access
  
      size_t p = begin;
      const size_t cap = begin + max;
@@ -658,7 +778,7 @@ diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_sw
          p += kPageSize;
      if (length) *length = p - begin;
      return true;
-@@ -759,3 +880,11 @@
+@@ -759,3 +880,11 @@ void* RexGmShadowFor(uint64_t window_address) {
  }  // extern "C"
  
  #endif /* __SWITCH__ */
@@ -671,9 +791,10 @@ diff --git a/sdk/src/core/guest_memory_switch.cpp b/sdk/src/core/guest_memory_sw
 +}
 +#endif
 diff --git a/sdk/src/core/guest_memory_switch.h b/sdk/src/core/guest_memory_switch.h
+index 45e8d93..7280507 100644
 --- a/sdk/src/core/guest_memory_switch.h
 +++ b/sdk/src/core/guest_memory_switch.h
-@@ -127,6 +127,9 @@
+@@ -127,6 +127,9 @@ bool RexGmDecommit(size_t offset, size_t length);
   */
  bool RexGmFaultIn(uint64_t window_address);
  
@@ -684,9 +805,10 @@ diff --git a/sdk/src/core/guest_memory_switch.h b/sdk/src/core/guest_memory_swit
   * Changes the logical permissions of a range of the window.
   *
 diff --git a/sdk/src/core/memory_switch.cpp b/sdk/src/core/memory_switch.cpp
+index d155038..05e8dc8 100644
 --- a/sdk/src/core/memory_switch.cpp
 +++ b/sdk/src/core/memory_switch.cpp
-@@ -176,6 +176,14 @@
+@@ -176,6 +176,14 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
                   reinterpret_cast<uintptr_t>(base_address), RexGmLastResult());
      return nullptr;
    }
@@ -702,9 +824,57 @@ diff --git a/sdk/src/core/memory_switch.cpp b/sdk/src/core/memory_switch.cpp
  }
  
 diff --git a/sdk/src/core/threading_posix.cpp b/sdk/src/core/threading_posix.cpp
+index 425b53b..8d59716 100644
 --- a/sdk/src/core/threading_posix.cpp
 +++ b/sdk/src/core/threading_posix.cpp
-@@ -849,7 +849,10 @@
+@@ -75,6 +75,8 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #define REX_HAS_SIGEV_THREAD_ID 0
+ #endif
+ 
++REXCVAR_DEFINE_UINT32(p2_semaphore_skip_empty_wake, 0, "Threading",
++                      "Empty semaphore consume wake: 0 = original, 1 = skip, 2 = Switch A/B (skip in odd 30 s periods)");
+ REXCVAR_DEFINE_BOOL(thread_wait_blocking, true, "Threading",
+                     "Event-driven waits: WaitMultiple parks on a wake point instead of polling every 1 ms, "
+                     "and alertable waits are woken by the queued APC hint instead of a 1 ms poll slice. "
+@@ -661,7 +663,8 @@ template <>
+ class PosixCondition<Semaphore> : public PosixConditionBase {
+  public:
+   PosixCondition(uint32_t initial_count, uint32_t maximum_count)
+-      : count_(initial_count), maximum_count_(maximum_count) {}
++      : count_(initial_count), maximum_count_(maximum_count),
++        skip_empty_wake_(REXCVAR_GET(p2_semaphore_skip_empty_wake)) {}
+ 
+   bool Signal() override { return Release(1, nullptr); }
+ 
+@@ -684,10 +687,26 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+   inline bool signaled() const override { return count_ > 0; }
+   inline void post_execution() override {
+     count_--;
+-    cond_.notify_all();
++    // Waiters test count_ > 0 under this same mutex. Consuming the final
++    // token cannot satisfy another wait. Release and APC keep their wakes.
++    if (count_ || !SkipEmptyWake()) {
++      cond_.notify_all();
++    }
++  }
++  bool SkipEmptyWake() const {
++#if defined(__SWITCH__)
++    if (skip_empty_wake_ == 2) {
++      uint64_t tick, frequency;
++      asm volatile("mrs %0, cntpct_el0" : "=r"(tick));
++      asm volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
++      return frequency && ((tick / (frequency * 30) & 1) != 0);
++    }
++#endif
++    return skip_empty_wake_ == 1;
+   }
+   uint32_t count_;
+   const uint32_t maximum_count_;
++  const uint32_t skip_empty_wake_;
+ };
+ 
+ template <>
+@@ -849,7 +868,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
      pthread_attr_t attr;
      if (pthread_attr_init(&attr) != 0)
        return false;
@@ -716,7 +886,7 @@ diff --git a/sdk/src/core/threading_posix.cpp b/sdk/src/core/threading_posix.cpp
        pthread_attr_destroy(&attr);
        return false;
      }
-@@ -865,7 +868,10 @@
+@@ -865,7 +887,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
          return false;
        }
      }
@@ -729,9 +899,10 @@ diff --git a/sdk/src/core/threading_posix.cpp b/sdk/src/core/threading_posix.cpp
        return false;
      }
 diff --git a/sdk/src/core/threading_switch.cpp b/sdk/src/core/threading_switch.cpp
+index d083c32..0bc4a8f 100644
 --- a/sdk/src/core/threading_switch.cpp
 +++ b/sdk/src/core/threading_switch.cpp
-@@ -302,6 +302,29 @@
+@@ -302,6 +302,29 @@ bool RexSwitchSetCurrentThreadCore(int core) {
   * thread does not get to run. That is why it sits behind a cvar that is off by default and is
   * checked in the log. See docs/platform-notes.md (Threads).
   */
@@ -761,24 +932,99 @@ diff --git a/sdk/src/core/threading_switch.cpp b/sdk/src/core/threading_switch.c
  bool RexSwitchPinCurrentThreadToCore(int core) {
    if (core < 0) {
      return false;
+@@ -331,6 +354,61 @@ bool RexSwitchPinCurrentThreadToCore(int core) {
+  */
+ int RexSwitchCurrentCore(void) { return int(svcGetCurrentProcessorNumber()); }
+ 
++/* PERF pass 12: see threading_switch.h. Handles of live guest workers; a worker leaves at exit (xthread.cpp). */
++static std::mutex g_guest_workers_mutex;
++static Handle g_guest_workers[256];
++static uint32_t g_guest_workers_count = 0;
++
++void RexSwitchGuestWorkerRegister(void) {
++  Thread* self = threadGetSelf();
++  if (self == nullptr) return;
++  std::lock_guard<std::mutex> lock(g_guest_workers_mutex);
++  for (uint32_t i = 0; i < g_guest_workers_count; ++i)
++    if (g_guest_workers[i] == self->handle) return;
++  if (g_guest_workers_count < 256) g_guest_workers[g_guest_workers_count++] = self->handle;
++}
++
++void RexSwitchGuestWorkerForget(void) {
++  Thread* self = threadGetSelf();
++  if (self == nullptr) return;
++  std::lock_guard<std::mutex> lock(g_guest_workers_mutex);
++  for (uint32_t i = 0; i < g_guest_workers_count; ++i) {
++    if (g_guest_workers[i] == self->handle) {
++      g_guest_workers[i] = g_guest_workers[--g_guest_workers_count];
++      return;
++    }
++  }
++}
++
++uint32_t RexSwitchApplyGuestWorkerPriority(int priority) {
++  std::lock_guard<std::mutex> lock(g_guest_workers_mutex);
++  uint32_t ok = 0;
++  for (uint32_t i = 0; i < g_guest_workers_count; ++i)
++    ok += R_SUCCEEDED(svcSetThreadPriority(g_guest_workers[i], u32(priority))) ? 1u : 0u;
++  return ok;
++}
++
++static Handle g_main_thread = 0;
++void RexSwitchMainThreadRegister(void) {
++  Thread* self = threadGetSelf();
++  if (self) g_main_thread = self->handle;
++}
++bool RexSwitchSetMainThreadPriority(int priority) {
++  return g_main_thread && R_SUCCEEDED(svcSetThreadPriority(g_main_thread, u32(priority)));
++}
++
++uint32_t RexSwitchApplyGuestWorkerMask(uint32_t want) {
++  u64 process_mask = 0;
++  if (R_FAILED(svcGetInfo(&process_mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0))) process_mask = 0x7;
++  const u64 use = u64(want) & process_mask & 0xF;
++  if (!use) return 0;
++  std::lock_guard<std::mutex> lock(g_guest_workers_mutex);
++  uint32_t ok = 0;
++  for (uint32_t i = 0; i < g_guest_workers_count; ++i)
++    ok += R_SUCCEEDED(svcSetThreadCoreMask(g_guest_workers[i], __builtin_ctzll(use), use)) ? 1u : 0u;
++  return ok;
++}
++
+ }  // extern "C"
+ 
+ #endif  /* REX_PLATFORM_SWITCH */
 diff --git a/sdk/src/core/threading_switch.h b/sdk/src/core/threading_switch.h
+index c5b960a..0315993 100644
 --- a/sdk/src/core/threading_switch.h
 +++ b/sdk/src/core/threading_switch.h
-@@ -169,6 +169,10 @@
+@@ -169,6 +169,21 @@ bool RexSwitchPinCurrentThreadToCore(int core);
  /* Which core the calling thread is running on right now. It can only be asked about oneself. */
  int RexSwitchCurrentCore(void);
  
 +/* The current thread may run only on the cores of `mask` (bits 0-2; the lowest becomes its
 + * preferred core). Cores outside the process mask are dropped. Returns whether it was accepted. */
 +bool RexSwitchSetCurrentThreadMask(uint32_t mask);
++/* PERF pass 12 (Prototype 2): the guest job workers that got p2_guest_core_mask at start are remembered, so a
++ * measurement can give them another mask while the game runs (in-run A/B). A thread that is pinned later (the
++ * simulation thread, the audio engine) leaves the set with RexSwitchGuestWorkerForget. */
++void RexSwitchGuestWorkerRegister(void);
++void RexSwitchGuestWorkerForget(void);
++uint32_t RexSwitchApplyGuestWorkerMask(uint32_t mask);
++/* PERF pass 18: the guest "Main XThread" handle, so its priority can be changed while the game runs (A/B). */
++void RexSwitchMainThreadRegister(void);
++bool RexSwitchSetMainThreadPriority(int priority);
++/* PERF pass 20: priority of the remembered guest job workers (A/B). Returns how many accepted it. */
++uint32_t RexSwitchApplyGuestWorkerPriority(int priority);
 +
  #ifdef __cplusplus
  }
  #endif
 diff --git a/sdk/src/graphics/CMakeLists.txt b/sdk/src/graphics/CMakeLists.txt
+index ea4789c..be1428b 100644
 --- a/sdk/src/graphics/CMakeLists.txt
 +++ b/sdk/src/graphics/CMakeLists.txt
-@@ -20,6 +20,7 @@
+@@ -20,6 +20,7 @@ set(REXGPU_XENOS_SOURCES
      command_processor.cpp
      util/draw_extent_estimator.cpp
      util/draw.cpp
@@ -787,6 +1033,7 @@ diff --git a/sdk/src/graphics/CMakeLists.txt b/sdk/src/graphics/CMakeLists.txt
      primitive_processor.cpp
      pipeline/render_target/cache.cpp
 diff --git a/sdk/src/graphics/command_processor.cpp b/sdk/src/graphics/command_processor.cpp
+index 4870c8d..606ccc5 100644
 --- a/sdk/src/graphics/command_processor.cpp
 +++ b/sdk/src/graphics/command_processor.cpp
 @@ -13,6 +13,9 @@
@@ -799,7 +1046,7 @@ diff --git a/sdk/src/graphics/command_processor.cpp b/sdk/src/graphics/command_p
  #include <string_view>
  
  #include <fmt/format.h>
-@@ -681,7 +684,7 @@
+@@ -681,7 +684,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
        // The ring wraps around, so the subtraction is masked with the size.
        const uint32_t advanced = (now - published) & (words_ring - 1);
        if (advanced >= step) {
@@ -808,7 +1055,7 @@ diff --git a/sdk/src/graphics/command_processor.cpp b/sdk/src/graphics/command_p
                                           now);
          published = now;
        }
-@@ -699,10 +702,38 @@
+@@ -699,10 +702,38 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
    // Execute commands!
    memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
    reader.set_write_offset(count * sizeof(uint32_t));
@@ -848,7 +1095,7 @@ diff --git a/sdk/src/graphics/command_processor.cpp b/sdk/src/graphics/command_p
        assert_always();
        break;
      }
-@@ -755,8 +786,8 @@
+@@ -755,8 +786,8 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
  
    uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
    if (reader->read_count() < count * sizeof(uint32_t)) {
@@ -861,6 +1108,7 @@ diff --git a/sdk/src/graphics/command_processor.cpp b/sdk/src/graphics/command_p
  
 diff --git a/sdk/src/graphics/edram_census.cpp b/sdk/src/graphics/edram_census.cpp
 new file mode 100644
+index 0000000..991d3a0
 --- /dev/null
 +++ b/sdk/src/graphics/edram_census.cpp
 @@ -0,0 +1,299 @@
@@ -1164,6 +1412,7 @@ new file mode 100644
 +
 +}  // namespace rex::graphics::edram_census
 diff --git a/sdk/src/graphics/pipeline/render_target/cache.cpp b/sdk/src/graphics/pipeline/render_target/cache.cpp
+index 953c5fd..d000a15 100644
 --- a/sdk/src/graphics/pipeline/render_target/cache.cpp
 +++ b/sdk/src/graphics/pipeline/render_target/cache.cpp
 @@ -19,6 +19,7 @@
@@ -1174,23 +1423,24 @@ diff --git a/sdk/src/graphics/pipeline/render_target/cache.cpp b/sdk/src/graphic
  #include <rex/graphics/flags.h>
  #include <rex/graphics/pipeline/render_target/cache.h>
  #include <rex/graphics/register_file.h>
-@@ -676,6 +677,12 @@
-     if (interlock_barrier_needed) {
-       RequestPixelShaderInterlockBarrier();
+@@ -678,6 +679,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
      }
-+  }
-+
+   }
+ 
 +  if (edram_census::Enabled()) {
 +    edram_census::OnDraw(regs, normalized_depth_control, normalized_color_mask, msaa_samples,
 +                         pitch_tiles_at_32bpp, edram_bases_sorted, edram_bases_sorted_count,
 +                         rt_lengths_tiles);
-   }
- 
++  }
++
    // From now on ownership transfers should succeed for simplicity and
+   // consistency, even if they fail in the implementation (just ignore that and
+   // draw with whatever contents currently are in the render target in this
 diff --git a/sdk/src/graphics/pipeline/shader/spirv_builder.cpp b/sdk/src/graphics/pipeline/shader/spirv_builder.cpp
+index fe0aa4e..80aaabb 100644
 --- a/sdk/src/graphics/pipeline/shader/spirv_builder.cpp
 +++ b/sdk/src/graphics/pipeline/shader/spirv_builder.cpp
-@@ -42,14 +42,14 @@
+@@ -42,14 +42,14 @@ spv::Id SpirvBuilder::createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id ope
  spv::Id SpirvBuilder::createNoContractionUnaryOp(spv::Op op_code, spv::Id type_id,
                                                   spv::Id operand) {
    spv::Id result = createUnaryOp(op_code, type_id, operand);
@@ -1208,9 +1458,10 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_builder.cpp b/sdk/src/graphi
  }
  
 diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/graphics/pipeline/shader/spirv_translator.cpp
+index 38fc7d1..a74fc21 100644
 --- a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp
 +++ b/sdk/src/graphics/pipeline/shader/spirv_translator.cpp
-@@ -21,10 +21,17 @@
+@@ -21,11 +21,18 @@
  #include <fmt/format.h>
  
  #include <rex/assert.h>
@@ -1219,16 +1470,17 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/gra
  #include <rex/graphics/pipeline/shader/spirv_translator.h>
  #include <rex/math.h>
  #include <rex/string/buffer.h>
-+
+ 
 +
 +// Mercenaries 2 (HANDOFF section 67). Off: every guest ALU operation keeps NoContraction.
 +REXCVAR_DEFINE_BOOL(gpu_vs_contraction_outside_position, false, "GPU",
 +                    "Vertex shaders: let the driver fuse multiply-add in ALU instructions that "
 +                    "cannot affect the position (backward slice from the position export)");
- 
++
  namespace rex::graphics {
  
-@@ -160,6 +167,8 @@
+ SpirvShaderTranslator::Features::Features(bool all)
+@@ -160,6 +167,8 @@ void SpirvShaderTranslator::Reset() {
    main_switch_op_.reset();
    main_switch_next_pc_phi_operands_.clear();
    main_loop_exit_ = nullptr;
@@ -1237,7 +1489,7 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/gra
  
    cf_exec_conditional_merge_ = nullptr;
    cf_instruction_predicate_merge_ = nullptr;
-@@ -172,9 +181,11 @@
+@@ -172,9 +181,11 @@ uint32_t SpirvShaderTranslator::GetModificationRegisterCount() const {
  }
  
  void SpirvShaderTranslator::StartTranslation() {
@@ -1249,7 +1501,7 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/gra
  
    builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                    : spv::CapabilityShader);
-@@ -499,10 +510,10 @@
+@@ -499,10 +510,10 @@ void SpirvShaderTranslator::StartTranslation() {
      var_main_vfetch_address_ =
          builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
                                   "xe_var_vfetch_address", const_int_0_);
@@ -1261,7 +1513,7 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/gra
          builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
                                   "xe_var_tfetch_lod", const_float_0_);
      var_main_tfetch_gradients_h_ =
-@@ -608,7 +619,10 @@
+@@ -608,7 +619,10 @@ void SpirvShaderTranslator::StartTranslation() {
  
    // If no jumps, don't create a switch, but still create a loop so exece can
    // break.
@@ -1273,7 +1525,7 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/gra
  
    // Main loop header - based on whether it's the first iteration (entered from
    // the function or from the continuation), choose the program counter.
-@@ -660,7 +674,11 @@
+@@ -660,7 +674,11 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
    if (!is_depth_only_fragment_shader_) {
      // Close flow control within the last switch case.
      CloseExecConditionals();
@@ -1286,7 +1538,7 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/gra
      // After the final exec (if it happened to be not exece, which would already
      // have a break branch), break from the switch if it exists, or from the
      // loop it doesn't.
-@@ -1294,6 +1312,12 @@
+@@ -1294,6 +1312,12 @@ void SpirvShaderTranslator::PostTranslation() {
  }
  
  void SpirvShaderTranslator::ProcessLabel(uint32_t cf_index) {
@@ -1299,7 +1551,7 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/gra
    if (cf_index == 0) {
      // 0 already added in the beginning.
      return;
-@@ -1329,8 +1353,7 @@
+@@ -1329,8 +1353,7 @@ void SpirvShaderTranslator::ProcessExecInstructionEnd(const ParsedExecInstructio
      // Break out of the main switch (if exists) and the main loop.
      CloseInstructionPredication();
      if (!builder_->getBuildPoint()->isTerminated()) {
@@ -1309,7 +1561,7 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/gra
      }
    }
    UpdateExecConditionals(instr.type, instr.bool_constant_index, instr.condition);
-@@ -1543,7 +1566,117 @@
+@@ -1543,7 +1566,117 @@ void SpirvShaderTranslator::ProcessLoopEndInstruction(const ParsedLoopEndInstruc
    // Now going to fall through to the next control flow instruction.
  }
  
@@ -1428,13 +1680,13 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator.cpp b/sdk/src/gra
    ParsedExecInstruction::Type type;
    if (instr.type == ParsedJumpInstruction::Type::kConditional) {
 diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator_alu.cpp b/sdk/src/graphics/pipeline/shader/spirv_translator_alu.cpp
+index 706ac7e..520878d 100644
 --- a/sdk/src/graphics/pipeline/shader/spirv_translator_alu.cpp
 +++ b/sdk/src/graphics/pipeline/shader/spirv_translator_alu.cpp
-@@ -21,6 +21,153 @@
- #include <rex/math.h>
+@@ -22,6 +22,153 @@
  
  namespace rex::graphics {
-+
+ 
 +namespace {
 +
 +// Mercenaries 2 (HANDOFF section 67): ALU instructions of a vertex shader that may feed the
@@ -1581,15 +1833,14 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator_alu.cpp b/sdk/src
 +  }
 +  position_slice_active_ = ComputeVertexPositionSlice(current_shader(), position_slice_alu_);
 +}
- 
++
  spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs,
                                                        spv::Id operand_1_abs) {
-@@ -60,6 +207,18 @@
-   if (instr.IsNop()) {
-     // Don't even disassemble or update predication.
+   EnsureBuildPointAvailable();
+@@ -62,6 +209,18 @@ void SpirvShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& in
      return;
-+  }
-+
+   }
+ 
 +  // Mercenaries 2 (HANDOFF section 67): outside the position slice the driver may fuse
 +  // multiply-add; the guard restores NoContraction for everything after this instruction.
 +  struct NoContractionGuard {
@@ -1600,13 +1851,16 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator_alu.cpp b/sdk/src
 +    uint32_t offset = current_alu_instruction_offset();
 +    builder_->SetNoContractionEnabled(offset >= position_slice_alu_.size() ||
 +                                      position_slice_alu_[offset] != 0);
-   }
- 
++  }
++
    UpdateInstructionPredication(instr.is_predicated, instr.predicate_condition);
+ 
+   // Floating-point arithmetic operations (addition, subtraction, negation,
 diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/sdk/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 46d01a9..b5cfafb 100644
 --- a/sdk/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
 +++ b/sdk/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
-@@ -1303,17 +1303,27 @@
+@@ -1303,17 +1303,27 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
          }
        }
  
@@ -1646,9 +1900,10 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/sdk/s
  
        spv::Builder::TextureParameters texture_parameters = {};
 diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+index 765c141..5b28af7 100644
 --- a/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp
 +++ b/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp
-@@ -800,8 +800,30 @@
+@@ -800,8 +800,30 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
    spv::Block* block_fsi_if_after_depth_stencil_merge = nullptr;
  
    if (edram_fragment_shader_interlock_) {
@@ -1680,7 +1935,7 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/sdk/src/
          // Don't do anything related to writing to the EDRAM if the pixel was
          // killed.
          id_vector_temp_.clear();
-@@ -862,17 +884,21 @@
+@@ -862,17 +884,21 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
        if (msaa_samples == spv::NoResult) {
          msaa_samples = LoadMsaaSamplesFromFlags();
        }
@@ -1713,7 +1968,7 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/sdk/src/
        if (color_targets_written) {
          // Only bits 0:3 of main_fsi_sample_mask_ are written by the late
          // depth / stencil test.
-@@ -1679,6 +1705,9 @@
+@@ -1679,6 +1705,9 @@ spv::Id SpirvShaderTranslator::FSI_AddSampleOffset(spv::Id sample_0_address, uin
  
  void SpirvShaderTranslator::FSI_DepthStencilTest(spv::Id msaa_samples,
                                                   bool sample_mask_potentially_narrowed_previouly) {
@@ -1724,9 +1979,10 @@ diff --git a/sdk/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/sdk/src/
    bool shader_writes_depth = current_shader().writes_depth();
    bool implicit_early_z_write_allowed = current_shader().implicit_early_z_write_allowed();
 diff --git a/sdk/src/graphics/pipeline/shader/translator.cpp b/sdk/src/graphics/pipeline/shader/translator.cpp
+index e472251..8ca0350 100644
 --- a/sdk/src/graphics/pipeline/shader/translator.cpp
 +++ b/sdk/src/graphics/pipeline/shader/translator.cpp
-@@ -905,7 +905,9 @@
+@@ -905,7 +905,9 @@ void ShaderTranslator::TranslateExecInstructions(const ParsedExecInstruction& in
        auto& op = *reinterpret_cast<const AluInstruction*>(op_ptr);
        ParsedAluInstruction alu_instr;
        ParseAluInstruction(op, current_shader().type(), alu_instr);
@@ -1737,6 +1993,7 @@ diff --git a/sdk/src/graphics/pipeline/shader/translator.cpp b/sdk/src/graphics/
                InstructionStorageTarget::kExportData &&
            alu_instr.vector_and_constant_result.GetUsedWriteMask()) {
 diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_cs.h b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_cs.h
+index 23418f4..209373b 100644
 --- a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_cs.h
 +++ b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_cs.h
 @@ -1,39 +1,57 @@
@@ -1879,10 +2136,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_cs.h b/sd
        %int_5 = OpConstant %int 5
        %int_7 = OpConstant %int 7
 -     %int_14 = OpConstant %int 14
-+      %int_8 = OpConstant %int 8
-+     %int_12 = OpConstant %int 12
-+      %int_3 = OpConstant %int 3
-       %int_2 = OpConstant %int 2
+-      %int_2 = OpConstant %int 2
 -    %int_n16 = OpConstant %int -16
 -      %int_1 = OpConstant %int 1
 -     %int_15 = OpConstant %int 15
@@ -1890,12 +2144,15 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_cs.h b/sd
 -   %int_n512 = OpConstant %int -512
 -      %int_3 = OpConstant %int 3
 -    %int_448 = OpConstant %int 448
--      %int_8 = OpConstant %int 8
+       %int_8 = OpConstant %int 8
 -      %int_6 = OpConstant %int 6
 -     %int_63 = OpConstant %int 63
 -     %uint_6 = OpConstant %uint 6
 -%int_268435455 = OpConstant %int 268435455
 -     %int_n2 = OpConstant %int -2
++     %int_12 = OpConstant %int 12
++      %int_3 = OpConstant %int 3
++      %int_2 = OpConstant %int 2
  %_runtimearr_uint = OpTypeRuntimeArray %uint
 -%_struct_1948 = OpTypeStruct %_runtimearr_uint
 -%_ptr_Uniform__struct_1948 = OpTypePointer Uniform %_struct_1948
@@ -6641,6 +6898,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_cs.h b/sd
 +    0x00000081, 0x000200F8, 0x00000081, 0x000100FD, 0x00010038,
  };
 diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_scaled_cs.h b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_scaled_cs.h
+index 7298c45..08ef524 100644
 --- a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_scaled_cs.h
 +++ b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_scaled_cs.h
 @@ -1,38 +1,55 @@
@@ -6780,10 +7038,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_scaled_cs
        %int_5 = OpConstant %int 5
        %int_7 = OpConstant %int 7
 -     %int_14 = OpConstant %int 14
-+      %int_8 = OpConstant %int 8
-+     %int_12 = OpConstant %int 12
-+      %int_3 = OpConstant %int 3
-       %int_2 = OpConstant %int 2
+-      %int_2 = OpConstant %int 2
 -    %int_n16 = OpConstant %int -16
 -      %int_1 = OpConstant %int 1
 -     %int_15 = OpConstant %int 15
@@ -6791,13 +7046,16 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_scaled_cs
 -   %int_n512 = OpConstant %int -512
 -      %int_3 = OpConstant %int 3
 -    %int_448 = OpConstant %int 448
--      %int_8 = OpConstant %int 8
+       %int_8 = OpConstant %int 8
 -      %int_6 = OpConstant %int 6
 -     %int_63 = OpConstant %int 63
 -     %uint_6 = OpConstant %uint 6
 -%int_268435455 = OpConstant %int 268435455
 -     %int_n2 = OpConstant %int -2
 -    %uint_32 = OpConstant %uint 32
++     %int_12 = OpConstant %int 12
++      %int_3 = OpConstant %int 3
++      %int_2 = OpConstant %int 2
  %_runtimearr_uint = OpTypeRuntimeArray %uint
 -%_struct_1948 = OpTypeStruct %_runtimearr_uint
 -%_ptr_Uniform__struct_1948 = OpTypePointer Uniform %_struct_1948
@@ -11715,6 +11973,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_128bpp_scaled_cs
 +    0x000200F8, 0x00000082, 0x000100FD, 0x00010038,
  };
 diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_cs.h b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_cs.h
+index ff98046..71c7894 100644
 --- a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_cs.h
 +++ b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_cs.h
 @@ -1,39 +1,57 @@
@@ -11867,18 +12126,17 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_cs.h b/sdk
      %uint_80 = OpConstant %uint 80
 -       %2719 = OpConstantComposite %v2uint %uint_80 %uint_16
 -     %uint_5 = OpConstant %uint 5
+-      %int_7 = OpConstant %int 7
+-     %int_14 = OpConstant %int 14
+-      %int_2 = OpConstant %int 2
+-    %int_n16 = OpConstant %int -16
 +         %86 = OpConstantComposite %v2uint %uint_80 %uint_16
 +  %uint_2048 = OpConstant %uint 2048
 +      %int_6 = OpConstant %int 6
-+      %int_1 = OpConstant %int 1
-       %int_7 = OpConstant %int 7
--     %int_14 = OpConstant %int 14
-+      %int_3 = OpConstant %int 3
-       %int_2 = OpConstant %int 2
--    %int_n16 = OpConstant %int -16
--      %int_1 = OpConstant %int 1
+       %int_1 = OpConstant %int 1
 -   %int_n512 = OpConstant %int -512
--      %int_3 = OpConstant %int 3
++      %int_7 = OpConstant %int 7
+       %int_3 = OpConstant %int 3
 -    %int_448 = OpConstant %int 448
 -      %int_6 = OpConstant %int 6
 -     %int_63 = OpConstant %int 63
@@ -11886,6 +12144,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_cs.h b/sdk
 -     %uint_6 = OpConstant %uint 6
 -%int_268435455 = OpConstant %int 268435455
 -     %int_n2 = OpConstant %int -2
++      %int_2 = OpConstant %int 2
  %_runtimearr_uint = OpTypeRuntimeArray %uint
 -%_struct_1948 = OpTypeStruct %_runtimearr_uint
 -%_ptr_Uniform__struct_1948 = OpTypePointer Uniform %_struct_1948
@@ -20447,6 +20706,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_cs.h b/sdk
 +    0x00000098, 0x000100FD, 0x00010038,
  };
 diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_scaled_cs.h b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_scaled_cs.h
+index 586ab0d..abc77d7 100644
 --- a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_scaled_cs.h
 +++ b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_scaled_cs.h
 @@ -1,38 +1,55 @@
@@ -20597,22 +20857,21 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_scaled_cs.
 -       %2719 = OpConstantComposite %v2uint %uint_80 %uint_16
 +         %86 = OpConstantComposite %v2uint %uint_80 %uint_16
    %uint_2048 = OpConstant %uint 2048
-+      %int_6 = OpConstant %int 6
-+      %int_1 = OpConstant %int 1
-+      %int_7 = OpConstant %int 7
-+      %int_3 = OpConstant %int 3
-+      %int_2 = OpConstant %int 2
-      %uint_5 = OpConstant %uint 5
+-     %uint_5 = OpConstant %uint 5
 -      %int_7 = OpConstant %int 7
 -     %int_14 = OpConstant %int 14
 -      %int_2 = OpConstant %int 2
 -    %int_n16 = OpConstant %int -16
--      %int_1 = OpConstant %int 1
++      %int_6 = OpConstant %int 6
+       %int_1 = OpConstant %int 1
 -   %int_n512 = OpConstant %int -512
--      %int_3 = OpConstant %int 3
++      %int_7 = OpConstant %int 7
+       %int_3 = OpConstant %int 3
 -    %int_448 = OpConstant %int 448
 -      %int_6 = OpConstant %int 6
 -     %int_63 = OpConstant %int 63
++      %int_2 = OpConstant %int 2
++     %uint_5 = OpConstant %uint 5
       %uint_4 = OpConstant %uint 4
 -     %uint_6 = OpConstant %uint 6
 -%int_268435455 = OpConstant %int 268435455
@@ -29392,6 +29651,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_16bpp_scaled_cs.
 +    0x000100FD, 0x00010038,
  };
 diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_cs.h b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_cs.h
+index c966202..681e92a 100644
 --- a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_cs.h
 +++ b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_cs.h
 @@ -1,39 +1,57 @@
@@ -29550,15 +29810,14 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_cs.h b/sdk
 -     %uint_5 = OpConstant %uint 5
        %int_7 = OpConstant %int 7
 -     %int_14 = OpConstant %int 14
-+     %int_12 = OpConstant %int 12
-+      %int_3 = OpConstant %int 3
-       %int_2 = OpConstant %int 2
+-      %int_2 = OpConstant %int 2
 -    %int_n16 = OpConstant %int -16
 -      %int_1 = OpConstant %int 1
 -     %int_15 = OpConstant %int 15
 -      %int_4 = OpConstant %int 4
 -   %int_n512 = OpConstant %int -512
--      %int_3 = OpConstant %int 3
++     %int_12 = OpConstant %int 12
+       %int_3 = OpConstant %int 3
 -    %int_448 = OpConstant %int 448
 -      %int_6 = OpConstant %int 6
 -     %int_63 = OpConstant %int 63
@@ -29566,6 +29825,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_cs.h b/sdk
 -     %uint_6 = OpConstant %uint 6
 -%int_268435455 = OpConstant %int 268435455
 -     %int_n2 = OpConstant %int -2
++      %int_2 = OpConstant %int 2
  %_runtimearr_uint = OpTypeRuntimeArray %uint
 -%_struct_1948 = OpTypeStruct %_runtimearr_uint
 -%_ptr_Uniform__struct_1948 = OpTypePointer Uniform %_struct_1948
@@ -38158,6 +38418,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_cs.h b/sdk
 +    0x000009DD, 0x000200F9, 0x0000009F, 0x000200F8, 0x0000009F, 0x000100FD, 0x00010038,
  };
 diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_scaled_cs.h b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_scaled_cs.h
+index db1f109..4299f3c 100644
 --- a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_scaled_cs.h
 +++ b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_scaled_cs.h
 @@ -1,38 +1,55 @@
@@ -38310,12 +38571,8 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_scaled_cs.
 +     %int_15 = OpConstant %int 15
 +      %int_1 = OpConstant %int 1
        %int_5 = OpConstant %int 5
-+      %int_7 = OpConstant %int 7
-+     %int_12 = OpConstant %int 12
-+      %int_3 = OpConstant %int 3
-+      %int_2 = OpConstant %int 2
-      %uint_5 = OpConstant %uint 5
--      %int_7 = OpConstant %int 7
+-     %uint_5 = OpConstant %uint 5
+       %int_7 = OpConstant %int 7
 -     %int_14 = OpConstant %int 14
 -      %int_2 = OpConstant %int 2
 -    %int_n16 = OpConstant %int -16
@@ -38323,10 +38580,13 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_scaled_cs.
 -     %int_15 = OpConstant %int 15
 -      %int_4 = OpConstant %int 4
 -   %int_n512 = OpConstant %int -512
--      %int_3 = OpConstant %int 3
++     %int_12 = OpConstant %int 12
+       %int_3 = OpConstant %int 3
 -    %int_448 = OpConstant %int 448
 -      %int_6 = OpConstant %int 6
 -     %int_63 = OpConstant %int 63
++      %int_2 = OpConstant %int 2
++     %uint_5 = OpConstant %uint 5
       %uint_4 = OpConstant %uint 4
 -     %uint_6 = OpConstant %uint 6
 -%int_268435455 = OpConstant %int 268435455
@@ -47107,6 +47367,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_32bpp_scaled_cs.
 +    0x00000A0A, 0x00000A09, 0x000200F9, 0x0000009B, 0x000200F8, 0x0000009B, 0x000100FD, 0x00010038,
  };
 diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_cs.h b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_cs.h
+index 6038ecc..4c0c42d 100644
 --- a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_cs.h
 +++ b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_cs.h
 @@ -1,39 +1,57 @@
@@ -47268,10 +47529,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_cs.h b/sdk
 -     %uint_5 = OpConstant %uint 5
        %int_7 = OpConstant %int 7
 -     %int_14 = OpConstant %int 14
-+      %int_8 = OpConstant %int 8
-+     %int_12 = OpConstant %int 12
-+      %int_3 = OpConstant %int 3
-       %int_2 = OpConstant %int 2
+-      %int_2 = OpConstant %int 2
 -    %int_n16 = OpConstant %int -16
 -      %int_1 = OpConstant %int 1
 -     %int_15 = OpConstant %int 15
@@ -47279,12 +47537,15 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_cs.h b/sdk
 -   %int_n512 = OpConstant %int -512
 -      %int_3 = OpConstant %int 3
 -    %int_448 = OpConstant %int 448
--      %int_8 = OpConstant %int 8
+       %int_8 = OpConstant %int 8
 -      %int_6 = OpConstant %int 6
 -     %int_63 = OpConstant %int 63
 -     %uint_6 = OpConstant %uint 6
 -%int_268435455 = OpConstant %int 268435455
 -     %int_n2 = OpConstant %int -2
++     %int_12 = OpConstant %int 12
++      %int_3 = OpConstant %int 3
++      %int_2 = OpConstant %int 2
  %_runtimearr_uint = OpTypeRuntimeArray %uint
 -%_struct_1948 = OpTypeStruct %_runtimearr_uint
 -%_ptr_Uniform__struct_1948 = OpTypePointer Uniform %_struct_1948
@@ -55379,6 +55640,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_cs.h b/sdk
 +    0x00010038,
  };
 diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_scaled_cs.h b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_scaled_cs.h
+index 6892b11..0731bc1 100644
 --- a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_scaled_cs.h
 +++ b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_scaled_cs.h
 @@ -1,38 +1,55 @@
@@ -55534,13 +55796,8 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_scaled_cs.
 +     %int_15 = OpConstant %int 15
 +      %int_1 = OpConstant %int 1
        %int_5 = OpConstant %int 5
-+      %int_7 = OpConstant %int 7
-+      %int_8 = OpConstant %int 8
-+     %int_12 = OpConstant %int 12
-+      %int_3 = OpConstant %int 3
-+      %int_2 = OpConstant %int 2
-      %uint_5 = OpConstant %uint 5
--      %int_7 = OpConstant %int 7
+-     %uint_5 = OpConstant %uint 5
+       %int_7 = OpConstant %int 7
 -     %int_14 = OpConstant %int 14
 -      %int_2 = OpConstant %int 2
 -    %int_n16 = OpConstant %int -16
@@ -55550,13 +55807,17 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_scaled_cs.
 -   %int_n512 = OpConstant %int -512
 -      %int_3 = OpConstant %int 3
 -    %int_448 = OpConstant %int 448
--      %int_8 = OpConstant %int 8
+       %int_8 = OpConstant %int 8
 -      %int_6 = OpConstant %int 6
 -     %int_63 = OpConstant %int 63
 -     %uint_6 = OpConstant %uint 6
 -%int_268435455 = OpConstant %int 268435455
 -     %int_n2 = OpConstant %int -2
 -    %uint_32 = OpConstant %uint 32
++     %int_12 = OpConstant %int 12
++      %int_3 = OpConstant %int 3
++      %int_2 = OpConstant %int 2
++     %uint_5 = OpConstant %uint 5
  %_runtimearr_uint = OpTypeRuntimeArray %uint
 -%_struct_1948 = OpTypeStruct %_runtimearr_uint
 -%_ptr_Uniform__struct_1948 = OpTypePointer Uniform %_struct_1948
@@ -63902,6 +64163,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_64bpp_scaled_cs.
 +    0x00000981, 0x00000980, 0x000200F9, 0x00000088, 0x000200F8, 0x00000088, 0x000100FD, 0x00010038,
  };
 diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_cs.h b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_cs.h
+index de5a239..1428665 100644
 --- a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_cs.h
 +++ b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_cs.h
 @@ -1,39 +1,57 @@
@@ -64014,15 +64276,14 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_cs.h b/sdk/
 -     %uint_5 = OpConstant %uint 5
        %int_7 = OpConstant %int 7
 -     %int_14 = OpConstant %int 14
-+     %int_12 = OpConstant %int 12
-+      %int_3 = OpConstant %int 3
-       %int_2 = OpConstant %int 2
+-      %int_2 = OpConstant %int 2
 -    %int_n16 = OpConstant %int -16
 -      %int_1 = OpConstant %int 1
 -     %int_15 = OpConstant %int 15
 -      %int_4 = OpConstant %int 4
 -   %int_n512 = OpConstant %int -512
--      %int_3 = OpConstant %int 3
++     %int_12 = OpConstant %int 12
+       %int_3 = OpConstant %int 3
 -    %int_448 = OpConstant %int 448
 -      %int_6 = OpConstant %int 6
 -     %int_63 = OpConstant %int 63
@@ -64030,6 +64291,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_cs.h b/sdk/
 -     %uint_6 = OpConstant %uint 6
 -%int_268435455 = OpConstant %int 268435455
 -     %int_n2 = OpConstant %int -2
++      %int_2 = OpConstant %int 2
  %_runtimearr_uint = OpTypeRuntimeArray %uint
 -%_struct_1948 = OpTypeStruct %_runtimearr_uint
 -%_ptr_Uniform__struct_1948 = OpTypePointer Uniform %_struct_1948
@@ -68467,6 +68729,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_cs.h b/sdk/
 +    0x00010038,
  };
 diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h
+index ce03f32..3ca8190 100644
 --- a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h
 +++ b/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h
 @@ -1,38 +1,55 @@
@@ -68581,12 +68844,8 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h
 +     %int_15 = OpConstant %int 15
 +      %int_1 = OpConstant %int 1
        %int_5 = OpConstant %int 5
-+      %int_7 = OpConstant %int 7
-+     %int_12 = OpConstant %int 12
-+      %int_3 = OpConstant %int 3
-+      %int_2 = OpConstant %int 2
-      %uint_5 = OpConstant %uint 5
--      %int_7 = OpConstant %int 7
+-     %uint_5 = OpConstant %uint 5
+       %int_7 = OpConstant %int 7
 -     %int_14 = OpConstant %int 14
 -      %int_2 = OpConstant %int 2
 -    %int_n16 = OpConstant %int -16
@@ -68594,20 +68853,23 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h
 -     %int_15 = OpConstant %int 15
 -      %int_4 = OpConstant %int 4
 -   %int_n512 = OpConstant %int -512
--      %int_3 = OpConstant %int 3
++     %int_12 = OpConstant %int 12
+       %int_3 = OpConstant %int 3
 -    %int_448 = OpConstant %int 448
 -      %int_6 = OpConstant %int 6
 -     %int_63 = OpConstant %int 63
++      %int_2 = OpConstant %int 2
++     %uint_5 = OpConstant %uint 5
       %uint_4 = OpConstant %uint 4
 -     %uint_6 = OpConstant %uint 6
 -%int_268435455 = OpConstant %int 268435455
 -     %int_n2 = OpConstant %int -2
-+      %int_0 = OpConstant %int 0
- %_runtimearr_uint = OpTypeRuntimeArray %uint
+-%_runtimearr_uint = OpTypeRuntimeArray %uint
 -%_struct_1948 = OpTypeStruct %_runtimearr_uint
 -%_ptr_Uniform__struct_1948 = OpTypePointer Uniform %_struct_1948
 -       %3271 = OpVariable %_ptr_Uniform__struct_1948 Uniform
--      %int_0 = OpConstant %int 0
+       %int_0 = OpConstant %int 0
++%_runtimearr_uint = OpTypeRuntimeArray %uint
 +%xe_resolve_edram_xe_block = OpTypeStruct %_runtimearr_uint
 +%_ptr_Uniform_xe_resolve_edram_xe_block = OpTypePointer Uniform %xe_resolve_edram_xe_block
 +%xe_resolve_edram = OpVariable %_ptr_Uniform_xe_resolve_edram_xe_block Uniform
@@ -73227,6 +73489,7 @@ diff --git a/sdk/src/graphics/shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h
 +    0x00010038,
  };
 diff --git a/sdk/src/graphics/vulkan/command_processor.cpp b/sdk/src/graphics/vulkan/command_processor.cpp
+index e7b2890..f232ac8 100644
 --- a/sdk/src/graphics/vulkan/command_processor.cpp
 +++ b/sdk/src/graphics/vulkan/command_processor.cpp
 @@ -13,6 +13,7 @@
@@ -73245,7 +73508,7 @@ diff --git a/sdk/src/graphics/vulkan/command_processor.cpp b/sdk/src/graphics/vu
  #include <rex/graphics/util/draw.h>
  #include <rex/graphics/flags.h>
  #include <rex/graphics/pipeline/shader/shader.h>
-@@ -788,6 +790,24 @@
+@@ -788,6 +790,24 @@ bool VulkanCommandProcessor::SetupContext() {
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
    const ui::vulkan::VulkanDevice::Properties& device_properties = vulkan_device->properties();
@@ -73270,7 +73533,7 @@ diff --git a/sdk/src/graphics/vulkan/command_processor.cpp b/sdk/src/graphics/vu
  
    // The unconditional inclusion of the vertex shader stage also covers the case
    // of manual index / factor buffer fetch (the system constants and the shared
-@@ -1908,6 +1928,9 @@
+@@ -1908,6 +1928,9 @@ void VulkanCommandProcessor::ShutdownContext() {
    AwaitAllQueueOperationsCompletion();
  #if REX_PLATFORM_SWITCH
    if (RexNativeVideoShutdown) RexNativeVideoShutdown();
@@ -73280,7 +73543,7 @@ diff --git a/sdk/src/graphics/vulkan/command_processor.cpp b/sdk/src/graphics/vu
  #endif
    InvalidateAllVertexBufferResidency();
    ShutdownOcclusionQueryResources();
-@@ -3735,6 +3758,7 @@
+@@ -3735,6 +3758,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
    VulkanShader::VulkanTranslation* vertex_shader_translation;
    VulkanShader::VulkanTranslation* pixel_shader_translation;
    bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
@@ -73288,7 +73551,7 @@ diff --git a/sdk/src/graphics/vulkan/command_processor.cpp b/sdk/src/graphics/vu
  
    // Two iterations because a submission (even the current one - in which case
    // it needs to be ended, and a new one must be started) may need to be awaited
-@@ -4174,6 +4198,12 @@
+@@ -4174,6 +4198,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
                         : surface_width >= 256  ? 31u
                                                    : 32u);
    }
@@ -73301,7 +73564,7 @@ diff --git a/sdk/src/graphics/vulkan/command_processor.cpp b/sdk/src/graphics/vu
  #endif
    if (primitive_processing_result.index_buffer_type ==
            PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
-@@ -4219,6 +4249,9 @@
+@@ -4219,6 +4249,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
                                                0, 0, 0);
    }
  
@@ -73311,7 +73574,7 @@ diff --git a/sdk/src/graphics/vulkan/command_processor.cpp b/sdk/src/graphics/vu
    // Invalidate textures in memexported memory and watch for changes.
    if (!memexport_ranges_.empty()) {
      for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-@@ -5019,6 +5052,8 @@
+@@ -5019,6 +5052,8 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
    sample_counts->StencilFail_B = 0;
  }
  
@@ -73320,7 +73583,7 @@ diff --git a/sdk/src/graphics/vulkan/command_processor.cpp b/sdk/src/graphics/vu
  void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
    // Only report once, no need to retry a wait that won't succeed anyway.
    if (device_lost_) {
-@@ -5091,6 +5126,9 @@
+@@ -5091,6 +5126,9 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
    submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
                                        submissions_in_flight_fences_awaited_end);
    submission_completed_ += fences_awaited;
@@ -73330,7 +73593,7 @@ diff --git a/sdk/src/graphics/vulkan/command_processor.cpp b/sdk/src/graphics/vu
  
    // Reclaim semaphores.
    while (!submissions_in_flight_semaphores_.empty()) {
-@@ -5461,6 +5499,15 @@
+@@ -5461,6 +5499,15 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
@@ -73347,9 +73610,10 @@ diff --git a/sdk/src/graphics/vulkan/command_processor.cpp b/sdk/src/graphics/vu
      if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
        REXGPU_ERROR("Failed to end a Vulkan command buffer");
 diff --git a/sdk/src/graphics/vulkan/deferred_command_buffer.cpp b/sdk/src/graphics/vulkan/deferred_command_buffer.cpp
+index b49e033..0ece57b 100644
 --- a/sdk/src/graphics/vulkan/deferred_command_buffer.cpp
 +++ b/sdk/src/graphics/vulkan/deferred_command_buffer.cpp
-@@ -266,6 +266,15 @@
+@@ -266,6 +266,15 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
              reinterpret_cast<const uint8_t*>(stream) + sizeof(ArgsVkPushConstants));
        } break;
  
@@ -73367,6 +73631,7 @@ diff --git a/sdk/src/graphics/vulkan/deferred_command_buffer.cpp b/sdk/src/graph
          dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,
 diff --git a/sdk/src/graphics/vulkan/draw_timing_switch.inc b/sdk/src/graphics/vulkan/draw_timing_switch.inc
 new file mode 100644
+index 0000000..60e42f6
 --- /dev/null
 +++ b/sdk/src/graphics/vulkan/draw_timing_switch.inc
 @@ -0,0 +1,111 @@
@@ -73482,6 +73747,7 @@ new file mode 100644
 +}
 +#endif
 diff --git a/sdk/src/graphics/vulkan/pipeline_cache.cpp b/sdk/src/graphics/vulkan/pipeline_cache.cpp
+index 43ac0ad..5a07986 100644
 --- a/sdk/src/graphics/vulkan/pipeline_cache.cpp
 +++ b/sdk/src/graphics/vulkan/pipeline_cache.cpp
 @@ -48,6 +48,7 @@
@@ -73492,7 +73758,7 @@ diff --git a/sdk/src/graphics/vulkan/pipeline_cache.cpp b/sdk/src/graphics/vulka
  
  #if REX_PLATFORM_SWITCH
  #include "../../core/threading_switch.h"
-@@ -1027,6 +1028,36 @@
+@@ -1027,6 +1028,36 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
      }
    }
  
@@ -73529,7 +73795,7 @@ diff --git a/sdk/src/graphics/vulkan/pipeline_cache.cpp b/sdk/src/graphics/vulka
    return modification;
  }
  
-@@ -1051,6 +1082,16 @@
+@@ -1051,6 +1082,16 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
    }
    if (pixel_shader != nullptr) {
      if (!pixel_shader->is_translated()) {
@@ -73546,7 +73812,7 @@ diff --git a/sdk/src/graphics/vulkan/pipeline_cache.cpp b/sdk/src/graphics/vulka
        pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
        if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader)) {
          REXGPU_ERROR("Failed to translate the pixel shader!");
-@@ -3522,11 +3563,25 @@
+@@ -3522,11 +3563,25 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
    VkPipeline pipeline;
@@ -73572,11 +73838,10 @@ diff --git a/sdk/src/graphics/vulkan/pipeline_cache.cpp b/sdk/src/graphics/vulka
    if (create_result != VK_SUCCESS) {
      uint64_t ps_hash = creation_arguments.pixel_shader
                             ? creation_arguments.pixel_shader->shader().ucode_data_hash()
-@@ -3541,6 +3596,57 @@
-         creation_arguments.tessellation_patch_control_points, description.render_pass_key.key,
+@@ -3542,6 +3597,57 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
          uint32_t(use_dynamic_rendering));
      return false;
-+  }
+   }
 +  if (capture_stats && (pipeline_create_info.flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR)) {
 +    // Resolve separately: never add slots to the SDK's shared device function table.
 +    const auto get_proc = vulkan_device->vulkan_instance()->functions().vkGetDeviceProcAddr;
@@ -73627,10 +73892,12 @@ diff --git a/sdk/src/graphics/vulkan/pipeline_cache.cpp b/sdk/src/graphics/vulka
 +    } else {
 +      REXLOG_WARN("SHADER_STATS entrypoints unavailable ps={:016X}", stats_ps);
 +    }
-   }
++  }
    bool was_placeholder =
        creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
+   VkPipeline old_pipeline =
 diff --git a/sdk/src/graphics/vulkan/render_target_cache.cpp b/sdk/src/graphics/vulkan/render_target_cache.cpp
+index 3f41047..dbf6c67 100644
 --- a/sdk/src/graphics/vulkan/render_target_cache.cpp
 +++ b/sdk/src/graphics/vulkan/render_target_cache.cpp
 @@ -23,6 +23,7 @@
@@ -73641,7 +73908,7 @@ diff --git a/sdk/src/graphics/vulkan/render_target_cache.cpp b/sdk/src/graphics/
  #include <rex/graphics/flags.h>
  #include <rex/graphics/pipeline/shader/spirv_builder.h>
  #include <rex/graphics/pipeline/shader/spirv_translator.h>
-@@ -1152,6 +1153,7 @@
+@@ -1152,6 +1153,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
    if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
      return true;
    }
@@ -73650,13 +73917,13 @@ diff --git a/sdk/src/graphics/vulkan/render_target_cache.cpp b/sdk/src/graphics/
    RexSwitchPerfCount(9);
    RexSwitchPerfAdd(10, uint64_t(resolve_info.coordinate_info.width_div_8) * 8 *
 diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch/switch_input_driver.cpp
+index f500080..89cb06e 100644
 --- a/sdk/src/input/switch/switch_input_driver.cpp
 +++ b/sdk/src/input/switch/switch_input_driver.cpp
-@@ -40,6 +40,15 @@
-                       "Record pad 1 to this file (e.g. sdmc:/switch/masseffect-nx/route.tsv) between two MINUS presses");
+@@ -41,6 +41,15 @@ REXCVAR_DEFINE_STRING(input_record, "", "Input",
  REXCVAR_DEFINE_STRING(input_play, "", "Input",
                        "Play this recorded file (input_record) back as pad 1, starting at the next MINUS press");
-+
+ 
 +// Release builds ship with this off: players press L+R with the D-pad in normal play and would open the
 +// debug overlay, console, settings, A/B lap or screenshot by accident (see DispatchMenuShortcuts).
 +REXCVAR_DEFINE_BOOL(input_screenshot_shortcut, true, "Input",
@@ -73665,10 +73932,11 @@ diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch
 +REXCVAR_DEFINE_BOOL(input_menu_shortcuts, false, "Input",
 +                    "L+R combinations open the debug overlay, settings, console, achievements, GPU A/B lap "
 +                    "and screenshot. false = off (release)");
- 
++
  namespace rex::ui {
  // rex/ui/overlay/debug_overlay.h (not included here because it pulls in ImGui).
-@@ -457,6 +466,8 @@
+ bool DebugOverlayOpen();
+@@ -457,6 +466,8 @@ void SwitchInputDriver::Poll(size_t index) {
  }
  
  
@@ -73677,7 +73945,7 @@ diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch
  /* From the profiler (switch_perf.cpp): turns the GPU A/B test lap on and off. */
  extern "C" void RexSwitchPerfToggleAb(void);
  /*
-@@ -479,11 +490,30 @@
+@@ -479,11 +490,30 @@ extern "C" void RexSwitchPerfToggleAb(void);
   * slot.menu_shortcuts with the state from the previous poll.
   */
  void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
@@ -73709,7 +73977,7 @@ diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch
    static const Shortcut kShortcuts[] = {
        {HidNpadButton_Up, rex::ui::VirtualKey::kF3},
        {HidNpadButton_Right, rex::ui::VirtualKey::kF4},
-@@ -491,7 +521,6 @@
+@@ -491,7 +521,6 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
        {HidNpadButton_Left, rex::ui::VirtualKey::kF7},
    };
  
@@ -73717,7 +73985,7 @@ diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch
    for (size_t i = 0; i < std::size(kShortcuts); ++i) {
      const uint64_t bit = uint64_t(1) << i;
      const bool now = modifier && (held & kShortcuts[i].button) != 0;
-@@ -531,6 +560,8 @@
+@@ -531,6 +560,8 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
    }
    slot.menu_shortcuts = ab_now ? (slot.menu_shortcuts | kBitAb)
                                   : (slot.menu_shortcuts & ~kBitAb);
@@ -73727,6 +73995,7 @@ diff --git a/sdk/src/input/switch/switch_input_driver.cpp b/sdk/src/input/switch
  
  SwitchInputDriver::Slot* SwitchInputDriver::FindSlot(DeviceId id) {
 diff --git a/sdk/src/kernel/crt/threading.cpp b/sdk/src/kernel/crt/threading.cpp
+index 22ba2fb..6e68bdd 100644
 --- a/sdk/src/kernel/crt/threading.cpp
 +++ b/sdk/src/kernel/crt/threading.cpp
 @@ -16,6 +16,7 @@
@@ -73737,16 +74006,16 @@ diff --git a/sdk/src/kernel/crt/threading.cpp b/sdk/src/kernel/crt/threading.cpp
  #include <rex/logging.h>
  #include <rex/hook.h>
  #include <rex/types.h>
-@@ -25,6 +26,8 @@
- #include <rex/system/xthread.h>
+@@ -26,6 +27,8 @@
  #include <rex/system/xtypes.h>
  #include <rex/thread/fiber.h>
-+
-+REXCVAR_DEFINE_BOOL(p2_fiber_context_audit, false, "Prototype2", "Detect fibers resumed with a different PPCContext; bounded diagnostics");
  
++REXCVAR_DEFINE_BOOL(p2_fiber_context_audit, false, "Prototype2", "Detect fibers resumed with a different PPCContext; bounded diagnostics");
++
  namespace rex::kernel::crt {
  using namespace rex::system;
-@@ -82,6 +85,13 @@
+ 
+@@ -82,6 +85,13 @@ static void FiberEntryPoint(void* raw_arg) {
    auto* fiber = mem->TranslateVirtual<X_FIBER_CONTEXT*>(args->guest_fiber_addr);
    ctx.r3.u64 = static_cast<uint32_t>(fiber->fiber_data);
  
@@ -73760,7 +74029,7 @@ diff --git a/sdk/src/kernel/crt/threading.cpp b/sdk/src/kernel/crt/threading.cpp
    // Call the fiber function
    args->start_fn(ctx, mem->virtual_membase());
  
-@@ -298,6 +308,23 @@
+@@ -298,6 +308,23 @@ void SwitchToFiber_entry(mapped_void lpFiber) {
      return;
    }
  
@@ -73785,6 +74054,7 @@ diff --git a/sdk/src/kernel/crt/threading.cpp b/sdk/src/kernel/crt/threading.cpp
    uint32_t current_addr = static_cast<uint32_t>(kthread->fiber_ptr);
    if (current_addr) {
 diff --git a/sdk/src/kernel/xam/xam_info.cpp b/sdk/src/kernel/xam/xam_info.cpp
+index 1fda053..4d972d4 100644
 --- a/sdk/src/kernel/xam/xam_info.cpp
 +++ b/sdk/src/kernel/xam/xam_info.cpp
 @@ -20,6 +20,7 @@
@@ -73795,7 +74065,7 @@ diff --git a/sdk/src/kernel/xam/xam_info.cpp b/sdk/src/kernel/xam/xam_info.cpp
  
  #if REX_PLATFORM_WIN32
  #include <windows.h>
-@@ -183,6 +184,11 @@
+@@ -183,6 +184,11 @@ u32 XGetGameRegion_entry() {
  }
  
  u32 XGetLanguage_entry() {
@@ -73808,9 +74078,10 @@ diff --git a/sdk/src/kernel/xam/xam_info.cpp b/sdk/src/kernel/xam/xam_info.cpp
  
    // Switch the language based on game region.
 diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_debug.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
+index 670c446..e1f424b 100644
 --- a/sdk/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
 +++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
-@@ -143,15 +143,13 @@
+@@ -143,15 +143,13 @@ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
    rex::debug::Break();
  }
  
@@ -73832,9 +74103,10 @@ diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_debug.cpp b/sdk/src/kernel/xboxkrn
  }
  
 diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..388d851 100644
 --- a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 +++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
-@@ -112,6 +112,13 @@
+@@ -112,6 +112,13 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
        "ExCreateThread", "stack={:#x} xapi_startup={:#x} start={:#x} context={:#x} flags={:#x}",
        (uint32_t)stack_size, (uint32_t)xapi_thread_startup, start_address.guest_address(),
        start_context.guest_address(), (uint32_t)creation_flags);
@@ -73848,7 +74120,7 @@ diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/sdk/src/kernel/xbo
    // http://jafile.com/uploads/scoop/main.cpp.txt
    // DWORD
    // LPHANDLE Handle,
-@@ -283,6 +290,13 @@
+@@ -283,6 +290,13 @@ u32 KeSetAffinityThread_entry(mapped_void thread_ptr, u32 affinity,
                                mapped_u32 previous_affinity_ptr) {
    REXKRNL_IMPORT_TRACE("KeSetAffinityThread", "thread={:#x} affinity={:#x}",
                         thread_ptr.guest_address(), (uint32_t)affinity);
@@ -73862,7 +74134,7 @@ diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/sdk/src/kernel/xbo
    // The Xbox 360, according to disassembly of KeSetAffinityThread, unlike
    // Windows NT, stores the previous affinity via the pointer provided as an
    // argument, not in the return value - the return value is used for the
-@@ -320,6 +334,13 @@
+@@ -320,6 +334,13 @@ u32 KeQueryBasePriorityThread_entry(mapped_void thread_ptr) {
  u32 KeSetBasePriorityThread_entry(mapped_void thread_ptr, u32 increment) {
    REXKRNL_IMPORT_TRACE("KeSetBasePriorityThread", "thread={:#x} increment={}",
                         thread_ptr.guest_address(), (int32_t)increment);
@@ -73877,6 +74149,7 @@ diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/sdk/src/kernel/xbo
    auto thread = XObject::GetNativeObject<XThread>(REX_KERNEL_STATE(), thread_ptr);
  
 diff --git a/sdk/src/system/function_dispatcher.cpp b/sdk/src/system/function_dispatcher.cpp
+index bd43109..0930dad 100644
 --- a/sdk/src/system/function_dispatcher.cpp
 +++ b/sdk/src/system/function_dispatcher.cpp
 @@ -13,6 +13,8 @@
@@ -73888,7 +74161,7 @@ diff --git a/sdk/src/system/function_dispatcher.cpp b/sdk/src/system/function_di
  #include <rex/assert.h>
  #include <rex/dbg.h>
  #include <rex/logging.h>
-@@ -34,7 +36,24 @@
+@@ -34,7 +36,24 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
  
  }  // namespace
  
@@ -73914,10 +74187,240 @@ diff --git a/sdk/src/system/function_dispatcher.cpp b/sdk/src/system/function_di
    REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
              ctx.last_indirect_target);
  }
+diff --git a/sdk/src/system/xevent.cpp b/sdk/src/system/xevent.cpp
+index c24fbd1..0da9d95 100644
+--- a/sdk/src/system/xevent.cpp
++++ b/sdk/src/system/xevent.cpp
+@@ -13,6 +13,8 @@
+ #include <rex/stream.h>
+ #include <rex/system/xevent.h>
+ 
++namespace rex::system::waithist { void Signal(uint32_t type, uint32_t obj); }  // xobject.cpp, PERF pass 12
++
+ namespace rex::system {
+ 
+ XEvent::XEvent(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
+@@ -74,11 +76,13 @@ void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
+ }
+ 
+ int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
++  rex::system::waithist::Signal(uint32_t(type()) + 1, guest_object());  // PERF pass 12
+   event_->Set();
+   return 1;
+ }
+ 
+ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
++  rex::system::waithist::Signal(uint32_t(type()) + 1, guest_object());  // PERF pass 12
+   event_->Pulse();
+   return 1;
+ }
+diff --git a/sdk/src/system/xobject.cpp b/sdk/src/system/xobject.cpp
+index 71d9286..21b9aa5 100644
+--- a/sdk/src/system/xobject.cpp
++++ b/sdk/src/system/xobject.cpp
+@@ -28,6 +28,131 @@
+ #include <rex/system/xthread.h>
+ 
+ #include "global_lock_spin.h"
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <rex/system/thread_state.h>
++#include <rex/cvar.h>
++
++// PERF pass 12 (Prototype 2): what the guest threads wait on. Per guest thread and guest call site (the LR of the
++// kernel call and the next two return addresses of the guest stack) the number of waits on kernel objects and
++// their total / longest time. The game writes and clears it every 30 s (RexWaitHistogramDump from
++// switch_sim_priority.cpp, logs/rex/wait_hist.csv). Off: one cvar test per wait.
++REXCVAR_DEFINE_BOOL(p2_wait_histogram, false, "Kernel",
++                    "Measurement: count and time of guest waits on kernel objects per thread and guest call site, "
++                    "written every 30 s to logs/rex/wait_hist.csv");
++namespace rex::system::waithist {
++// v2 (pass 12, run 3): the guest object is part of the key, signals (KeSetEvent / KeReleaseSemaphore ...) are
++// counted too (type 2000 + object type + 1, time 0), the dump copies the table under the lock and writes outside
++// it from a thread of its own (v1 wrote under the lock from the frame hook: 0.4 s stalls every 30 s).
++struct Bin {
++  uint32_t tid, lr, c1, c2, type, obj;
++  uint64_t count, total_us, max_us;
++  char name[32];
++};
++constexpr uint32_t kBins = 4096;
++static Bin g_bins[kBins];
++static std::mutex g_mutex;
++static uint64_t g_dropped = 0;
++struct Probe {
++  bool on = false;
++  uint32_t tid = 0, lr = 0, c1 = 0, c2 = 0, type = 0, obj = 0;
++  const char* name = nullptr;
++  std::chrono::steady_clock::time_point t0;
++};
++static void Begin(Probe& p, uint32_t type, uint32_t obj) {
++  if (!REXCVAR_GET(p2_wait_histogram) || !XThread::IsInThread()) return;
++  XThread* self = XThread::GetCurrentThread();
++  if (!self) return;
++  const PPCContext* c = self->thread_state() ? self->thread_state()->context() : nullptr;
++  p.tid = self->thread_id();
++  p.type = type;
++  p.obj = obj;
++  p.lr = c ? uint32_t(c->lr) : 0;
++  p.name = self->thread_name().c_str();
++  auto* ks = kernel_state();
++  uint8_t* vb = ks ? ks->memory()->virtual_membase() : nullptr;
++  if (vb && c && c->r13.u32 >= 0x10000u) {
++    uint32_t b, e2;
++    std::memcpy(&b, vb + c->r13.u32 + 0x70, 4);
++    std::memcpy(&e2, vb + c->r13.u32 + 0x74, 4);
++    const uint32_t hi = __builtin_bswap32(b), lo = __builtin_bswap32(e2);
++    uint32_t fp = c->r1.u32;
++    uint32_t* out[2] = {&p.c1, &p.c2};
++    for (int i = 0; i < 2; ++i) {
++      if (!lo || hi <= lo || fp < lo || fp + 4 > hi) break;
++      uint32_t next, ret;
++      std::memcpy(&next, vb + fp, 4);
++      next = __builtin_bswap32(next);
++      if (next <= fp || next < lo + 8 || next > hi) break;
++      std::memcpy(&ret, vb + next - 8, 4);
++      *out[i] = __builtin_bswap32(ret);
++      fp = next;
++    }
++  }
++  p.t0 = std::chrono::steady_clock::now();
++  p.on = true;
++}
++static void Add(const Probe& p, uint64_t us) {
++  uint32_t h = p.tid * 0x9E3779B1u ^ p.lr * 0x85EBCA6Bu ^ p.c1 * 0xC2B2AE35u ^ p.c2 * 0x27D4EB2Fu ^ p.type ^
++               p.obj * 0x165667B1u;
++  h ^= h >> 15;
++  std::lock_guard<std::mutex> lock(g_mutex);
++  for (uint32_t k = 0; k < 64; ++k) {
++    Bin& b = g_bins[(h + k) & (kBins - 1)];
++    if (b.count == 0) {
++      b.tid = p.tid; b.lr = p.lr; b.c1 = p.c1; b.c2 = p.c2; b.type = p.type; b.obj = p.obj;
++      std::snprintf(b.name, sizeof(b.name), "%s", p.name ? p.name : "");
++    } else if (b.tid != p.tid || b.lr != p.lr || b.c1 != p.c1 || b.c2 != p.c2 || b.type != p.type ||
++               b.obj != p.obj) {
++      continue;
++    }
++    ++b.count;
++    b.total_us += us;
++    if (us > b.max_us) b.max_us = us;
++    return;
++  }
++  ++g_dropped;
++}
++static void End(const Probe& p) {
++  if (!p.on) return;
++  Add(p, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++             std::chrono::steady_clock::now() - p.t0).count()));
++}
++void Signal(uint32_t type, uint32_t obj) {
++  Probe p;
++  Begin(p, 2000u + type, obj);
++  if (p.on) Add(p, 0);
++}
++}  // namespace rex::system::waithist
++
++extern "C" bool RexWaitHistogramEnabled() { return REXCVAR_GET(p2_wait_histogram); }
++
++// One line per bin: tick_s,phase,tid,thread,type,lr,caller1,caller2,count,total_us,max_us,obj; bins are cleared.
++// type: kernel object type + 1 (Event 3, Semaphore 9 ... see XObject::Type), 1000 + n for WaitMultiple of n
++// objects, 2000 + (type + 1) for a signal of that object (Set / Pulse / Release).
++extern "C" void RexWaitHistogramDump(FILE* f, uint64_t tick_s, uint32_t phase) {
++  using namespace rex::system::waithist;
++  static Bin copy[kBins];
++  uint64_t dropped;
++  {
++    std::lock_guard<std::mutex> lock(g_mutex);
++    std::memcpy(copy, g_bins, sizeof(copy));
++    std::memset(g_bins, 0, sizeof(g_bins));
++    dropped = g_dropped;
++    g_dropped = 0;
++  }
++  for (auto& b : copy) {
++    if (!b.count) continue;
++    std::fprintf(f, "%llu,%u,%u,%s,%u,%08X,%08X,%08X,%llu,%llu,%llu,%08X\n", (unsigned long long)tick_s, phase,
++                 b.tid, b.name, b.type, b.lr, b.c1, b.c2, (unsigned long long)b.count,
++                 (unsigned long long)b.total_us, (unsigned long long)b.max_us, b.obj);
++  }
++  if (dropped) std::fprintf(f, "%llu,%u,0,dropped,0,0,0,0,%llu,0,0,0\n", (unsigned long long)tick_s, phase,
++                            (unsigned long long)dropped);
++}
+ 
+ namespace rex::system {
+ 
+@@ -215,7 +340,10 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++  waithist::Probe hist;
++  waithist::Begin(hist, uint32_t(type_) + 1, guest_object_ptr_);
+   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
++  waithist::End(hist);
+   XThread::CheckTitleTermination();
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+@@ -241,9 +369,12 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+                                       TimeoutTicksToMs(*opt_timeout)))
+                                 : std::chrono::milliseconds::max();
+ 
++  waithist::Probe hist;
++  waithist::Begin(hist, uint32_t(wait_object->type()) + 1, wait_object->guest_object());
+   auto result =
+       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
+                                  alertable ? true : false, timeout_ms);
++  waithist::End(hist);
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+       wait_object->WaitCallback();
+@@ -275,9 +406,12 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++  waithist::Probe hist;
++  waithist::Begin(hist, 1000u + count, count ? objects[0]->guest_object() : 0);
+   if (wait_type) {
+     auto result =
+         rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
++    waithist::End(hist);
+     XThread::CheckTitleTermination();
+     switch (result.first) {
+       case rex::thread::WaitResult::kSuccess:
+@@ -299,6 +433,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+   } else {
+     auto result =
+         rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
++    waithist::End(hist);
+     XThread::CheckTitleTermination();
+     switch (result) {
+       case rex::thread::WaitResult::kSuccess:
+diff --git a/sdk/src/system/xsemaphore.cpp b/sdk/src/system/xsemaphore.cpp
+index db830e4..a931b69 100644
+--- a/sdk/src/system/xsemaphore.cpp
++++ b/sdk/src/system/xsemaphore.cpp
+@@ -13,6 +13,8 @@
+ #include <rex/stream.h>
+ #include <rex/system/xsemaphore.h>
+ 
++namespace rex::system::waithist { void Signal(uint32_t type, uint32_t obj); }  // xobject.cpp, PERF pass 12
++
+ namespace rex::system {
+ 
+ XSemaphore::XSemaphore(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
+@@ -40,6 +42,7 @@ bool XSemaphore::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
+ 
+ bool XSemaphore::ReleaseSemaphore(int32_t release_count, int32_t* out_previous_count) {
+   int32_t previous_count = 0;
++  rex::system::waithist::Signal(uint32_t(type()) + 1, guest_object());  // PERF pass 12
+   bool success = semaphore_->Release(release_count, &previous_count);
+   if (out_previous_count) {
+     *out_previous_count = previous_count;
 diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
+index c2903c0..da7f3e5 100644
 --- a/sdk/src/system/xthread.cpp
 +++ b/sdk/src/system/xthread.cpp
-@@ -49,6 +49,44 @@
+@@ -49,6 +49,44 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
  REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                      "Ignores game-specified thread affinities");
  
@@ -73962,7 +74465,7 @@ diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
  namespace rex::system {
  
  const uint32_t XAPC::kSize;
-@@ -464,12 +502,34 @@
+@@ -464,12 +502,36 @@ X_STATUS XThread::Create() {
    RetainHandle();
  
    rex::thread::Thread::CreationParameters params;
@@ -73991,13 +74494,25 @@ diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
 +      if (mask) (void)RexSwitchSetCurrentThreadMask(mask);
 +      const uint32_t priority = REXCVAR_GET(p2_main_thread_priority);
 +      if (priority) RexSwitchSetCurrentThreadPriority(int(priority));
++      RexSwitchMainThreadRegister();  // PERF pass 18: priority A/B while the game runs
 +    } else if (const uint32_t guest_mask = REXCVAR_GET(p2_guest_core_mask) & 0xFu) {
 +      (void)RexSwitchSetCurrentThreadMask(guest_mask);
++      RexSwitchGuestWorkerRegister();  // PERF pass 12: in-run A/B of the workers' mask
 +    }
  #endif
      runtime::ThreadState::Bind(thread_state_.get());
  
-@@ -894,6 +954,14 @@
+@@ -488,6 +550,9 @@ X_STATUS XThread::Create() {
+     Execute();
+     running_ = false;
+     current_xthread_tls_ = nullptr;
++#if REX_PLATFORM_SWITCH
++    RexSwitchGuestWorkerForget();
++#endif
+ 
+     PROFILE_THREAD_EXITED();
+     PROFILE_THREAD_EXIT();
+@@ -894,6 +959,14 @@ void XThread::SetPriority(int32_t increment) {
    } else {
      target_priority = rex::thread::ThreadPriority::kNormal;
    }
@@ -74012,7 +74527,7 @@ diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
    if (!REXCVAR_GET(ignore_thread_priorities)) {
      thread_->set_priority(target_priority);
    }
-@@ -935,6 +1003,12 @@
+@@ -935,6 +1008,12 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
      pcr.prcb_data.current_cpu = cpu_index;
    }
  
@@ -74025,7 +74540,7 @@ diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
    if (rex::thread::logical_processor_count() >= 6) {
      if (!REXCVAR_GET(ignore_thread_affinities)) {
        thread_->set_affinity_mask(uint64_t(1) << cpu_index);
-@@ -1072,8 +1146,10 @@
+@@ -1072,8 +1151,10 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
      }
    } else {
      if (timeout_ms == 0) {
@@ -74039,6 +74554,7 @@ diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
          rex::thread::MaybeYield();
        }
 diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
+index 33e668a..bbc064d 100644
 --- a/sdk/src/ui/presenter.cpp
 +++ b/sdk/src/ui/presenter.cpp
 @@ -9,6 +9,7 @@
@@ -74058,7 +74574,7 @@ diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
  #endif
  
  REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
-@@ -676,6 +679,14 @@
+@@ -676,6 +679,14 @@ bool Presenter::RefreshGuestOutput(
      uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
      uint32_t display_aspect_ratio_y,
      std::function<bool(GuestOutputRefreshContext& context)> refresher) {
@@ -74073,7 +74589,7 @@ diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
    GuestOutputProperties& writable_properties =
        guest_output_properties_[guest_output_mailbox_writable_];
    writable_properties.frontbuffer_width = frontbuffer_width;
-@@ -753,6 +764,18 @@
+@@ -753,6 +764,18 @@ bool Presenter::RefreshGuestOutput(
     * the same milliseconds again and achieve nothing.
     */
    if (paint_thread_active_.load(std::memory_order_acquire) &&
@@ -74092,7 +74608,7 @@ diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
        paint_mode_fast_.load(std::memory_order_acquire) ==
            PaintMode::kGuestOutputThreadImmediately) {
      RequestPaintFromPaintThread();
-@@ -1679,9 +1702,14 @@
+@@ -1679,9 +1702,14 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
  // The presenter's own thread. See the long comment in presenter.h.
  
  void Presenter::StartPaintThreadFromUIThread() {
@@ -74110,7 +74626,7 @@ diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
    {
      std::lock_guard<std::mutex> lock(paint_thread_mutex_);
      paint_thread_pending_ = false;
-@@ -1696,6 +1724,7 @@
+@@ -1696,6 +1724,7 @@ void Presenter::StartPaintThreadFromUIThread() {
    }
    paint_thread_->set_name("Presenter Paint");
    paint_thread_active_.store(true, std::memory_order_release);
@@ -74118,7 +74634,7 @@ diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
    REXLOG_INFO(
        "Presenter: own presentation thread running (Horizon priority {:#x}). The thread that "
        "produces the image no longer blocks while presenting",
-@@ -1708,6 +1737,7 @@
+@@ -1708,6 +1737,7 @@ void Presenter::ShutdownPaintThread() {
    }
    // First stop receiving new signals, then wake it up so it sees the exit flag.
    paint_thread_active_.store(false, std::memory_order_release);
@@ -74126,7 +74642,7 @@ diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
    {
      std::lock_guard<std::mutex> lock(paint_thread_mutex_);
      paint_thread_shutdown_ = true;
-@@ -1740,6 +1770,7 @@
+@@ -1740,6 +1770,7 @@ void Presenter::ShutdownPaintThread() {
   * When it expires, the frame is discarded as before and counted.
   */
  void Presenter::RequestPaintFromPaintThread() {
@@ -74134,7 +74650,7 @@ diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
    uint64_t warnings, painted, discarded, waits, wait_ns;
    bool give_up = false;
    {
-@@ -1902,6 +1933,15 @@
+@@ -1902,6 +1933,15 @@ void Presenter::PaintThreadMain() {
                  priority);
    }
  #endif
@@ -74150,10 +74666,51 @@ diff --git a/sdk/src/ui/presenter.cpp b/sdk/src/ui/presenter.cpp
    for (;;) {
      {
        std::unique_lock<std::mutex> lock(paint_thread_mutex_);
+diff --git a/sdk/src/ui/rex_app.cpp b/sdk/src/ui/rex_app.cpp
+index 042bd7e..b823da0 100644
+--- a/sdk/src/ui/rex_app.cpp
++++ b/sdk/src/ui/rex_app.cpp
+@@ -68,6 +68,16 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++#if REX_PLATFORM_SWITCH
++REXCVAR_DEFINE_BOOL(achievement_notifications, false, "UI",
++                    "Show achievement popups (requires restart)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#else
++REXCVAR_DEFINE_BOOL(achievement_notifications, true, "UI",
++                    "Show achievement popups (requires restart)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#endif
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -87,7 +97,7 @@ std::unique_ptr<ui::ImGuiDialog> ReXApp::CreateAchievementsOverlay() {
+ }
+ 
+ std::unique_ptr<ui::AchievementNotificationDialog> ReXApp::CreateAchievementNotificationDialog() {
+-  if (!imgui_drawer_ || !immediate_drawer_ || !runtime_) {
++  if (!REXCVAR_GET(achievement_notifications) || !imgui_drawer_ || !immediate_drawer_ || !runtime_) {
+     return nullptr;
+   }
+   return std::make_unique<ui::AchievementToastDialog>(imgui_drawer_.get(), immediate_drawer_.get(),
+@@ -481,7 +491,8 @@ void ReXApp::LaunchModule() {
+      * session. By creating it only when the first event arrives, the game presents every frame it
+      * renders.
+      */
+-    if (achievement_notification_listener_ == 0 && runtime_ && runtime_->kernel_state()) {
++    if (REXCVAR_GET(achievement_notifications) && achievement_notification_listener_ == 0 &&
++        runtime_ && runtime_->kernel_state()) {
+       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
+           [this](const rex::system::AchievementEvent& event) {
+             rex::system::AchievementEvent copy = event;
 diff --git a/sdk/src/ui/runtime_switch.cpp b/sdk/src/ui/runtime_switch.cpp
+index 51e5e82..e8e01d1 100644
 --- a/sdk/src/ui/runtime_switch.cpp
 +++ b/sdk/src/ui/runtime_switch.cpp
-@@ -94,7 +94,12 @@
+@@ -94,7 +94,12 @@ u32 __nx_applet_type = AppletType_Application;
   * asks for) and leave the rest free for the mappings. What the GPU uses
   * (textures, buffers and compiled shaders) does not come from here.
   */
@@ -74168,6 +74725,7 @@ diff --git a/sdk/src/ui/runtime_switch.cpp b/sdk/src/ui/runtime_switch.cpp
  /*
   * The exception handler stack is no longer declared here.
 diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
+index 1976e72..b9d57f2 100644
 --- a/sdk/src/ui/switch_perf.cpp
 +++ b/sdk/src/ui/switch_perf.cpp
 @@ -39,15 +39,18 @@
@@ -74189,7 +74747,7 @@ diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
  
  #include "rex/ui/switch_apm.h"
  #include "rex/ui/switch_saltynx.h"
-@@ -89,6 +92,7 @@
+@@ -89,6 +92,7 @@ constexpr u64 kSecondNs = 1000000000ULL;      // tick for the console overlays
  
  /* internal resolution published to the overlays. The game sets it when choosing the video mode. */
  std::atomic<uint32_t> g_resolution{(1280u << 16) | 720u};
@@ -74197,7 +74755,7 @@ diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
  constexpr u64 kPassiveIntervalNs = 100000000ULL;  // 100 ms, without pausing threads
  // Next to the rexglue logs, in <NRO folder>/logs/rex/.
  std::string StackFlagPath() {
-@@ -230,6 +234,14 @@
+@@ -230,6 +234,14 @@ std::atomic<bool> g_ab_active{false};
  std::atomic<u32> g_skip_mask{0};
  
  extern "C" void RexSwitchPerfToggleAb(void) {
@@ -74212,7 +74770,7 @@ diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
    const bool new_value = !g_ab_active.load(std::memory_order_relaxed);
    g_ab_active.store(new_value, std::memory_order_relaxed);
    if (!new_value) {
-@@ -918,8 +930,24 @@
+@@ -918,8 +930,24 @@ void ProfilerMain(void*) {
    // Invasive sampling is only enabled explicitly, for diagnostics.
    // The normal mode keeps FPS, CPU and counters, without stopping the game.
    bool sample_stacks = false;
@@ -74238,7 +74796,7 @@ diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
      std::fclose(flag);
    }
  
-@@ -931,6 +959,7 @@
+@@ -931,6 +959,7 @@ void ProfilerMain(void*) {
      std::fprintf(f, "image 0x%016" PRIx64 ", code up to 0x%016" PRIx64 "\n\n", g_base,
                   g_text_hi);
      std::fprintf(f, "Stack sampling: %s\n", sample_stacks ? "active (1 ms)" : "disabled");
@@ -74246,7 +74804,7 @@ diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
      std::fclose(f);
    }
  
-@@ -945,7 +974,19 @@
+@@ -945,7 +974,19 @@ void ProfilerMain(void*) {
    size_t rr = 0;
    size_t mode_index = 0;
    while (true) {
@@ -74267,7 +74825,7 @@ diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
  
      for (size_t tries = 0; sample_stacks && tries < kMaxThreads; ++tries) {
        const size_t idx = rr;
-@@ -1034,6 +1075,19 @@
+@@ -1034,6 +1075,19 @@ Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_m
    const Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
    if (R_SUCCEEDED(rc) && t) {
      Register(t->handle);
@@ -74287,7 +74845,7 @@ diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
    }
    return rc;
  }
-@@ -1047,9 +1101,14 @@
+@@ -1047,9 +1101,14 @@ Result __wrap_threadClose(Thread* t) {
  
  /* libnx calls that cost IPC or walk memory. See g_calls. */
  Result __wrap_nvFenceWait(NvFence* f, s32 timeout_us) {
@@ -74302,7 +74860,7 @@ diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
    return rc;
  }
  
-@@ -1203,6 +1262,13 @@
+@@ -1203,6 +1262,13 @@ void RexSwitchPerfMax(unsigned id, u64 value) {
   * Bits: 1 draws, 2 transfers, 4 resolves, 8 texture loads,
   * 16 presentation effect, 32 tiled dispatch.
   */
@@ -74317,6 +74875,7 @@ diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
    return (g_skip_mask.load(std::memory_order_relaxed) & bit) != 0;
  }
 diff --git a/sdk/src/ui/vulkan/vulkan_device.cpp b/sdk/src/ui/vulkan/vulkan_device.cpp
+index f31eb56..0456b6c 100644
 --- a/sdk/src/ui/vulkan/vulkan_device.cpp
 +++ b/sdk/src/ui/vulkan/vulkan_device.cpp
 @@ -21,6 +21,7 @@
@@ -74327,7 +74886,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_device.cpp b/sdk/src/ui/vulkan/vulkan_devi
  
  REXCVAR_DEFINE_BOOL(vulkan_native_shader_features, false, "UI/Vulkan",
                      "Enable available capabilities for the experimental native shaders")
-@@ -45,6 +46,15 @@
+@@ -45,6 +46,15 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/V
                      "allow fallback to solid fill for line/point polygon modes)")
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
  
@@ -74343,7 +74902,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_device.cpp b/sdk/src/ui/vulkan/vulkan_devi
  namespace rex {
  namespace ui {
  namespace vulkan {
-@@ -173,6 +183,10 @@
+@@ -173,6 +183,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
  #define XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(name, major, minor) \
    request_promoted_extension("VK_" #name, major, minor, &ext_##major##_##minor##_##name);
  
@@ -74354,7 +74913,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_device.cpp b/sdk/src/ui/vulkan/vulkan_devi
    bool ext_KHR_portability_subset = false;
    bool ext_1_2_KHR_driver_properties = false;
    if (get_physical_device_properties2_supported) {
-@@ -349,6 +363,13 @@
+@@ -349,6 +363,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
                   VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT>
        features_EXT_extended_dynamic_state3;
  
@@ -74368,7 +74927,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_device.cpp b/sdk/src/ui/vulkan/vulkan_devi
    if (get_physical_device_properties2_supported) {
      if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
        features_1_2.Link(supported_features_2, device_create_info);
-@@ -644,6 +665,11 @@
+@@ -644,6 +665,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
  
    if (with_gpu_emulation) {
      XE_UI_VULKAN_FEATURE(robustBufferAccess)
@@ -74380,7 +74939,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_device.cpp b/sdk/src/ui/vulkan/vulkan_devi
      XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
      XE_UI_VULKAN_FEATURE(independentBlend)
      XE_UI_VULKAN_FEATURE(geometryShader)
-@@ -763,6 +789,12 @@
+@@ -763,6 +789,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
    if (device->extensions_.ext_EXT_robustness2) {
      if (with_gpu_emulation) {
        XE_UI_VULKAN_FEATURE_2(features_EXT_robustness2, nullDescriptor)
@@ -74393,33 +74952,34 @@ diff --git a/sdk/src/ui/vulkan/vulkan_device.cpp b/sdk/src/ui/vulkan/vulkan_devi
      }
    }
  
-@@ -773,6 +805,11 @@
-     XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorBlendEnable)
-     XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorBlendEquation)
+@@ -775,6 +807,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
      XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorWriteMask)
-+  }
-+
+   }
+ 
 +  if (ext_KHR_pipeline_executable_properties) {
 +    features_KHR_pipeline_executable_properties.enabled.pipelineExecutableInfo =
 +        features_KHR_pipeline_executable_properties.supported.pipelineExecutableInfo;
-   }
- 
++  }
++
  #undef XE_UI_VULKAN_LIMIT
-@@ -821,6 +858,13 @@
- #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
+ #undef XE_UI_VULKAN_ENUM_LIMIT
+ #undef XE_UI_VULKAN_FEATURE
+@@ -822,6 +859,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
    }
  #undef XE_UI_VULKAN_FUNCTION_PROMOTED
-+
+ 
 +  if (SwitchShaderStatsRequested()) {
 +    const bool enabled = ext_KHR_pipeline_executable_properties &&
 +        features_KHR_pipeline_executable_properties.enabled.pipelineExecutableInfo;
 +    if (enabled) switch_shader_stats_device.store(device->device_, std::memory_order_release);
 +    REXLOG_INFO("SHADER_STATS requested=1 enabled={}", enabled ? 1 : 0);
 +  }
- 
++
    // Non-promoted extensions, and extensions promoted to a Vulkan version not
    // supported by the device.
+ #define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
 diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_presenter.cpp
+index 84fa5ee..d8c15ab 100644
 --- a/sdk/src/ui/vulkan/vulkan_presenter.cpp
 +++ b/sdk/src/ui/vulkan/vulkan_presenter.cpp
 @@ -9,6 +9,7 @@
@@ -74430,7 +74990,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
  #include <algorithm>
  #include <atomic>
  #include <chrono>  // present_wait_acquisition_in_cpu
-@@ -119,7 +120,7 @@
+@@ -119,7 +120,7 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, REX_VULKAN_ALLOW_UNSYNCED
  REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                      "Allow FIFO relaxed present mode");
  
@@ -74439,7 +74999,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
  #define REX_PRESENT_PAINTED_DEFAULT_PROFILE true
  #else
  #define REX_PRESENT_PAINTED_DEFAULT_PROFILE false
-@@ -927,9 +928,9 @@
+@@ -927,9 +928,9 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
        VkResult submit_result;
        {
          const VulkanDevice::Queue::Acquisition queue_acquisition =
@@ -74451,7 +75011,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
        }
        if (submit_result != VK_SUCCESS) {
          REXLOG_ERROR(
-@@ -1398,6 +1399,7 @@
+@@ -1398,6 +1399,7 @@ void VulkanPresenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
  }
  
  void VulkanPresenter::SealRefreshesAndWait() {
@@ -74459,7 +75019,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
    if (!refreshes_no_seal_.exchange(false, std::memory_order_relaxed)) {
      // Nothing is unsealed: either there has been no refresh since the last seal, or lazy sealing is
      // off and every refresh already carried its own fence.
-@@ -1419,9 +1421,9 @@
+@@ -1419,9 +1421,9 @@ void VulkanPresenter::SealRefreshesAndWait() {
          guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
      {
        const VulkanDevice::Queue::Acquisition queue_acquisition =
@@ -74471,7 +75031,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
            VK_SUCCESS) {
          // Same as before: the refresh commands will still run, but this fence stays
          // unsignaled and there is nothing to wait for. It is reported because here it is
-@@ -1440,6 +1442,7 @@
+@@ -1440,6 +1442,7 @@ void VulkanPresenter::SealRefreshesAndWait() {
  bool VulkanPresenter::RefreshGuestOutputImpl(
      uint32_t mailbox_index, uint32_t frontbuffer_width, uint32_t frontbuffer_height,
      std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) {
@@ -74479,7 +75039,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
    assert_not_zero(frontbuffer_width);
    assert_not_zero(frontbuffer_height);
    VkExtent2D max_framebuffer_extent = util::GetMax2DFramebufferExtent(vulkan_device_->properties());
-@@ -1512,9 +1515,9 @@
+@@ -1512,9 +1515,9 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
      VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
          guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
      const VulkanDevice::Queue::Acquisition queue_acquisition =
@@ -74491,7 +75051,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
          VK_SUCCESS) {
        fence_acqusition.SubmissionSucceededSignalFailed();
      }
-@@ -2000,6 +2003,9 @@
+@@ -2000,6 +2003,9 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
  }
  
  Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
@@ -74501,7 +75061,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
    // First mark of the fine-grained breakdown. With the switch off this is just a bool.
    uint64_t profile = PaintedNow();
  
-@@ -2067,6 +2073,7 @@
+@@ -2067,6 +2073,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
      ++paint_context_.early_hits;
    } else {
      ++paint_context_.early_failures;
@@ -74509,7 +75069,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
      acquire_result = dfn.vkAcquireNextImageKHR(
          device, paint_context_.swapchain, UINT64_MAX, acquisition_in_cpu ? VK_NULL_HANDLE : acquire_semaphore,
          acquisition_in_cpu ? acquire_fence : VK_NULL_HANDLE, &swapchain_image_index);
-@@ -2737,13 +2744,13 @@
+@@ -2737,13 +2744,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
      VkResult submit_result;
      {
        const VulkanDevice::Queue::Acquisition queue_acquisition =
@@ -74527,7 +75087,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
            ui_fence_acquisition.SubmissionSucceededSignalFailed();
          }
        }
-@@ -2781,9 +2788,10 @@
+@@ -2781,9 +2788,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
    VkResult present_result;
    {
      const VulkanDevice::Queue::Acquisition queue_acquisition =
@@ -74541,6 +75101,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_presenter.cpp b/sdk/src/ui/vulkan/vulkan_p
    }
    /*
 diff --git a/sdk/src/ui/vulkan/vulkan_submission_tracker.cpp b/sdk/src/ui/vulkan/vulkan_submission_tracker.cpp
+index 07a07b2..8b918f6 100644
 --- a/sdk/src/ui/vulkan/vulkan_submission_tracker.cpp
 +++ b/sdk/src/ui/vulkan/vulkan_submission_tracker.cpp
 @@ -9,6 +9,7 @@
@@ -74551,7 +75112,7 @@ diff --git a/sdk/src/ui/vulkan/vulkan_submission_tracker.cpp b/sdk/src/ui/vulkan
  #include <cstdint>
  
  #include <rex/assert.h>
-@@ -89,6 +90,7 @@
+@@ -89,6 +90,7 @@ uint64_t VulkanSubmissionTracker::UpdateAndGetCompletedSubmission() {
  }
  
  bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_index) {
@@ -74559,42 +75120,125 @@ diff --git a/sdk/src/ui/vulkan/vulkan_submission_tracker.cpp b/sdk/src/ui/vulkan
    // The tracker itself can't give a submission index for a submission that
    // hasn't even started being recorded yet, the client has provided a
    // completely invalid value or has done overly optimistic math if such an
-diff --git a/sdk/src/ui/rex_app.cpp b/sdk/src/ui/rex_app.cpp
---- a/sdk/src/ui/rex_app.cpp
-+++ b/sdk/src/ui/rex_app.cpp
-@@ -68,6 +68,16 @@
-                       "GPU emulation")
-     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+diff --git a/sdk/src/ui/vulkan/vulkan_util.cpp b/sdk/src/ui/vulkan/vulkan_util.cpp
+index 2106800..acd970e 100644
+--- a/sdk/src/ui/vulkan/vulkan_util.cpp
++++ b/sdk/src/ui/vulkan/vulkan_util.cpp
+@@ -10,6 +10,8 @@
+  */
  
-+#if REX_PLATFORM_SWITCH
-+REXCVAR_DEFINE_BOOL(achievement_notifications, false, "UI",
-+                    "Show achievement popups (requires restart)")
-+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-+#else
-+REXCVAR_DEFINE_BOOL(achievement_notifications, true, "UI",
-+                    "Show achievement popups (requires restart)")
-+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-+#endif
-+
- namespace rex {
+ #include <cstdint>
++#include <atomic>
++#include <rex/logging.h>
  
- // --- ReXApp ---
-@@ -87,7 +97,7 @@
+ #include <rex/assert.h>
+ #include <rex/math.h>
+@@ -113,6 +115,20 @@ bool CreateDedicatedAllocationBuffer(const VulkanDevice* const vulkan_device,
+   return true;
  }
  
- std::unique_ptr<ui::AchievementNotificationDialog> ReXApp::CreateAchievementNotificationDialog() {
--  if (!imgui_drawer_ || !immediate_drawer_ || !runtime_) {
-+  if (!REXCVAR_GET(achievement_notifications) || !imgui_drawer_ || !immediate_drawer_ || !runtime_) {
-     return nullptr;
++namespace {
++void ReportDedicatedImageFailure(unsigned stage, VkResult result, VkDeviceSize bytes,
++    uint32_t type, const VkImageCreateInfo& info) {
++  static std::atomic<uint64_t> failures[4]{};
++  const uint64_t n = failures[stage].fetch_add(1, std::memory_order_relaxed) + 1;
++  if (n > 8 && (n & 4095) != 0) return;
++  const char* operations[] = {"vkCreateImage", "ChooseMemoryType", "vkAllocateMemory", "vkBindImageMemory"};
++  REXLOG_ERROR("[vulkan-image-failure] operation={} has_vk_result={} result={} count={} bytes={} memory_type={} extent={}x{}x{} format={} levels={} layers={} usage={:X}",
++      operations[stage], stage != 1, int32_t(result), n, uint64_t(bytes), type,
++      info.extent.width, info.extent.height, info.extent.depth, uint32_t(info.format),
++      info.mipLevels, info.arrayLayers, uint32_t(info.usage));
++}
++}  // namespace
++
+ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+                                     const VkImageCreateInfo& create_info,
+                                     const MemoryPurpose memory_purpose, VkImage& image_out,
+@@ -122,7 +138,9 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+   const VkDevice device = vulkan_device->device();
+ 
+   VkImage image;
+-  if (dfn.vkCreateImage(device, &create_info, nullptr, &image) != VK_SUCCESS) {
++  const VkResult create_result = dfn.vkCreateImage(device, &create_info, nullptr, &image);
++  if (create_result != VK_SUCCESS) {
++    ReportDedicatedImageFailure(0, create_result, 0, UINT32_MAX, create_info);
+     return false;
    }
-   return std::make_unique<ui::AchievementToastDialog>(imgui_drawer_.get(), immediate_drawer_.get(),
-@@ -481,7 +491,8 @@
-      * session. By creating it only when the first event arrives, the game presents every frame it
-      * renders.
-      */
--    if (achievement_notification_listener_ == 0 && runtime_ && runtime_->kernel_state()) {
-+    if (REXCVAR_GET(achievement_notifications) && achievement_notification_listener_ == 0 &&
-+        runtime_ && runtime_->kernel_state()) {
-       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
-           [this](const rex::system::AchievementEvent& event) {
-             rex::system::AchievementEvent copy = event;
+ 
+@@ -131,6 +149,8 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+   uint32_t memory_type = ChooseMemoryType(vulkan_device->memory_types(),
+                                           memory_requirements.memoryTypeBits, memory_purpose);
+   if (memory_type == UINT32_MAX) {
++    // This is a local selection failure, not a VkResult-returning call.
++    ReportDedicatedImageFailure(1, VK_SUCCESS, memory_requirements.size, memory_type, create_info);
+     dfn.vkDestroyImage(device, image, nullptr);
+     return false;
+   }
+@@ -150,12 +170,16 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+     memory_dedicated_allocate_info.buffer = VK_NULL_HANDLE;
+   }
+   VkDeviceMemory memory;
+-  if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory) != VK_SUCCESS) {
++  const VkResult allocate_result = dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory);
++  if (allocate_result != VK_SUCCESS) {
++    ReportDedicatedImageFailure(2, allocate_result, memory_requirements.size, memory_type, create_info);
+     dfn.vkDestroyImage(device, image, nullptr);
+     return false;
+   }
+ 
+-  if (dfn.vkBindImageMemory(device, image, memory, 0) != VK_SUCCESS) {
++  const VkResult bind_result = dfn.vkBindImageMemory(device, image, memory, 0);
++  if (bind_result != VK_SUCCESS) {
++    ReportDedicatedImageFailure(3, bind_result, memory_requirements.size, memory_type, create_info);
+     dfn.vkDestroyImage(device, image, nullptr);
+     dfn.vkFreeMemory(device, memory, nullptr);
+     return false;
+diff --git a/shaders/XenosRecomp/shader_recompiler.cpp b/shaders/XenosRecomp/shader_recompiler.cpp
+index dacc7a5..08781fc 100644
+--- a/shaders/XenosRecomp/shader_recompiler.cpp
++++ b/shaders/XenosRecomp/shader_recompiler.cpp
+@@ -365,7 +365,10 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     {
+     case TextureDimension::Texture2D:
+         // The last argument is 1/size of the slot, so the texture does not have to be queried.
+-        print(", float2({}, {}), {}_InvSize", instr.offsetX * 0.5f, instr.offsetY * 0.5f, constNamePtr);
++        if (instr.opcode == FetchOpcode::GetTextureWeights)
++            print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
++        else
++            print(", float2({}, {}), {}_InvSize", instr.offsetX * 0.5f, instr.offsetY * 0.5f, constNamePtr);
+         break;
+     case TextureDimension::TextureCube:
+         out += ", cubeMapData";
+@@ -1509,9 +1512,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         {
+             const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+             println("\t#define {} (1 << {})", constantName, constantInfo->registerIndex + (isPixelShader ? 16 : 0));
+-            // In MASSEFFECT CTAB numbers b0.. and CF uses 128.. for pixels.
+-            // The g_Booleans packing keeps its 16 bits per stage.
+-            boolConstants.emplace(constantInfo->registerIndex + (isPixelShader ? 128 : 0), constantName);
++            // CTAB can declare an array spanning multiple boolean registers.
++            // Mercenaries 2 uses b0..b3 (numPointLights), b4..b6 and b8.
++            // Register every element; CF uses 128.. for pixel boolean addresses.
++            const uint32_t first = constantInfo->registerIndex;
++            const uint32_t count = constantInfo->registerCount;
++            if (count == 0 || first + count > 16)
++                throw std::runtime_error("boolean declaration exceeds the shared constant ABI");
++            for (uint32_t element = 0; element < count; ++element)
++                boolConstants.emplace(first + element + (isPixelShader ? 128 : 0),
++                    uint32_t{1} << (first + element + (isPixelShader ? 16 : 0)));
+         }
+     }
+ 
+diff --git a/shaders/XenosRecomp/shader_recompiler.h b/shaders/XenosRecomp/shader_recompiler.h
+index e450e48..12fff2d 100644
+--- a/shaders/XenosRecomp/shader_recompiler.h
++++ b/shaders/XenosRecomp/shader_recompiler.h
+@@ -33,7 +33,7 @@ struct ShaderRecompiler : StringBuffer
+     std::unordered_map<uint32_t, VertexElement> vertexElements;
+     std::unordered_map<uint32_t, std::string> interpolators;
+     std::unordered_map<uint32_t, const ConstantInfo*> float4Constants;
+-    std::unordered_map<uint32_t, const char*> boolConstants;
++    std::unordered_map<uint32_t, uint32_t> boolConstants;
+     std::unordered_map<uint32_t, const char*> samplers;
+     // MASSEFFECT: float registers set by the definition table (literal c<N> locals); an undeclared
+     // register outside this set is read from the constant buffer directly.

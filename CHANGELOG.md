@@ -1,3 +1,25 @@
+# Prototype 2 — 0.3.0
+
+## Русский
+
+- Производительность: выше частота кадров в городе и в бою, заметно реже длинные подвисания (кадры дольше 50 мс). Самые частые функции системы задач игры работают без глобального мьютекса, у главного потока игры выше приоритет, анимацию персонажей считают два вспомогательных потока, SDK не будит потоки на семафорах, которых никто не ждёт.
+- Переработана кодогенерация: прямые вызовы для самых частых косвенных переходов, вычисления одинарной точности без лишних преобразований, встроенные короткие memcpy/memset, свёртка констант из данных только для чтения.
+- Пул памяти текстур и обновлённые профили PGO.
+- Исправлен зелёный кадр перед каждой видеовставкой.
+- Исправлено свечение солнца и луны сквозь мосты и здания.
+- Улучшена совместимость сохранений; размер файла обновляется после записи. Дополнительная диагностика выключена.
+- Сборка из исходников повторяет релизную: шаги производительности выполняет `tools/prepare_p2_perf.py`, см. [сборка](docs/BUILD.ru.md).
+
+## English
+
+- Performance: higher frame rate in the city and in combat, far fewer long hitches (frames over 50 ms). The game's most frequent job-system functions run without the global mutex, the game's main thread has a higher priority, character animation runs on two helper threads, and the SDK no longer wakes threads on semaphores nobody waits on.
+- Reworked code generation: direct calls for the most frequent indirect branches, single-precision arithmetic without extra conversions, inlined short memcpy/memset, folding of constants from read-only data.
+- Texture memory pool and updated PGO profiles.
+- Fixed the green frame before every video.
+- Fixed the sun and moon glow showing through bridges and buildings.
+- Improved save compatibility; the file size is refreshed after writes. Optional diagnostics are off.
+- Building from source reproduces the release: `tools/prepare_p2_perf.py` applies the performance steps, see the [build guide](docs/BUILD.en.md).
+
 # Prototype 2 — 0.2.0
 
 ## Русский

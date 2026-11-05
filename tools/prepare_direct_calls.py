@@ -22,6 +22,11 @@ def protected_targets():
     # Public list of strong dispatch overrides; no archived NRO or nm file is required.
     strong=set(json.loads((ROOT/'config/strong-overrides.json').read_text(encoding='utf-8'))['symbols'])
     result|=strong
+    # 0.3.0: addresses that later tools and comments only mention (hot msr sets, census lists, hooks patched into the
+    # generated code itself) stay direct calls, exactly as in the released build (config/direct_call_keep.txt).
+    keep=ROOT/'config/direct_call_keep.txt'
+    if keep.exists():
+        result-={l.strip() for l in keep.read_text(encoding='utf-8').splitlines() if l.strip().startswith('sub_')}-strong
     return result,strong
 
 def prepare():

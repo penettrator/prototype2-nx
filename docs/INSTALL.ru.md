@@ -1,4 +1,4 @@
-# Установка Prototype 2 на Nintendo Switch — 0.2.0
+# Установка Prototype 2 на Nintendo Switch — 0.3.0
 
 [English](INSTALL.en.md)
 

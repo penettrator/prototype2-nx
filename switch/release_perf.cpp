@@ -5,6 +5,9 @@
 #include <atomic>
 #include <cstdio>
 #include <malloc.h>
+#include "../project/src/native/staging_reuse_stats.h"
+#include "../project/src/native/frame_pacing_window.h"
+extern "C" bool P2LightFrameReportEnabled(void);
 #include <rex/ui/switch_apm.h>
 #include <rex/ui/switch_saltynx.h>
 #include <rex/ui/switch_sysclk.h>
@@ -26,6 +29,57 @@ namespace {
 std::atomic<u64> g_counters[1]{};
 std::atomic<uint32_t> g_resolution{(1280u<<16)|720u};
 Thread g_thread;
+p2::native::FramePacingWindow g_pacing;
+std::atomic<u64> g_last_present_tick{0};
+u64 g_report_tick=0,g_report_presents=0;
+void WriteLightReport(u64 now,u64 freq) {
+  if(!P2LightFrameReportEnabled()) return;
+  const u64 presents=g_counters[0].load(std::memory_order_relaxed);
+  if(!g_report_tick){g_pacing.Take();g_report_tick=now;g_report_presents=presents;return;}
+  if(now-g_report_tick<10*freq)return;
+  const double seconds=double(now-g_report_tick)/double(freq);
+  const auto frame=g_pacing.Take();
+  const auto& staging=p2::native::staging_reuse_counters;
+  char path[1024];std::snprintf(path,sizeof(path),"%sframe_pacing.csv",RexSwitchLogDir());
+  // The existing 1-Hz FPS worker writes one small row every ten seconds.
+  // No formatting, file access or thread suspension on the ring/game thread.
+  if(FILE* f=std::fopen(path,"a")){
+    if(std::ftell(f)==0)std::fprintf(f,"tick_s,window_s,presents,fps,intervals,p95_bucket_ms,p99_bucket_ms,max_gap_ms,gaps_gt50,gaps_gt100,gaps_ge1000,staging_created_total,staging_reused_total,staging_returned_total,idle_KiB,pool_budget_MiB\n");
+    std::fprintf(f,"%.3f,%.3f,%llu,%.3f,%llu,%u,%u,%.3f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+      double(now)/double(freq),seconds,(unsigned long long)(presents-g_report_presents),
+      double(presents-g_report_presents)/seconds,(unsigned long long)frame.count,
+      frame.p95_ms,frame.p99_ms,double(frame.max_us)/1000.0,
+      (unsigned long long)frame.gt50,(unsigned long long)frame.gt100,(unsigned long long)frame.ge1000,
+      (unsigned long long)staging.created.load(std::memory_order_relaxed),
+      (unsigned long long)staging.reused.load(std::memory_order_relaxed),
+      (unsigned long long)staging.returned.load(std::memory_order_relaxed),
+      (unsigned long long)(staging.idle_bytes.load(std::memory_order_relaxed)/1024),
+      (unsigned long long)(staging.budget_bytes.load(std::memory_order_relaxed)/(1024*1024)));
+    std::fclose(f);
+  }
+  const auto& streams = p2::native::stream_lifetime_counters;
+  u64 used=0,limit=0;
+  const Result used_rc=svcGetInfo(&used,InfoType_UsedMemorySize,CUR_PROCESS_HANDLE,0);
+  const Result limit_rc=svcGetInfo(&limit,InfoType_TotalMemorySize,CUR_PROCESS_HANDLE,0);
+  const auto heap=mallinfo();
+  std::snprintf(path,sizeof(path),"%smemory_streaming.csv",RexSwitchLogDir());
+  if(FILE* f=std::fopen(path,"a")){
+    if(std::ftell(f)==0)std::fprintf(f,"tick_s,pending_jobs,ready_jobs,ready_staging_KiB,discarded_total,reaped_total,image_failures,host_heap_used_KiB,host_heap_free_KiB,process_used_KiB,process_limit_KiB,used_result,limit_result\n");
+    std::fprintf(f,"%.3f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u\n",
+      double(now)/double(freq),
+      (unsigned long long)streams.pending.load(std::memory_order_relaxed),
+      (unsigned long long)streams.ready.load(std::memory_order_relaxed),
+      (unsigned long long)(streams.ready_staging_bytes.load(std::memory_order_relaxed)/1024),
+      (unsigned long long)streams.discarded.load(std::memory_order_relaxed),
+      (unsigned long long)streams.reaped.load(std::memory_order_relaxed),
+      (unsigned long long)streams.image_failures.load(std::memory_order_relaxed),
+      (unsigned long long)(uint64_t(uint32_t(heap.uordblks))/1024),
+      (unsigned long long)(uint64_t(uint32_t(heap.fordblks))/1024),
+      (unsigned long long)(used/1024),(unsigned long long)(limit/1024),used_rc,limit_rc);
+    std::fclose(f);
+  }
+  g_report_tick=now;g_report_presents=presents;
+}
 struct TicOverlay {
   u64 tic = 0;
   u64 presented = 0;
@@ -80,6 +134,7 @@ struct TicOverlay {
      * does not even do that.
      */
     RexSwitchApmWatch();
+    WriteLightReport(now,freq);
     presented = presented_now;
     tic = now;
   }
@@ -217,6 +272,11 @@ void RexSwitchPerfIntervalSwap(unsigned vblanks) {
 
 void RexSwitchPerfCount(unsigned id) {
   if (id != 0) return;
+  if(P2LightFrameReportEnabled()){
+    const u64 now=armGetSystemTick(),freq=armGetSystemTickFreq();
+    const u64 prev=g_last_present_tick.exchange(now,std::memory_order_relaxed);
+    if(prev && now>=prev)g_pacing.Record((now-prev)*1000000/freq);
+  }
   g_counters[0].fetch_add(1, std::memory_order_relaxed);
   const uint32_t res = g_resolution.load(std::memory_order_relaxed);
   rex::ui::switch_saltynx::Beat(res >> 16, res & 0xFFFF);

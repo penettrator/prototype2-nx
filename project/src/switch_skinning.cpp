@@ -41,15 +41,55 @@ REXCVAR_DEFINE_UINT32(p2_skinning_helper_mask, 0x6, "Prototype2",
     "Core mask of the skinning helper thread (WORKLOG #101: 0x8 = core 3 when the process may use it)");
 REXCVAR_DEFINE_UINT32(p2_skinning_helper_spin_us, 150, "Prototype2",
     "The skinning helper keeps polling this long after its last chunk before it sleeps (calls come in bursts)");
+// PERF pass 7 (perf_results/pass_6: skinning ~12 % of the simulation thread with one helper on core 3).
+REXCVAR_DEFINE_UINT32(p2_skinning_helpers, 1, "Prototype2",
+    "Skinning helper threads: 1 = one helper (previous), 2 = a second helper; calls then split into per-chunk "
+    "bounds folded in chunk order (same result)");
+REXCVAR_DEFINE_UINT32(p2_skinning_helper2_mask, 0x4, "Prototype2", "Core mask of the second skinning helper");
+REXCVAR_DEFINE_UINT32(p2_skinning_helper2_priority, 0x2D, "Prototype2",
+    "Horizon priority of the second skinning helper (0x2D = just below the renderer threads at 0x2C)");
+REXCVAR_DEFINE_UINT32(p2_skinning_multi_ab_period_s, 0, "Prototype2",
+    "Measurement: with 2 helpers, use them in even periods of this many seconds and one helper in odd ones; 0 = always");
 namespace {
+// PERF pass 14 (perf_results/pass_13/logs5-diag): the simulation thread spends a third of its skinning time
+// waiting for the helper's last chunk (yield loop on g_active) - the helper on core 3 at 0x2A is preempted by
+// the game's audio engine (0x29). In-run A/B: odd periods give the helper p2_skinning_helper_priority_alt.
+REXCVAR_DEFINE_UINT32(p2_skinning_helper_priority_alt, 0, "Prototype2",
+    "Measurement: helper priority in odd periods of p2_skinning_prio_ab_period_s (0 = off)");
+REXCVAR_DEFINE_UINT32(p2_skinning_prio_ab_period_s, 0, "Prototype2",
+    "Measurement: alternate the skinning helper priority every this many seconds of the system clock; 0 = off");
+static void p2_skin_priority_ab() {
+  const uint32_t period = REXCVAR_GET(p2_skinning_prio_ab_period_s);
+  const uint32_t alt = REXCVAR_GET(p2_skinning_helper_priority_alt);
+  if (!period || !alt) return;
+  static uint32_t calls = 0;
+  if ((++calls & 63) != 0) return;
+#if defined(__aarch64__)
+  uint64_t tick, freq;
+  __asm__ volatile("mrs %0, cntpct_el0" : "=r"(tick));
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+  const uint64_t seconds = freq ? tick / freq : 0;
+#else
+  const uint64_t seconds = 0;
+#endif
+  const int want = ((seconds / period) & 1) ? int(alt) : int(REXCVAR_GET(p2_skinning_helper_priority));
+  p2skinpar::g_priority_want.store(want, std::memory_order_relaxed);
+}
+
 p2skinpar::Parallel ParallelRunner() {
   const uint32_t min = REXCVAR_GET(p2_skinning_parallel_min);
+  p2_skin_priority_ab();
   if (min) p2skinpar::Start(int(REXCVAR_GET(p2_skinning_helper_priority)), REXCVAR_GET(p2_skinning_helper_mask),
                            REXCVAR_GET(p2_skinning_helper_spin_us));
+  if (min && REXCVAR_GET(p2_skinning_helpers) >= 2) {
+    p2skinpar::g_multi_period.store(REXCVAR_GET(p2_skinning_multi_ab_period_s), std::memory_order_relaxed);
+    p2skinpar::StartExtra(int(REXCVAR_GET(p2_skinning_helper2_priority)), REXCVAR_GET(p2_skinning_helper2_mask));
+  }
   const uint64_t calls = p2skinpar::g_calls.load(std::memory_order_relaxed);
   if (calls && calls % 400000 == 0)
-    REXLOG_INFO("[p2-skin-par] {} calls, {} vertices, {} split, {} vertices by the helper", calls,
+    REXLOG_INFO("[p2-skin-par] {} calls, {} vertices, {} split, {} several-helper, {} vertices by helpers", calls,
                 p2skinpar::g_vertices.load(std::memory_order_relaxed), p2skinpar::g_split.load(std::memory_order_relaxed),
+                p2skinpar::g_multi_calls.load(std::memory_order_relaxed),
                 p2skinpar::g_helper_vertices.load(std::memory_order_relaxed));
   return p2skinpar::Parallel{min ? min : UINT32_MAX};
 }

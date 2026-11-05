@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -56,6 +57,23 @@
 
 // project8-sw defines this in its SDK patches; ours has no equivalent, so it lives here.
 REXCVAR_DECLARE(uint32_t, p2_host_core_mask);  // SDK xthread.cpp
+// B-007 (2026-11-04): the sun/moon glow draws through bridges whatever the occlusion queries say. Xenos VIZ queries
+// (PM4_VIZ_QUERY start/end around test draws) were always reported visible and the visibility word of DRAW_INDX
+// ignored, so draws the game made conditional on a VIZ query were always drawn. With p2_viz_queries the VIZ
+// intervals are measured; a DRAW_INDX whose visibility word has any of p2_viz_kill_mask set (id = low 6 bits) is
+// dropped when that query's last result was 0 samples. p2_viz_report logs the words seen (to find the mask).
+REXCVAR_DEFINE_BOOL(p2_viz_queries, false, "Prototype2",
+                    "B-007: measure Xenos VIZ queries and drop draws conditional on an invisible one "
+                    "(needs p2_viz_kill_mask)");
+REXCVAR_DEFINE_UINT32(p2_viz_kill_mask, 0, "Prototype2",
+                      "B-007: bits of the DRAW_INDX visibility word that make the draw conditional on VIZ query "
+                      "(word & 63); 0 = never drop");
+REXCVAR_DEFINE_BOOL(p2_viz_report, false, "Prototype2",
+                    "B-007: every 10 s, a warning line with the VIZ_QUERY packet values and DRAW_INDX visibility "
+                    "words seen, and the draws dropped");
+REXCVAR_DEFINE_BOOL(p2_occlusion_fake_last, false, "Prototype2",
+                    "B-007: an occlusion query the native renderer could not track repeats the last measured "
+                    "result of its address (0 if none) instead of reporting fully visible");
 REXCVAR_DEFINE_INT32(switch_cp_core, -1, "Prototype2",
                      "Core (0-2) to pin the native ring thread to; -1 leaves it unpinned");
 
@@ -81,6 +99,18 @@ REXCVAR_DEFINE_UINT32(p2_msr_lock_mode, 2, "Prototype2",
                       "run19/21), 1 = one lock per address stripe, 2 = the SDK's single global mutex (slowest)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_UINT32(p2_native_rptr_writeback_words, 0, "Prototype2",
+    "Write the ring read pointer back to the game every this many consumed words within a batch "
+    "(the game waits for ring space on it); 0 = only at the end of each batch (previous behaviour)");
+REXCVAR_DEFINE_UINT32(p2_native_rptr_writeback_alt_words, 0, "Prototype2",
+    "With p2_native_rptr_ab_period_s: p2_native_rptr_writeback_words of the odd periods (0 = end of batch)");
+REXCVAR_DEFINE_UINT32(p2_native_wait_reg_mem_sleep_us, 50, "Prototype2",
+    "Sleep per poll of a PM4 WAIT_REG_MEM after 64 yields (us); 50 = previous fixed value");
+REXCVAR_DEFINE_UINT32(p2_native_wait_reg_mem_sleep_alt_us, 50, "Prototype2",
+    "With p2_native_rptr_ab_period_s: p2_native_wait_reg_mem_sleep_us of the odd periods");
+REXCVAR_DEFINE_UINT32(p2_native_rptr_ab_period_s, 0, "Prototype2",
+    "Measurement: alternate p2_native_rptr_writeback_words (even periods) and 0 (odd periods) every "
+    "this many seconds of the system clock; 0 = off");
 REXCVAR_DEFINE_STRING(p2_renderer, "xenos", "Prototype2",
                       "xenos = the SDK's emulated Xbox 360 GPU; native = the native renderer "
                       "(in development: stage A presents a test colour)")
@@ -597,11 +627,21 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       reader.mask = words - 1;
       reader.pos = read;
       reader.end = written;
+      // PERF pass 4: publish the read pointer while the batch is consumed, as the CP does every
+      // RB_CNTL block, not only at its end: the game's D3D waits for ring space on this word.
+      const uint32_t writeback_words = RingWritebackWords();
+      uint32_t written_back = read;
       while (reader.Pending()) {
         if (renderer_ready_ && (packets_ & 63u)==0) renderer_.PollOcclusionQueries();
         if (!Packet(reader, 0)) {
           // A partial packet: the rest arrives with the next CP_RB_WPTR.
           break;
+        }
+        if (writeback_words && ((reader.pos - written_back) & reader.mask) >= writeback_words) {
+          if (const uint32_t wb = read_pointer_writeback_.load(std::memory_order_acquire)) {
+            rex::memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(wb), reader.pos);
+          }
+          written_back = reader.pos;
         }
       }
       read = reader.pos;
@@ -855,6 +895,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         const auto wait_start = Clock::now();
         const auto limit = wait_start + kWaitRegMemMax;
         bool waited = false;
+        uint32_t wait_sleep_us = 50;
         uint64_t gpu_wait_blocked=0;uint32_t gpu_wait_kind=p2::gpuwait::WaitMemBlocked;
         for (uint32_t attempt = 0;; ++attempt) {
           if (!(info & 0x10) && poll == rex::graphics::XE_GPU_REG_COHER_STATUS_HOST &&
@@ -887,7 +928,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           if (attempt < 64) {
             std::this_thread::yield();
           } else {
-            rex::thread::Sleep(std::chrono::microseconds(50));
+            // PERF pass 7: was a fixed 50 us; p2_native_wait_reg_mem_sleep_us (default 50 = unchanged).
+            if (attempt == 64) wait_sleep_us = WaitRegMemSleepUs();
+            rex::thread::Sleep(std::chrono::microseconds(wait_sleep_us));
           }
         }
         if(gpu_wait_blocked)P2GpuWaitEnd(gpu_wait_kind,gpu_wait_blocked);
@@ -1051,6 +1094,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         if (words < 1) break;
         const uint32_t value = data.Read();
         const uint32_t id = value & 0x3F;
+        VizNote(viz_packets_, value);
+        if (REXCVAR_GET(p2_viz_queries) && renderer_ready_) {
+          if (!(value & 0x100)) renderer_.VizBegin(id); else renderer_.VizEnd(id);
+        }
         if (!(value & 0x100)) {
           WriteRegister(rex::graphics::XE_GPU_REG_VGT_EVENT_INITIATOR, xenos::VIZQUERY_START);
         } else {
@@ -1066,8 +1113,15 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         // DRAW_INDX starts with the visibility query word.
         const uint32_t skip = opcode == xenos::PM4_DRAW_INDX ? 1 : 0;
         if (words < skip + 1) break;
+        uint32_t viz_word = 0;
         if (skip) {
-          data.Read();
+          viz_word = data.Read();
+          VizNote(viz_words_, viz_word);
+        }
+        bool viz_killed = false;
+        if (viz_word && REXCVAR_GET(p2_viz_queries) && renderer_ready_) {
+          const uint32_t mask = REXCVAR_GET(p2_viz_kill_mask);
+          if (mask && (viz_word & mask) && renderer_.VizHidden(viz_word & 0x3F)) { viz_killed = true; ++viz_dropped_; }
         }
         const uint32_t initiator = data.Read();
         WriteRegister(rex::graphics::XE_GPU_REG_VGT_DRAW_INITIATOR, initiator);
@@ -1098,7 +1152,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           }
         } else {
           ++draws_;
-          if (renderer_ready_) {
+          if (renderer_ready_ && !viz_killed) {
             renderer_.Draw(immediate, immediate_words);
             if (packet_trace_enabled_ && renderer_.TakePacketTraceRequest()) LogPacketTrace();
           }
@@ -1158,6 +1212,31 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     }
   }
 
+  // B-007 diagnostics: distinct VIZ_QUERY values / DRAW_INDX visibility words with counts, every 10 s.
+  struct VizCount { uint32_t value = 0; uint64_t count = 0; };
+  std::array<VizCount, 32> viz_packets_{}, viz_words_{};
+  uint64_t viz_dropped_ = 0;
+  std::chrono::steady_clock::time_point viz_report_at_{};
+  void VizNote(std::array<VizCount, 32>& table, uint32_t value) {
+    if (!REXCVAR_GET(p2_viz_report)) return;
+    for (auto& e : table) {
+      if (e.count && e.value == value) { ++e.count; break; }
+      if (!e.count) { e.value = value; e.count = 1; break; }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - viz_report_at_ < std::chrono::seconds(10)) return;
+    viz_report_at_ = now;
+    std::string line = "[viz-report] VIZ_QUERY:";
+    char item[48];
+    for (auto& e : viz_packets_) if (e.count) { std::snprintf(item, sizeof(item), " %X x%llu", e.value, (unsigned long long)e.count); line += item; }
+    line += " | DRAW_INDX words:";
+    for (auto& e : viz_words_) if (e.count) { std::snprintf(item, sizeof(item), " %X x%llu", e.value, (unsigned long long)e.count); line += item; }
+    std::snprintf(item, sizeof(item), " | dropped %llu", (unsigned long long)viz_dropped_);
+    line += item;
+    REXLOG_WARN("{}", line);
+    viz_packets_ = {}; viz_words_ = {}; viz_dropped_ = 0;
+  }
+
   void NativeOcclusionResult(uint32_t address) {
     auto* counts=memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(address);
     const uint32_t finished=rex::byte_swap(UINT32_C(0xFFFFFEED));
@@ -1167,6 +1246,16 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     static uint32_t event_logs=0;
     if(event_logs++<32)REXLOG_INFO("[native-occlusion] snapshot {:08X} sentinel_end={} measured={}",address,end,native);
     if(native)return;
+    // B-007: a query the renderer could not track (end without its begin, or no free record) ended as fully
+    // visible, which shows the sun/moon through buildings. With p2_occlusion_fake_last it repeats the last
+    // measured result of that address (0 = hidden if there is none).
+    if(end && renderer_ready_ && REXCVAR_GET(p2_occlusion_fake_last)){
+      uint32_t samples=0;
+      renderer_.OcclusionLastSamples(address,samples);
+      std::memset(counts,0,sizeof(*counts));
+      counts->ZPass_A=samples;counts->Total_A=samples;
+      return;
+    }
     FakeOcclusionResult(address);
   }
 
@@ -1510,6 +1599,39 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   std::atomic<uint32_t> ring_generation_{0};
   std::atomic<uint32_t> write_pointer_{0};
   std::atomic<uint32_t> read_pointer_writeback_{0};
+  // p2_native_rptr_writeback_words, or in-run A/B by p2_native_rptr_ab_period_s (even periods: words,
+  // odd periods: 0 = only at the end of a batch, the previous behaviour). Same clock as frame_pacing.csv.
+  static uint32_t RingWritebackWords() {
+    const uint32_t words = REXCVAR_GET(p2_native_rptr_writeback_words);
+    const uint32_t period = REXCVAR_GET(p2_native_rptr_ab_period_s);
+    if (!period) return words;
+#if defined(__SWITCH__) && defined(__aarch64__)
+    uint64_t tick, freq;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(tick));
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    const uint64_t seconds = freq ? tick / freq : 0;
+#else
+    const uint64_t seconds = uint64_t(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+    return ((seconds / period) & 1) ? REXCVAR_GET(p2_native_rptr_writeback_alt_words) : words;
+  }
+  // Same phase as RingWritebackWords (p2_native_rptr_ab_period_s): WAIT_REG_MEM poll sleep, even/odd periods.
+  static uint32_t WaitRegMemSleepUs() {
+    const uint32_t us = REXCVAR_GET(p2_native_wait_reg_mem_sleep_us);
+    const uint32_t period = REXCVAR_GET(p2_native_rptr_ab_period_s);
+    if (!period) return us;
+#if defined(__SWITCH__) && defined(__aarch64__)
+    uint64_t tick, freq;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(tick));
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    const uint64_t seconds = freq ? tick / freq : 0;
+#else
+    const uint64_t seconds = uint64_t(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+    return ((seconds / period) & 1) ? REXCVAR_GET(p2_native_wait_reg_mem_sleep_alt_us) : us;
+  }
   std::mutex ring_mutex_;
   std::condition_variable ring_cv_;
 

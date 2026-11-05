@@ -80,7 +80,7 @@ else:
     print('Applied lock-free msr regions')
 
 # Per-address lock: insert REX_ENTER_ADDR_LOCK(ea) right after the reservation's address is computed.
-pat = re.compile(r'REX_ENTER_GLOBAL_LOCK\(\);(\n\t// l[wd]arx [^\n]*\n\tea = [^;]+;)(?!\n\tREX_ENTER_(?:ADDR|HOT)_LOCK)')
+pat = re.compile(r'REX_ENTER_GLOBAL_LOCK\(\);(\n\t// l[wd]arx [^\n]*\n\tea = [^;]+;)(?!\n\t(?:REX_ENTER_(?:ADDR|HOT)_LOCK|\{ extern bool p2_msr_hot2_free;))')
 changed = 0
 for f in sorted(glob.glob(str(gen / 'prototype2_recomp.*.cpp'))):
     src = Path(f).read_text(encoding='utf-8', errors='replace')
