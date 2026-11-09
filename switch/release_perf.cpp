@@ -25,6 +25,7 @@ Result __real_nwindowQueueBuffer(NWindow*,s32,const NvMultiFence*);
 Result __real_bqDequeueBuffer(Binder*,bool,u32,u32,s32,u32,s32*,NvMultiFence*);
 void __real_svcSleepThread(s64);
 }
+extern "C" void p2_applet_memory_stats(uint64_t*,uint64_t*,uint64_t*,uint64_t*,int*);
 namespace {
 std::atomic<u64> g_counters[1]{};
 std::atomic<uint32_t> g_resolution{(1280u<<16)|720u};
@@ -62,6 +63,26 @@ void WriteLightReport(u64 now,u64 freq) {
   const Result used_rc=svcGetInfo(&used,InfoType_UsedMemorySize,CUR_PROCESS_HANDLE,0);
   const Result limit_rc=svcGetInfo(&limit,InfoType_TotalMemorySize,CUR_PROCESS_HANDLE,0);
   const auto heap=mallinfo();
+  // PERF pass 31: how much of each physical pool (application, applet, system, system non-secure) is
+  // used while the game runs, to know whether the applet pool really has memory to spare before any
+  // attempt to borrow it. Read-only: svcGetSystemInfo does not change anything.
+  std::snprintf(path,sizeof(path),"%sphysical_pools.csv",RexSwitchLogDir());
+  if(FILE* f=std::fopen(path,"a")){
+    if(std::ftell(f)==0)std::fprintf(f,"tick_s,app_total_KiB,app_used_KiB,applet_total_KiB,applet_used_KiB,system_total_KiB,system_used_KiB,nonsecure_total_KiB,nonsecure_used_KiB,borrowed_KiB,borrowed_used_KiB,borrowed_peak_KiB,borrowed_fallbacks,borrowed_state\n");
+    std::fprintf(f,"%.3f",double(now)/double(freq));
+    for(u64 pool=0;pool<4;++pool){
+      u64 total=0,used_pool=0;
+      if(R_FAILED(svcGetSystemInfo(&total,0,INVALID_HANDLE,pool)))total=~0ull;
+      if(R_FAILED(svcGetSystemInfo(&used_pool,1,INVALID_HANDLE,pool)))used_pool=~0ull;
+      std::fprintf(f,",%lld,%lld",total==~0ull?-1ll:(long long)(total/1024),used_pool==~0ull?-1ll:(long long)(used_pool/1024));
+    }
+    u64 bsize=0,bused=0,bpeak=0,bfall=0; int bstate=0;
+    p2_applet_memory_stats(&bsize,&bused,&bpeak,&bfall,&bstate);
+    std::fprintf(f,",%llu,%llu,%llu,%llu,%d",(unsigned long long)(bsize/1024),(unsigned long long)(bused/1024),
+                 (unsigned long long)(bpeak/1024),(unsigned long long)bfall,bstate);
+    std::fprintf(f,"\n");
+    std::fclose(f);
+  }
   std::snprintf(path,sizeof(path),"%smemory_streaming.csv",RexSwitchLogDir());
   if(FILE* f=std::fopen(path,"a")){
     if(std::ftell(f)==0)std::fprintf(f,"tick_s,pending_jobs,ready_jobs,ready_staging_KiB,discarded_total,reaped_total,image_failures,host_heap_used_KiB,host_heap_free_KiB,process_used_KiB,process_limit_KiB,used_result,limit_result\n");

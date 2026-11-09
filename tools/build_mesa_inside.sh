@@ -89,7 +89,7 @@ meson setup builddir-switch "${cross_setup[@]}" \
     --cross-file switch_cross_file.txt \
     --native-file /work/tools/switch/mesa-native.ini \
     --buildtype=release \
-    -Doptimization=1 \
+    -Doptimization=2 \
     -Db_lto=false \
     -Db_ndebug=true \
     -Dvulkan-drivers=nouveau \
@@ -140,4 +140,5 @@ echo "Merging the complete NVK and Rust runtime archives"
 mkdir -p /work/out/mesa-sdk/opt/devkitpro/portlibs/switch/lib
 cd /project/builddir-switch
 printf "CREATE /work/out/mesa-sdk/opt/devkitpro/portlibs/switch/lib/libvulkan.a\nADDLIB src/nouveau/vulkan/libvulkan.a\nADDLIB src/nouveau/compiler/libnak_rs.a\nSAVE\nEND\n" | /opt/devkitpro/devkitA64/bin/aarch64-none-elf-ar -M
+bash /work/tools/redirect_libvulkan.sh /work/out/mesa-sdk/opt/devkitpro/portlibs/switch/lib/libvulkan.a
 echo "Mesa Switch archive ready"

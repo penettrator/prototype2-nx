@@ -1,3 +1,17 @@
+# Prototype 2 — 0.4.0
+
+## Русский
+
+- Стабильность: игра берёт 256 МБ простаивающей памяти апплетов для драйвера GPU. Это делает модуль `p2mem.nsp` из пакета: игра сама копирует его в `atmosphere/contents/010000000050324D/` и запускает, он закрывается вместе с игрой. Основная куча раньше в тяжёлых местах доходила до предела, теперь у неё ~250 МБ запаса. HOME, скриншоты и клавиатура работают. Выключение: `p2_applet_memory_mb = 0`.
+- Производительность: поток, который переводит команды игры для GPU, тратит на кадр около 19 % меньше времени процессора. Не менявшиеся вершинные данные и текстуры перепроверяются реже (`p2_ring_light_checks`, `p2_texture_light_trust`).
+- Драйвер Mesa/NVK собран с `-O2` вместо `-O1`.
+
+## English
+
+- Stability: the game borrows 256 MB of idle applet memory for the GPU driver. The helper `p2mem.nsp` from the package does this: the game copies it to `atmosphere/contents/010000000050324D/` and starts it, and it exits with the game. The main heap used to reach its limit in heavy scenes; it now has ~250 MB of headroom. HOME, screenshots and the keyboard keep working. To turn it off: `p2_applet_memory_mb = 0`.
+- Performance: the thread that translates the game's commands for the GPU spends about 19 % less CPU time per frame. Vertex data and textures that never change are re-checked less often (`p2_ring_light_checks`, `p2_texture_light_trust`).
+- The Mesa/NVK driver is built with `-O2` instead of `-O1`.
+
 # Prototype 2 — 0.3.0
 
 ## Русский

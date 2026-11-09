@@ -146,3 +146,9 @@ p2_occlusion_fallback_last = true
 p2_occlusion_fake_last = true
 p2_occlusion_report = false
 p2_sun_probe_flip = false
+
+# 0.4.0: 256 MB of the idle applet pool for GPU memory (helper switch/Prototype2/p2mem.nsp); 0 = off.
+p2_applet_memory_mb = 256
+# 0.4.0: lighter change checks for vertex/index data and textures that never changed.
+p2_ring_light_checks = 1
+p2_texture_light_trust = 1

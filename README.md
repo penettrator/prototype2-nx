@@ -1,4 +1,4 @@
-# Prototype 2 для Nintendo Switch — 0.3.0
+# Prototype 2 для Nintendo Switch — 0.4.0
 
 [English](README.en.md)
 
@@ -39,6 +39,7 @@ extract-xiso.exe -x "Prototype 2.iso" -d game_root
 SD:/switch/Prototype2/
   prototype2.nro
   prototype2.toml
+  p2mem.nsp
   game_root/
     default.xex
     boot.rcf
@@ -65,8 +66,9 @@ SD:/switch/Prototype2/
 | `present_effect` | `"fsr"` | Масштабирование изображения через FSR 1 |
 | `achievement_notifications` | `false` | Всплывающие уведомления достижений выключены |
 | `p2_native_texture_cache_mb` | `128` | Бюджет сохранения неактивных текстур, МиБ |
+| `p2_applet_memory_mb` | `256` | Сколько МБ свободной памяти апплетов отдать драйверу GPU (модуль `p2mem.nsp`); `0` — выключено |
 
-При обновлении заменяйте файлы порта. `game_root` копировать повторно не нужно. Перед заменой TOML сохраните свои изменённые настройки.
+При обновлении заменяйте файлы порта, включая `p2mem.nsp`. `game_root` копировать повторно не нужно. Перед заменой TOML сохраните свои изменённые настройки.
 
 ## Известные проблемы
 

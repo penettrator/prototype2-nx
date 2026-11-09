@@ -1,4 +1,4 @@
-# Prototype 2 for Nintendo Switch — 0.3.0
+# Prototype 2 for Nintendo Switch — 0.4.0
 
 [Русский](README.md)
 
@@ -39,6 +39,7 @@ Use your ISO filename. Copy the entire `game_root` folder to `SD:/switch/Prototy
 SD:/switch/Prototype2/
   prototype2.nro
   prototype2.toml
+  p2mem.nsp
   game_root/
     default.xex
     boot.rcf
@@ -65,6 +66,7 @@ File: **`SD:/switch/Prototype2/prototype2.toml`**. Fully close and restart the g
 | `present_effect` | `"fsr"` | FSR 1 upscaling |
 | `achievement_notifications` | `false` | Achievement popups are disabled |
 | `p2_native_texture_cache_mb` | `128` | Retention budget for idle texture payload, MiB |
+| `p2_applet_memory_mb` | `256` | MB of idle applet memory lent to the GPU driver (helper `p2mem.nsp`); `0` = off |
 
 When updating, replace the port files. You do not need to copy `game_root` again. Back up your edited settings before replacing the TOML.
 

@@ -1,5 +1,5 @@
 {
-  "version": "0.3.0",
+  "version": "0.4.0",
   "kind": "source-and-binary-distribution",
   "platform": "Nintendo Switch",
   "technology": [
@@ -13,6 +13,7 @@
     "Prototype2-NX.zip",
     "Prototype2-forwarder.nsp"
   ],
+  "applet_memory_helper": "switch/Prototype2/p2mem.nsp (program 010000000050324D)",
   "binary_distribution": "GitHub Releases",
   "resolution": [
     800,

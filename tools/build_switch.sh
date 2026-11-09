@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prototype 2 0.3.0; Windows Git Bash + Docker.
+# Prototype 2 0.4.0; Windows Git Bash + Docker.
 # PERF pass 1: DEVKITA64_IMAGE pins the toolchain image (default unchanged: devkitpro/devkita64:latest);
 # with PGO=USE the GCC version inside the image must match the stamp of config/pgo-data/*.gcda
 # (tools/check_pgo_compiler.py), otherwise the build stops instead of silently losing PGO.

@@ -93,6 +93,27 @@ REXCVAR_DECLARE(bool, p2_skin_write_log);  // switch_skinning.cpp
 REXCVAR_DEFINE_BOOL(p2_native_copy_ab, false, "Prototype2", "One scene test: compute copies 30s, fragment copies 45s, compute copies thereafter; image-preserving A/B");
 
 REXCVAR_DEFINE_BOOL(p2_frame_diagnostics, false, "Prototype2", "Per-frame percentiles in 300-frame windows, excludes low-draw UI");
+// PERF pass 30: per frame, the draws and the CPU the GPU threads spent on them (logs/rex/frame_cpu.csv: tick ms, frame
+// ms, draws, record-thread busy ms, ring-thread CPU ms), so a driver or wait change can be compared per draw in any
+// place instead of by FPS in the same place.
+REXCVAR_DEFINE_BOOL(p2_frame_cpu_csv, false, "Prototype2",
+                    "Diagnostic: per-frame draws and GPU-thread CPU to logs/rex/frame_cpu.csv");
+extern "C" const char* RexSwitchLogDir();
+// PERF pass 32: in-run A/B of lighter vertex/index change checks (odd 30 s windows of the system clock with 2).
+// On: settled ranges hashed every 16th frame instead of the 4th, a range counts as settled after 60 identical exact
+// checks instead of 300, and ranges from 256 bytes (not 1024) can settle. Only ranges that never changed settle,
+// and a change in one is still seen, at most 15 frames late, once.
+REXCVAR_DEFINE_UINT32(p2_ring_light_checks, 0, "Prototype2",
+                      "0 = off, 1 = lighter settled vertex/index checks, 2 = in-run A/B in 30 s windows");
+// PERF pass 33: a texture binding stays valid across an answers_epoch move made only by targeted forgets outside
+// the guest range its answers depend on (TextureCache::AnswersUnchangedFor), instead of re-looking up every
+// view (pass 32: ~800 of ~3100 bindings per frame re-checked this way, all kept).
+REXCVAR_DEFINE_UINT32(p2_binding_targeted, 0, "Prototype2",
+                      "0 = off, 1 = bindings revalidated by range, 2 = in-run A/B in 30 s windows");
+// PERF pass 32: textures and sampled vertex ranges that never changed: trusted 16 frames, full hash every 64
+// (native_hash.h g_p2_light_trust). Pass 32 measured 5.7 MB of texture data hashed per frame.
+REXCVAR_DEFINE_UINT32(p2_texture_light_trust, 0, "Prototype2",
+                      "0 = off, 1 = never-changed content trusted longer, 2 = in-run A/B in 30 s windows");
 
 REXCVAR_DEFINE_BOOL(p2_native_gpu_profile, false, "Prototype2",
                     "Log GPU time by render pass and resolve, measured on one frame in 16");
@@ -227,6 +248,13 @@ REXCVAR_DEFINE_BOOL(p2_occlusion_fallback_last, false, "Prototype2",
 // come a frame or more later, after the GPU fence, so the glow saw "visible" whenever it read early. With this, a
 // query's end snapshot gets the last measured result of its address at once (0 if none), replaced by the real
 // one when it completes.
+// PERF pass 23 (profile diag030: XXH3 ~13 % of a core, mostly the GPU ring): the texture-binding key of a draw
+// (layout, shaders and the fetch constants of the slots they read, up to 768 bytes) is reused from the previous
+// draw when all of its inputs are byte-identical, instead of hashing them again. Exact: same inputs, same key.
+// 0 = off, 1 = on, 2 = in-run A/B (on in odd 30 s periods of the system clock).
+REXCVAR_DEFINE_UINT32(p2_ring_hash_memo, 0, "Prototype2",
+                      "Texture-binding key of the previous draw reused when its inputs are identical: 0 off, 1 on, "
+                      "2 A/B every 30 s");
 REXCVAR_DEFINE_BOOL(p2_occlusion_provisional, false, "Prototype2",
                     "Occlusion queries: publish the last measured result of the address at the query's end at "
                     "once (0 if none), then the real result when the GPU has it (instead of 'not ready' = 1 sample)");
@@ -1285,6 +1313,8 @@ struct Renderer::Impl {
     uint64_t valid_until = 0;
     uint64_t set_generation = 0;
     uint64_t answers_epoch = 0;
+    // PERF pass 33: the union of the guest ranges its answers depend on.
+    uint32_t range_lo = UINT32_MAX, range_hi = 0;
     // The views the sets hold, to check them alive when views_epoch moved.
     uint32_t view_count = 0;
     VkImageView views[24] = {};
@@ -1306,8 +1336,11 @@ struct Renderer::Impl {
     VkImageView view = VK_NULL_HANDLE;
     void* texture = nullptr;
     uint64_t valid_until = 0;
+    uint32_t lo = 0, hi = 0;
   };
   SlotViewEntry slot_views[32][8];
+  uint32_t slot_lo = 0, slot_hi = 0;
+  bool binding_targeted_on = false;
   // Set by SlotView: the texture behind its answer and how long it holds.
   void* slot_texture = nullptr;
   uint64_t slot_valid_until = 0;
@@ -1330,12 +1363,16 @@ struct Renderer::Impl {
         !std::memcmp(e.words, words, sizeof(e.words))) {
       slot_texture = e.texture;
       slot_valid_until = e.valid_until;
+      slot_lo = e.lo;
+      slot_hi = e.hi;
       return e.view;
     }
     VkImageView view =
         textures.GetView(regs->GetTextureFetch(slot), dimension, is_signed, upload);
     e.texture = slot_texture = textures.last_texture();
     e.valid_until = slot_valid_until = textures.last_valid_until();
+    e.lo = slot_lo = textures.last_range_lo();
+    e.hi = slot_hi = textures.last_range_hi();
     e.frame = frame;
     e.submission = submission_number;
     e.views_epoch = textures.views_epoch();
@@ -1370,6 +1407,28 @@ struct Renderer::Impl {
     return sampler;
   }
   uint64_t tb_cache_frame = 0;
+  // PERF pass 23: the previous draw's texture-binding key inputs (p2_ring_hash_memo).
+  bool tbm_valid = false;
+  const PipelineLayout* tbm_layout = nullptr;
+  const void* tbm_vs = nullptr;
+  const void* tbm_ps = nullptr;
+  uint32_t tbm_mask = 0, tbm_count = 0;
+  uint32_t tbm_words[6 * 32];
+  uint64_t tbm_key = 0, tbm_hits = 0, tbm_misses = 0;
+  static bool RingHashMemoOn() {
+    const uint32_t mode = REXCVAR_GET(p2_ring_hash_memo);
+    if (mode == 2) {
+#if defined(__SWITCH__)
+      uint64_t tick, frequency;
+      asm volatile("mrs %0, cntpct_el0" : "=r"(tick));
+      asm volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+      return frequency && ((tick / (frequency * 30) & 1) != 0);
+#else
+      return false;
+#endif
+    }
+    return mode == 1;
+  }
 
   // The fetch constants as the shaders get them: the guest's, with vertex
   // buffer addresses pointing into the stream.
@@ -1538,9 +1597,24 @@ struct Renderer::Impl {
     }
 #endif
     while (const DrawCommand* draw=record_work.FrontOrWait()) {
+      const uint64_t t0 = NowNs();
       ExecuteDrawCommand(*draw);
+      record_busy_ns.store(record_busy_ns.load(std::memory_order_relaxed) + (NowNs() - t0), std::memory_order_relaxed);
       record_work.CompleteFront();
     }
+  }
+  std::atomic<uint64_t> record_busy_ns{0};  // PERF pass 30 (p2_frame_cpu_csv)
+  // PERF pass 31 (p2_frame_cpu_csv): ring-thread CPU per part of Draw, and Resolve, per frame.
+  // 0 state, 1 indices, 2 vertex fetch, 3 float/bool constants, 4 textures, 5 system constants, 6 record, 7 resolve
+  uint64_t cpu_phase_ns[8] = {};
+  uint64_t cpu_phase_mark = 0;
+  bool cpu_phase_on = false;
+  void PhaseStart() { if (cpu_phase_on) cpu_phase_mark = NowNs(); }
+  void PhaseAdd(int i) {
+    if (!cpu_phase_on) return;
+    const uint64_t n = NowNs();
+    cpu_phase_ns[i] += n - cpu_phase_mark;
+    cpu_phase_mark = n;
   }
   void SubmitDraw(const DrawCommand& d) {
     if (!record_threaded) { ExecuteDrawCommand(d); return; }
@@ -6095,6 +6169,7 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
 }
 
 void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_index_words) {
+  PhaseStart();
   const RegisterFile& r = *regs;
   // The reasons, in order: 0 no surface pitch, 1 no vertex shader, 2 memory
   // export, 3 no rasterization, 4 primitive type, 5 no geometry shaders,
@@ -6227,6 +6302,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   const PassTargets& targets = st.targets;
   const PipelineLayout* layout = st.layout;
 
+  PhaseAdd(0);
   // Indices.
   BeginRecording();
   auto dma_size = r.Get<reg::VGT_DMA_SIZE>();
@@ -6388,6 +6464,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     }
   }
 
+  PhaseAdd(1);
   // Fetch constants: the vertex buffers the shader reads are pointed at their
   // copies in the stream. Only slots written since they were last resolved,
   // or not yet resolved this frame, are looked at again.
@@ -6488,6 +6565,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   uint8_t* last_float_out = nullptr;
   const bool motion_blur_draw = motion_blur_off && ps && ps->ucode_data_hash() == kMotionBlurPs;
   const bool dof_draw = dof_off && ps && ps->ucode_data_hash() == kMotionBlurPs;
+  PhaseAdd(2);
   auto write_float_constants = [&](const Shader::ConstantRegisterMap& map, uint32_t base_register,
                                    VkDeviceSize& offset) -> bool {
     // Only the constants the shader reads: the binding's fixed range reads on
@@ -6589,6 +6667,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     }
   }
 
+  PhaseAdd(3);
   // Textures and samplers, reused while no fetch slot they come from was
   // written, within one frame (content changes are looked for once a frame)
   // and one submission (uploads go in its setup command buffer).
@@ -6608,9 +6687,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       slot_mask |= 1u << b.fetch_constant;
     }
   }
-  uint64_t tb_key = XXH3_64bits_withSeed(&layout, sizeof(layout),
-                                         uint64_t(reinterpret_cast<uintptr_t>(vs)) ^
-                                             (uint64_t(reinterpret_cast<uintptr_t>(ps)) << 1));
+  uint64_t tb_key;
   {
     uint32_t words[6 * 32];
     uint32_t count = 0;
@@ -6623,7 +6700,28 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
                   6 * sizeof(uint32_t));
       count += 6;
     }
-    tb_key = XXH3_64bits_withSeed(words, count * sizeof(uint32_t), tb_key ^ slot_mask);
+    const bool memo = RingHashMemoOn();
+    if (memo && tbm_valid && tbm_layout == layout && tbm_vs == vs && tbm_ps == ps && tbm_mask == slot_mask &&
+        tbm_count == count && std::memcmp(tbm_words, words, count * sizeof(uint32_t)) == 0) {
+      tb_key = tbm_key;
+      ++tbm_hits;
+    } else {
+      tb_key = XXH3_64bits_withSeed(&layout, sizeof(layout),
+                                    uint64_t(reinterpret_cast<uintptr_t>(vs)) ^
+                                        (uint64_t(reinterpret_cast<uintptr_t>(ps)) << 1));
+      tb_key = XXH3_64bits_withSeed(words, count * sizeof(uint32_t), tb_key ^ slot_mask);
+      if (memo) {
+        tbm_valid = true;
+        tbm_layout = layout;
+        tbm_vs = vs;
+        tbm_ps = ps;
+        tbm_mask = slot_mask;
+        tbm_count = count;
+        std::memcpy(tbm_words, words, count * sizeof(uint32_t));
+        tbm_key = tb_key;
+        ++tbm_misses;
+      }
+    }
   }
   if (tb_cache_frame != frame) {
     if (tb_cache.size() > 8192) tb_cache.clear();
@@ -6642,10 +6740,16 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     tb.views_epoch = textures.views_epoch();
     return true;
   };
+  bool answers_same = tb.answers_epoch == textures.answers_epoch();
+  if (!answers_same && binding_targeted_on && tb.valid &&
+      textures.AnswersUnchangedFor(tb.answers_epoch, tb.range_lo, tb.range_hi)) {
+    tb.answers_epoch = textures.answers_epoch();
+    answers_same = true;
+  }
   const BindingReuse reuse = CheckBindingReuse(
       tb.valid, tb.vs == vs && tb.ps == ps && tb.layout == layout,
       tb.set_generation == set_cache_generation,
-      tb.answers_epoch == textures.answers_epoch(), views_alive,
+      answers_same, views_alive,
       tb.frame == frame, tb.submission == submission_number, tb.valid_until, frame);
   static_assert(uint32_t(BindingReuse::Count) == 7);
   ++stats().texture_binding_cache[uint32_t(reuse)];
@@ -6713,6 +6817,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
         info.sampler = VK_NULL_HANDLE;
         info.imageView = SlotView(binding.fetch_constant, binding.dimension,
                                   bool(binding.is_signed));
+        tb.range_lo = std::min(tb.range_lo, slot_lo);
+        tb.range_hi = std::max(tb.range_hi, slot_hi);
         info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         tb.valid_until = std::min(tb.valid_until, slot_valid_until);
         if (tb.view_count < 24) {
@@ -6800,6 +6906,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     owner->texture_fetch_dirty_ &= ~tb.slots;
   }
 
+  PhaseAdd(4);
   // System constants come from the render state, the texture fetch
   // constants and the vertex index registers.
   bool system_same = last_system.submission == submission_number &&
@@ -6826,6 +6933,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     last_system = {submission_number, 0, nullptr, frame, system_offset};
   }
 
+  PhaseAdd(5);
   // Record.
   if (!BeginPass(targets)) return skip(14);
   DrawCommand d;
@@ -7008,6 +7116,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
   AppendOcclusion(d);
   SubmitDraw(d);
+  PhaseAdd(6);
   ProfileDraw(d.count);
   ++frame_draw_count;
   ++stats().draws;
@@ -7019,6 +7128,10 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
 // --- Resolves ------------------------------------------------------------------------
 
 void Renderer::Impl::Resolve() {
+  struct ResolvePhase {
+    Impl* impl; uint64_t t0;
+    ~ResolvePhase() { if (impl->cpu_phase_on) impl->cpu_phase_ns[7] += NowNs() - t0; }
+  } resolve_phase{this, cpu_phase_on ? NowNs() : 0};
   p2::gpuwait::Scope gpu_wait_scope(p2::gpuwait::Resolve);
   const RegisterFile& r = *regs;
   auto copy_control = r.Get<reg::RB_COPY_CONTROL>();
@@ -7925,6 +8038,105 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
           st.render_targets_created - at_last_swap.render_targets_created;
     }
   }
+  cpu_phase_on = REXCVAR_GET(p2_frame_cpu_csv);
+  bool light_on = false, ab_column = false;
+  {
+    const uint32_t mode = REXCVAR_GET(p2_ring_light_checks);
+    light_on = mode == 1;
+#if defined(__SWITCH__)
+    if (mode == 2) {
+      uint64_t tick, freq;
+      asm volatile("mrs %0, cntpct_el0" : "=r"(tick));
+      asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+      light_on = freq && ((tick / (freq * 30)) & 1) != 0;
+    }
+#endif
+    const uint32_t trust_mode = REXCVAR_GET(p2_texture_light_trust);
+    bool trust_on = trust_mode == 1;
+#if defined(__SWITCH__)
+    if (trust_mode == 2) {
+      uint64_t tick, freq;
+      asm volatile("mrs %0, cntpct_el0" : "=r"(tick));
+      asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+      trust_on = freq && ((tick / (freq * 30)) & 1) != 0;
+    }
+#endif
+    g_p2_light_trust = trust_on;
+    const uint32_t bt_mode = REXCVAR_GET(p2_binding_targeted);
+    bool bt_on = bt_mode == 1;
+#if defined(__SWITCH__)
+    if (bt_mode == 2) {
+      uint64_t tick, freq;
+      asm volatile("mrs %0, cntpct_el0" : "=r"(tick));
+      asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+      bt_on = freq && ((tick / (freq * 30)) & 1) != 0;
+    }
+#endif
+    binding_targeted_on = bt_on;
+    // The A/B column of frame_cpu.csv follows whichever setting is being compared in-run.
+    ab_column = bt_mode == 2 ? bt_on : trust_mode == 2 ? trust_on : light_on;
+    if (mode) {
+      settled_every = light_on ? 16u : std::max<uint32_t>(1, REXCVAR_GET(p2_native_settled_check_every));
+      settled_frames = light_on ? 60u : REXCVAR_GET(p2_native_settled_frames);
+      settled_min_bytes = light_on ? 256u : REXCVAR_GET(p2_native_settled_min_bytes);
+    }
+  }
+  if (cpu_phase_on) {
+    static uint64_t prev_record = 0, prev_ring = 0;
+    // PERF pass 32: per-frame deltas of the counters behind the parts (textures, vertices, resolves).
+    static uint64_t prev_c[16] = {};
+    const RendererStats& rs = stats();
+    const TextureCacheStats& ts = textures.stats();
+    const uint64_t cur_c[16] = {ts.uncached, ts.hash_bytes, ts.upload_bytes, rs.texture_bindings_built,
+                                rs.texture_binding_refresh_attempts, rs.texture_binding_refresh_kept,
+                                rs.texture_binding_cache[0], rs.texture_binding_cache[1], rs.texture_binding_cache[2],
+                                rs.texture_binding_cache[3], rs.texture_binding_cache[4], rs.texture_binding_cache[5],
+                                rs.texture_binding_cache[6], vertex_hash_bytes, rs.vertex_bytes_copied, rs.resolves};
+    uint64_t d_c[16];
+    for (int i = 0; i < 16; ++i) {
+      d_c[i] = cur_c[i] >= prev_c[i] ? cur_c[i] - prev_c[i] : cur_c[i];
+      prev_c[i] = cur_c[i];
+    }
+    static std::string rows;
+    uint64_t ring_ticks = 0;
+#if defined(__SWITCH__)
+    svcGetInfo(&ring_ticks, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, UINT64_MAX);
+#endif
+    const uint64_t record = record_busy_ns.load(std::memory_order_relaxed);
+    const double ring_ms = double(ring_ticks - prev_ring) * 1000.0 / 19200000.0;
+    if (prev_ring && last_swap_time.time_since_epoch().count()) {
+      char line[320];
+      const double waits_ms = double(frame_upload_wait_ns + frame_fence_wait_ns + frame_drain_wait_ns +
+                                     frame_stream_wait_ns) * 1e-6;
+      std::snprintf(line, sizeof(line),
+                    "%.1f,%.3f,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                    std::chrono::duration<double, std::milli>(now.time_since_epoch()).count(),
+                    std::chrono::duration<double, std::milli>(now - last_swap_time).count(), uint32_t(frame_draw_count),
+                    double(record - prev_record) * 1e-6, ring_ms, cpu_phase_ns[0] * 1e-6, cpu_phase_ns[1] * 1e-6,
+                    cpu_phase_ns[2] * 1e-6, cpu_phase_ns[3] * 1e-6, cpu_phase_ns[4] * 1e-6, cpu_phase_ns[5] * 1e-6,
+                    cpu_phase_ns[6] * 1e-6, cpu_phase_ns[7] * 1e-6, double(frame_texture_ns) * 1e-6, waits_ms);
+      rows += line;
+      rows.pop_back();  // the newline: the counters follow on the same row
+      char more[400];
+      int n = std::snprintf(more, sizeof(more), ",%d", ab_column ? 1 : 0);
+      for (int i = 0; i < 16 && n > 0 && n < int(sizeof(more)); ++i)
+        n += std::snprintf(more + n, sizeof(more) - n, ",%llu", (unsigned long long)d_c[i]);
+      rows += more;
+      rows += '\n';
+    }
+    prev_record = record;
+    prev_ring = ring_ticks;
+    for (uint64_t& v : cpu_phase_ns) v = 0;
+    if (rows.size() > 32768) {
+      char path[1024];
+      std::snprintf(path, sizeof(path), "%sframe_cpu.csv", RexSwitchLogDir());
+      if (FILE* f = std::fopen(path, "a")) {
+        std::fwrite(rows.data(), 1, rows.size(), f);
+        std::fclose(f);
+      }
+      rows.clear();
+    }
+  }
   last_swap_time = now;
   at_last_swap = stats();
   at_last_swap.textures_uploaded = textures.stats().uploads;
@@ -7967,6 +8179,9 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
     REXLOG_INFO("[native] hashed MB/ranges: index {}/{}, small exact {}/{}, changed exact {}/{}, sampled {}/{}",
                 hash_class_bytes[0] >> 20, hash_class_ranges[0], hash_class_bytes[1] >> 20, hash_class_ranges[1],
                 hash_class_bytes[2] >> 20, hash_class_ranges[2], hash_class_bytes[3] >> 20, hash_class_ranges[3]);
+    REXLOG_INFO("[native] pass 23 binding-key memo: {} reused, {} hashed (mode {})", tbm_hits, tbm_misses,
+                REXCVAR_GET(p2_ring_hash_memo));
+    tbm_hits = tbm_misses = 0;
     REXLOG_INFO("[native] settled small ranges not hashed: {} checks; range table pruned {} times, {} entries",
                 settled_skips, vertex_hash_prunes, vertex_hashes.size());
     REXLOG_INFO("[native] skinned-page ranges: {} new, {} exact checks, {} fresh (not hashed)", skin_page_ranges,

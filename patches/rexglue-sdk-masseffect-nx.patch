@@ -824,38 +824,142 @@ index d155038..05e8dc8 100644
  }
  
 diff --git a/sdk/src/core/threading_posix.cpp b/sdk/src/core/threading_posix.cpp
-index 425b53b..8d59716 100644
+index 425b53b..cb2f689 100644
 --- a/sdk/src/core/threading_posix.cpp
 +++ b/sdk/src/core/threading_posix.cpp
-@@ -75,6 +75,8 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -75,6 +75,35 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
  #define REX_HAS_SIGEV_THREAD_ID 0
  #endif
  
 +REXCVAR_DEFINE_UINT32(p2_semaphore_skip_empty_wake, 0, "Threading",
 +                      "Empty semaphore consume wake: 0 = original, 1 = skip, 2 = Switch A/B (skip in odd 30 s periods)");
++// PERF pass 27 (profile pass_26: the game's job workers spend most of their run time in this semaphore's mutex):
++// a release of one token woke every waiter (notify_all); all of them took the mutex, one got the token, the
++// others went back to sleep. With 1 a release of one token wakes one waiter, and a consumer that leaves tokens
++// wakes the next one (the chain the original's notify_all also covers). Releases of several tokens, APC
++// interrupts and WaitMultiple keep waking everyone.
++// PERF pass 30 (from masseffect-nx fbc484a, docs/kernel-waits.md): on Horizon every cond_.notify_all() is a
++// svcSignalProcessWideKey system call even when nobody waits. Each object counts the threads inside Wait() under
++// its mutex; Event/Semaphore/Mutant/Timer state changes notify only when that count is not zero (read in the same
++// critical section that changes the state, so no wake-up is lost). WaitMultiple wake points are unchanged.
++REXCVAR_DEFINE_UINT32(p2_wait_notify_gate, 0, "Threading",
++                      "Kernel object notifies only when a thread waits on it: 0 = always notify (original), 1 = gate, "
++                      "2 = Switch A/B (gate in odd 30 s periods)");
++inline bool P2WaitGateOn() {
++  const uint32_t mode = REXCVAR_GET(p2_wait_notify_gate);
++#if defined(__SWITCH__)
++  if (mode == 2) {
++    uint64_t tick, frequency;
++    asm volatile("mrs %0, cntpct_el0" : "=r"(tick));
++    asm volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
++    return frequency && ((tick / (frequency * 30) & 1) != 0);
++  }
++#endif
++  return mode == 1;
++}
++REXCVAR_DEFINE_UINT32(p2_semaphore_notify_one, 0, "Threading",
++                      "Semaphore wakes: 0 = notify_all (original), 1 = one waiter per token, 2 = Switch A/B (one in "
++                      "odd 30 s periods)");
  REXCVAR_DEFINE_BOOL(thread_wait_blocking, true, "Threading",
                      "Event-driven waits: WaitMultiple parks on a wake point instead of polling every 1 ms, "
                      "and alertable waits are woken by the queued APC hint instead of a 1 ms poll slice. "
-@@ -661,7 +663,8 @@ template <>
+@@ -400,6 +429,8 @@ class PosixConditionBase {
+     if (predicate()) {
+       executed = true;
+     } else {
++      // PERF pass 30: counted under mutex_ before the wait releases it (see p2_wait_notify_gate).
++      ++cond_waiters_;
+       if (timeout == std::chrono::milliseconds::max()) {
+         cond_.wait(lock, predicate);
+         executed = true;  // Did not time out;
+@@ -411,6 +442,7 @@ class PosixConditionBase {
+         executed = cond_.wait_for(lock, timeout, predicate);
+ #endif
+       }
++      --cond_waiters_;
+     }
+     if (executed) {
+       if (interrupt && !signaled()) {
+@@ -608,6 +640,10 @@ class PosixConditionBase {
+   inline virtual void post_execution() = 0;
+   std::condition_variable cond_;
+   std::mutex mutex_;
++  // PERF pass 30: threads inside Wait() between a failed predicate and their return; guarded by mutex_.
++  uint32_t cond_waiters_ = 0;
++  // With mutex_ held, in the critical section that changed the state: may anyone be waiting on cond_?
++  bool may_have_cond_waiters() const { return cond_waiters_ != 0 || !P2WaitGateOn(); }
+ 
+  private:
+   std::mutex multi_mutex_;
+@@ -630,13 +666,15 @@ class PosixCondition<Event> : public PosixConditionBase {
+   virtual ~PosixCondition() = default;
+ 
+   bool Signal() override {
++    bool notify;
+     {
+       auto lock = std::unique_lock<std::mutex>(mutex_);
+       signal_ = true;
++      notify = may_have_cond_waiters();
+     }
+     // Notified after the lock is released: a woken waiter (on Horizon the XMA decoder runs above the guest
+     // threads) would otherwise run straight into the mutex its signaller still holds and go back to sleep.
+-    cond_.notify_all();
++    if (notify) cond_.notify_all();
+     NotifyMulti();
+     return true;
+   }
+@@ -661,7 +699,9 @@ template <>
  class PosixCondition<Semaphore> : public PosixConditionBase {
   public:
    PosixCondition(uint32_t initial_count, uint32_t maximum_count)
 -      : count_(initial_count), maximum_count_(maximum_count) {}
 +      : count_(initial_count), maximum_count_(maximum_count),
-+        skip_empty_wake_(REXCVAR_GET(p2_semaphore_skip_empty_wake)) {}
++        skip_empty_wake_(REXCVAR_GET(p2_semaphore_skip_empty_wake)),
++        notify_one_(REXCVAR_GET(p2_semaphore_notify_one)) {}
  
    bool Signal() override { return Release(1, nullptr); }
  
-@@ -684,10 +687,26 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -674,8 +714,14 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+       *out_previous_count = count_;
+     }
+     count_ += release_count;
++    const bool notify = may_have_cond_waiters();
+     lock.unlock();
+-    cond_.notify_all();
++    if (!notify) {
++    } else if (release_count == 1 && NotifyOne()) {
++      cond_.notify_one();
++    } else {
++      cond_.notify_all();
++    }
+     NotifyMulti();
+     return true;
+   }
+@@ -684,10 +730,42 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
    inline bool signaled() const override { return count_ > 0; }
    inline void post_execution() override {
      count_--;
 -    cond_.notify_all();
 +    // Waiters test count_ > 0 under this same mutex. Consuming the final
 +    // token cannot satisfy another wait. Release and APC keep their wakes.
-+    if (count_ || !SkipEmptyWake()) {
++    // Runs with mutex_ held (Wait and WaitMultiple).
++    if (!may_have_cond_waiters()) {
++    } else if (count_ && NotifyOne()) {
++      cond_.notify_one();
++    } else if (count_ || !SkipEmptyWake()) {
 +      cond_.notify_all();
 +    }
++  }
++  bool NotifyOne() const {
++#if defined(__SWITCH__)
++    if (notify_one_ == 2) {
++      uint64_t tick, frequency;
++      asm volatile("mrs %0, cntpct_el0" : "=r"(tick));
++      asm volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
++      return frequency && ((tick / (frequency * 30) & 1) != 0);
++    }
++#endif
++    return notify_one_ == 1;
 +  }
 +  bool SkipEmptyWake() const {
 +#if defined(__SWITCH__)
@@ -871,10 +975,46 @@ index 425b53b..8d59716 100644
    uint32_t count_;
    const uint32_t maximum_count_;
 +  const uint32_t skip_empty_wake_;
++  const uint32_t notify_one_;
  };
  
  template <>
-@@ -849,7 +868,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -705,14 +783,18 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+   bool Release() {
+     if (owner_ == std::this_thread::get_id() && count_ > 0) {
+       bool released = false;
++      bool notify = false;
+       {
+         auto lock = std::unique_lock<std::mutex>(mutex_);
+         --count_;
+         // Free to be acquired by another thread
+         released = count_ == 0;
++        notify = released && may_have_cond_waiters();
+       }
+-      if (released) {
++      if (notify) {
+         cond_.notify_all();
++      }
++      if (released) {
+         NotifyMulti();
+       }
+       return true;
+@@ -743,11 +825,13 @@ class PosixCondition<Timer> : public PosixConditionBase {
+   virtual ~PosixCondition() { Cancel(); }
+ 
+   bool Signal() override {
++    bool notify;
+     {
+       std::lock_guard<std::mutex> lock(mutex_);
+       signal_ = true;
++      notify = may_have_cond_waiters();
+     }
+-    cond_.notify_all();
++    if (notify) cond_.notify_all();
+     NotifyMulti();
+     return true;
+   }
+@@ -849,7 +933,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
      pthread_attr_t attr;
      if (pthread_attr_init(&attr) != 0)
        return false;
@@ -886,7 +1026,7 @@ index 425b53b..8d59716 100644
        pthread_attr_destroy(&attr);
        return false;
      }
-@@ -865,7 +887,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -865,7 +952,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
          return false;
        }
      }
@@ -74725,7 +74865,7 @@ index 51e5e82..e8e01d1 100644
  /*
   * The exception handler stack is no longer declared here.
 diff --git a/sdk/src/ui/switch_perf.cpp b/sdk/src/ui/switch_perf.cpp
-index 1976e72..b9d57f2 100644
+index 1976e72..8d63b99 100644
 --- a/sdk/src/ui/switch_perf.cpp
 +++ b/sdk/src/ui/switch_perf.cpp
 @@ -39,15 +39,18 @@
@@ -74755,6 +74895,15 @@ index 1976e72..b9d57f2 100644
  constexpr u64 kPassiveIntervalNs = 100000000ULL;  // 100 ms, without pausing threads
  // Next to the rexglue logs, in <NRO folder>/logs/rex/.
  std::string StackFlagPath() {
+@@ -102,7 +106,7 @@ constexpr u64 kReportSeconds = 10;
+  */
+ constexpr u64 kStartDelayNs = 8000000000ULL;
+ constexpr size_t kMaxSamples = 1 << 15;
+-constexpr size_t kFrames = 10;
++constexpr size_t kFrames = 24;  // P2 pass 26: deeper stacks for the raw dump
+ // 0-32 renderer/audio counters (see RexSwitchPerfAdd); 40-55 host-runtime overhead (include/rex/sys_counters.h).
+ constexpr unsigned kCounterCount = 64;
+ // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
 @@ -230,6 +234,14 @@ std::atomic<bool> g_ab_active{false};
  std::atomic<u32> g_skip_mask{0};
  
@@ -74770,7 +74919,46 @@ index 1976e72..b9d57f2 100644
    const bool new_value = !g_ab_active.load(std::memory_order_relaxed);
    g_ab_active.store(new_value, std::memory_order_relaxed);
    if (!new_value) {
-@@ -918,8 +930,24 @@ void ProfilerMain(void*) {
+@@ -633,6 +645,38 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+ 
+   std::vector<Sample> samples(g_samples, g_samples + g_sample_count);
+   g_sample_count = 0;
++  // P2 PERF pass 26: every sample of this report, raw, for an offline inclusive (call-tree) profile:
++  // logs/rex/samples.bin, appended blocks: "P2SB", u32 samples, u32 slots, slots x {u16 slot, char name[32]},
++  // samples x {u16 slot, u16 frames, u64 tick, u32 pc, u32 lr, u32 frame[24]} (image offsets, 0 = outside).
++  if (!samples.empty()) {
++    char raw_path[1024];
++    std::snprintf(raw_path, sizeof(raw_path), "%ssamples.bin", RexSwitchLogDir());
++    if (FILE* raw = std::fopen(raw_path, "ab")) {
++      auto off = [](u64 a) -> u32 { return (a >= g_base && a < g_text_hi) ? u32(a - g_base) : 0u; };
++      u32 slots = 0;
++      for (size_t i = 0; i < kMaxThreads; ++i) if (g_slots[i].handle.load()) ++slots;
++      const u32 n = u32(samples.size());
++      std::fwrite("P2SB", 1, 4, raw);
++      std::fwrite(&n, 4, 1, raw);
++      std::fwrite(&slots, 4, 1, raw);
++      for (size_t i = 0; i < kMaxThreads; ++i) {
++        if (!g_slots[i].handle.load()) continue;
++        const u16 id = u16(i);
++        std::fwrite(&id, 2, 1, raw);
++        std::fwrite(g_slots[i].name, 1, 32, raw);
++      }
++      for (const Sample& smp : samples) {
++        struct __attribute__((packed)) Rec { u16 slot, frames; u64 tick; u32 pc, lr, frame[kFrames]; } rec{};
++        rec.slot = smp.slot;
++        rec.tick = smp.tick;
++        rec.pc = off(smp.pc);
++        rec.lr = off(smp.lr);
++        for (size_t k = 0; k < kFrames; ++k) { rec.frame[k] = off(smp.frames[k]); if (smp.frames[k]) rec.frames = u16(k + 1); }
++        std::fwrite(&rec, sizeof(rec), 1, raw);
++      }
++      std::fclose(raw);
++    }
++  }
+   std::sort(samples.begin(), samples.end(),
+             [](const Sample& a, const Sample& b) { return a.slot < b.slot; });
+ 
+@@ -918,8 +962,24 @@ void ProfilerMain(void*) {
    // Invasive sampling is only enabled explicitly, for diagnostics.
    // The normal mode keeps FPS, CPU and counters, without stopping the game.
    bool sample_stacks = false;
@@ -74796,7 +74984,7 @@ index 1976e72..b9d57f2 100644
      std::fclose(flag);
    }
  
-@@ -931,6 +959,7 @@ void ProfilerMain(void*) {
+@@ -931,6 +991,7 @@ void ProfilerMain(void*) {
      std::fprintf(f, "image 0x%016" PRIx64 ", code up to 0x%016" PRIx64 "\n\n", g_base,
                   g_text_hi);
      std::fprintf(f, "Stack sampling: %s\n", sample_stacks ? "active (1 ms)" : "disabled");
@@ -74804,7 +74992,7 @@ index 1976e72..b9d57f2 100644
      std::fclose(f);
    }
  
-@@ -945,7 +974,19 @@ void ProfilerMain(void*) {
+@@ -945,7 +1006,19 @@ void ProfilerMain(void*) {
    size_t rr = 0;
    size_t mode_index = 0;
    while (true) {
@@ -74825,7 +75013,7 @@ index 1976e72..b9d57f2 100644
  
      for (size_t tries = 0; sample_stacks && tries < kMaxThreads; ++tries) {
        const size_t idx = rr;
-@@ -1034,6 +1075,19 @@ Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_m
+@@ -1034,6 +1107,19 @@ Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_m
    const Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
    if (R_SUCCEEDED(rc) && t) {
      Register(t->handle);
@@ -74845,7 +75033,7 @@ index 1976e72..b9d57f2 100644
    }
    return rc;
  }
-@@ -1047,9 +1101,14 @@ Result __wrap_threadClose(Thread* t) {
+@@ -1047,9 +1133,14 @@ Result __wrap_threadClose(Thread* t) {
  
  /* libnx calls that cost IPC or walk memory. See g_calls. */
  Result __wrap_nvFenceWait(NvFence* f, s32 timeout_us) {
@@ -74860,7 +75048,7 @@ index 1976e72..b9d57f2 100644
    return rc;
  }
  
-@@ -1203,6 +1262,13 @@ void RexSwitchPerfMax(unsigned id, u64 value) {
+@@ -1203,6 +1294,13 @@ void RexSwitchPerfMax(unsigned id, u64 value) {
   * Bits: 1 draws, 2 transfers, 4 resolves, 8 texture loads,
   * 16 presentation effect, 32 tiled dispatch.
   */

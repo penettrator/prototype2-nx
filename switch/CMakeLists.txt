@@ -3,7 +3,7 @@
 # separate host step (tools/codegen.ps1) because a cross-built rexglue cannot run here.
 # Scheme follows Mercenaries2-NX app/CMakeLists.txt (see X360_TO_SWITCH_PORTING_GUIDE.md stage 4).
 cmake_minimum_required(VERSION 3.25)
-project(prototype2 VERSION 0.3.0 LANGUAGES C CXX)
+project(prototype2 VERSION 0.4.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(P2_PROJECT "${CMAKE_CURRENT_SOURCE_DIR}/../project")
@@ -69,7 +69,7 @@ set_source_files_properties("${P2_PROJECT}/generated/default/prototype2_register
 foreach(t prototype2 prototype2_recomp)
     target_compile_options(${t} PRIVATE -ffp-contract=off -fno-strict-aliasing)
 endforeach()
-rexglue_switch_add_nro(prototype2 NAME "Prototype 2" AUTHOR "penettrator" VERSION "0.3.0" ICON "${CMAKE_CURRENT_SOURCE_DIR}/../extras/icon.jpg")
+rexglue_switch_add_nro(prototype2 NAME "Prototype 2" AUTHOR "penettrator" VERSION "0.4.0" ICON "${CMAKE_CURRENT_SOURCE_DIR}/../extras/icon.jpg")
 
 option(P2_GUEST_STACK_AUDIT "Instrument generated function returns (diagnostic overhead)" OFF)
 foreach(t prototype2 prototype2_recomp)
@@ -87,7 +87,7 @@ foreach(t prototype2 prototype2_recomp)
 endforeach()
 if(P2_DIRECT_CALLS)
     set_property(SOURCE "${P2_PROJECT}/generated/default/prototype2_recomp.0.cpp" APPEND PROPERTY
-      COMPILE_OPTIONS "-fopt-info-inline-optimized=/work/build/direct-call-inlining.0.log")
+      COMPILE_OPTIONS "-fopt-info-inline-optimized=${CMAKE_BINARY_DIR}/direct-call-inlining.0.log")
 endif()
 
 # First LTO stage is limited to guest code. Native renderer/xxHash/SDK keep their

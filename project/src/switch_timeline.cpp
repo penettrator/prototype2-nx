@@ -5,19 +5,28 @@
 // Moving 45 % of the skinning off the render thread (run65) did not change the frame rate, so the frame is set
 // by this hand-off. Every 10 s: per frame, the time each side spent in these three calls and how often.
 #include "generated/default/prototype2_pch.h"
+#include <rex/cvar.h>
 #include <rex/logging.h>
+#include <cstdio>
+#include <string>
 #include <atomic>
 #include <chrono>
 
+// PERF pass 26: the same three waits per frame, every frame, in logs/rex/frame_timeline.csv (diagnostic).
+REXCVAR_DEFINE_BOOL(p2_timeline_frames, false, "Prototype2",
+                    "Diagnostic: per-frame render-thread pop / Main frame wait / Main push times to "
+                    "logs/rex/frame_timeline.csv");
+extern "C" const char* RexSwitchLogDir();
 REX_EXTERN(__imp__sub_821EC950);
 REX_EXTERN(__imp__sub_82283888);
 REX_EXTERN(__imp__sub_821DF540);
 
 namespace {
 struct Counter {
-  std::atomic<uint64_t> ns{0}, calls{0}, max_ns{0};
+  std::atomic<uint64_t> ns{0}, calls{0}, max_ns{0}, total{0};
   void Add(uint64_t d) {
     ns.fetch_add(d, std::memory_order_relaxed);
+    total.fetch_add(d, std::memory_order_relaxed);
     calls.fetch_add(1, std::memory_order_relaxed);
     uint64_t m = max_ns.load(std::memory_order_relaxed);
     while (d > m && !max_ns.compare_exchange_weak(m, d, std::memory_order_relaxed)) {}
@@ -58,6 +67,28 @@ extern "C" void p2_timeline_frame() {
   const uint64_t now = Now();
   if (!last) last = now;
   ++frames;
+  if (REXCVAR_GET(p2_timeline_frames)) {
+    static uint64_t prev = 0, prev_pop = 0, prev_event = 0, prev_push = 0;
+    static std::string rows;
+    const uint64_t pop = g_pop.total.load(std::memory_order_relaxed), ev = g_event.total.load(std::memory_order_relaxed),
+                   push = g_push.total.load(std::memory_order_relaxed);
+    if (prev) {
+      char line[96];
+      std::snprintf(line, sizeof(line), "%.3f,%.3f,%.3f,%.3f,%.3f\n", double(now) * 1e-6, double(now - prev) * 1e-6,
+                    double(pop - prev_pop) * 1e-6, double(ev - prev_event) * 1e-6, double(push - prev_push) * 1e-6);
+      rows += line;
+    }
+    prev = now; prev_pop = pop; prev_event = ev; prev_push = push;
+    if (rows.size() > 32768) {
+      char path[1024];
+      std::snprintf(path, sizeof(path), "%sframe_timeline.csv", RexSwitchLogDir());
+      if (FILE* f = std::fopen(path, "a")) {
+        std::fwrite(rows.data(), 1, rows.size(), f);
+        std::fclose(f);
+      }
+      rows.clear();
+    }
+  }
   if (now - last < 10000000000ull) return;
   auto take = [](Counter& c, uint64_t& ns, uint64_t& calls, uint64_t& max) {
     ns = c.ns.exchange(0, std::memory_order_relaxed);

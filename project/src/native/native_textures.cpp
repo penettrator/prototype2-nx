@@ -705,12 +705,14 @@ struct TextureCache::Impl {
   void ForgetAnswersAt(uint32_t address, TextureCacheStats& stats) {
     ++answers_epoch;
     if (!REXCVAR_GET(p2_native_targeted_memo)) {
+      full_epoch = answers_epoch;
       memo.clear();
       ++stats.memo_full_clears;
       return;
     }
     ++stats.memo_targeted;
     const uint32_t a = address & ~0xFFFu;
+    forget_ring[forget_count++ % kForgetRing] = {answers_epoch, a};
     memo.for_each_value([&](Memo& m) {
       if (m.view && a >= m.lo && a < m.hi) {
         m.view = VK_NULL_HANDLE;
@@ -723,6 +725,14 @@ struct TextureCache::Impl {
   // What the last GetView answered from (last_texture(), last_valid_until()).
   Texture* out_texture = nullptr;
   uint64_t out_valid_until = 0;
+  // PERF pass 33 (p2_binding_targeted): the last answer's range, the last epoch that moved for a reason other
+  // than a targeted forget, and the recent targeted forgets.
+  uint32_t out_lo = 0, out_hi = 0;
+  uint64_t full_epoch = 0;
+  static constexpr uint32_t kForgetRing = 256;
+  struct ForgetEvent { uint64_t epoch; uint32_t address; };
+  ForgetEvent forget_ring[kForgetRing] = {};
+  uint64_t forget_count = 0;
   uint32_t sync_creates_left = 0;
   VkDeviceSize sync_bytes_left = 0;
   uint32_t sync_creates_per_frame = kSyncCreatesPerFrame;
@@ -1436,6 +1446,7 @@ void TextureCache::BeginFrame(uint64_t frame, uint64_t completed_frame) {
     if (!evicted.empty()) {
       ++im.views_epoch;
       ++im.answers_epoch;
+      im.full_epoch = im.answers_epoch;
       im.memo.for_each_value([&](Impl::Memo& memo) {
         InvalidateEvictedTextureMemo(memo,[&](const void* texture){return evicted.contains(texture);});
       });
@@ -1532,6 +1543,22 @@ bool TextureCache::DebugTextureImage(void* texture, VkImage* image, VkFormat* fo
 }
 
 uint64_t TextureCache::last_valid_until() const { return impl_->out_valid_until; }
+uint32_t TextureCache::last_range_lo() const { return impl_->out_lo; }
+uint32_t TextureCache::last_range_hi() const { return impl_->out_hi; }
+bool TextureCache::AnswersUnchangedFor(uint64_t since, uint32_t lo, uint32_t hi) const {
+  const Impl& im = *impl_;
+  if (since == im.answers_epoch) return true;
+  if (since > im.answers_epoch || im.full_epoch > since) return false;
+  // Every move after `since` is a targeted forget (full ones are excluded above), one ring entry each.
+  const uint64_t moves = im.answers_epoch - since;
+  if (moves > 64 || moves > im.forget_count) return false;
+  for (uint64_t i = 1; i <= moves; ++i) {
+    const auto& e = im.forget_ring[(im.forget_count - i) % Impl::kForgetRing];
+    if (e.epoch <= since) return false;  // the ring does not hold what we need: be safe
+    if (e.address >= lo && e.address < hi) return false;
+  }
+  return true;
+}
 
 void TextureCache::Touch(void* texture, uint64_t submission) {
   auto* t = static_cast<Texture*>(texture);
@@ -1968,6 +1995,7 @@ VkImageView TextureCache::GetView(const xenos::xe_gpu_texture_fetch_t& fetch,
   Impl& im = *impl_;
   im.out_texture = nullptr;
   im.out_valid_until = im.frame;
+  im.out_lo = im.out_hi = 0;
   VkImageView null_view = dimension == xenos::FetchOpDimension::kCube
                               ? im.null_views[1]
                               : (dimension == xenos::FetchOpDimension::k3DOrStacked &&
@@ -1983,6 +2011,7 @@ VkImageView TextureCache::GetView(const xenos::xe_gpu_texture_fetch_t& fetch,
   if (im.memo.size() > 16384) {
     im.memo.clear();
     ++im.answers_epoch;
+    im.full_epoch = im.answers_epoch;
     ++stats_.memo_full_clears;
   }
   uint64_t memo_key = XXH3_64bits_withSeed(&fetch, sizeof(fetch),
@@ -1996,6 +2025,8 @@ VkImageView TextureCache::GetView(const xenos::xe_gpu_texture_fetch_t& fetch,
     }
     im.out_texture = memo.texture;
     im.out_valid_until = memo.texture ? memo.valid_until : im.frame;
+    im.out_lo = memo.lo;
+    im.out_hi = memo.hi;
     return memo.view;
   }
   im.last_valid_until = im.frame;
@@ -2025,6 +2056,8 @@ VkImageView TextureCache::GetView(const xenos::xe_gpu_texture_fetch_t& fetch,
   stored.hi = range_hi;
   im.out_texture = im.last_texture;
   im.out_valid_until = im.last_texture ? im.last_valid_until : im.frame;
+  im.out_lo = range_lo;
+  im.out_hi = range_hi;
   return result_view;
 }
 
@@ -2435,6 +2468,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
       im.textures.erase(existing);
       im.memo.clear();
       ++im.answers_epoch;
+      im.full_epoch = im.answers_epoch;
       ++stats_.memo_full_clears;
     }
   }

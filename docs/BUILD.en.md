@@ -1,4 +1,4 @@
-# Building Prototype 2 — 0.3.0
+# Building Prototype 2 — 0.4.0
 
 [Русский](BUILD.ru.md)
 
@@ -49,6 +49,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_mesa.ps1
 
 Docker prepares the toolchain image and static driver in `out/mesa-sdk/opt/devkitpro/portlibs/switch`. This can take a long time and needs network access when preparing the image. No console keys required.
 
+Since 0.4.0 the driver is built with `-Doptimization=2`, and at the end `tools/redirect_libvulkan.sh` renames the `memalign`/`free` calls in `libvulkan.a` to `p2_nvk_memalign`/`p2_nvk_free` (`project/src/switch_applet_memory.cpp`), so the driver's GPU memory can come from the applet pool. The NRO does not link without this step. The original archive is kept as `libvulkan.a.orig`.
+
 ## 4. NRO
 
 In Git Bash:
@@ -57,17 +59,17 @@ In Git Bash:
 bash tools/build_switch.sh
 ```
 
-Default8compile jobs; adjust with `JOBS=4 bash tools/build_switch.sh`. Uses guest LTO, protected direct calls, ARM integer VMX and leaf locals; stack audit off. Output: `build/switch/prototype2.nro`, version 0.3.0. Derived hot code is generated before compilation. For a clean rebuild remove only your own build directory, not game data.
+Default8compile jobs; adjust with `JOBS=4 bash tools/build_switch.sh`. Uses guest LTO, protected direct calls, ARM integer VMX and leaf locals; stack audit off. Output: `build/switch/prototype2.nro`, version 0.4.0. Derived hot code is generated before compilation. For a clean rebuild remove only your own build directory, not game data.
 
 ## 5. Packaging
 
-Place the NRO and `config/prototype2.toml` in `switch/Prototype2/`, add VERSION 0.3.0, licenses and bilingual instructions. Public releases must exclude game_root, prod.keys/title.keys and personal saves/logs. For your installation add your own disc data separately. Title takeover needs no NSP forwarder. Distribute checksums with prepared packages.
+Place the NRO and `config/prototype2.toml` in `switch/Prototype2/`, add `p2mem.nsp` (`bash tools/build_p2mem.sh` → `out/p2mem/exefs.nsp`, renamed to `p2mem.nsp`), VERSION 0.4.0, licenses and bilingual instructions. Public releases must exclude game_root, prod.keys/title.keys and personal saves/logs. For your installation add your own disc data separately. Title takeover needs no NSP forwarder. Distribute checksums with prepared packages.
 
 ## Source layout
 
-`project/src`: handwritten hooks/native renderer; `switch`: CMake/Horizon; `tools`: code generation/build/checks; `patches`: SDK/Mesa changes; `config`: 0.3.0 settings; `docs`:RU/EN. Building never automatically connects to the Switch or overwrites the SD.
+`project/src`: handwritten hooks/native renderer; `switch`: CMake/Horizon; `tools`: code generation/build/checks; `patches`: SDK/Mesa changes; `config`: 0.4.0 settings; `docs`:RU/EN. Building never automatically connects to the Switch or overwrites the SD.
 
-## NSP forwarder 0.3.0
+## NSP forwarder 0.4.0
 
 After building an NRO with an icon/NACP, use Git Bash, Git, Docker and your own prod.keys:
 
@@ -75,7 +77,7 @@ After building an NRO with an icon/NACP, use Git Bash, Git, Docker and your own 
 SWITCH_PROD_KEYS=/path/to/your/prod.keys bash tools/build_forwarder.sh build/switch/prototype2.nro build/forwarder
 ```
 
-Output: `build/forwarder/Prototype2-forwarder.nsp`. Title ID `0150524F54320000`, target `sdmc:/switch/Prototype2/prototype2.nro`,39-bit, cores0–3. The script checks both NPDM permission tables and NACP version 0.3.0. Keys are mounted read-only and excluded from releases; packer output containing keys is not printed. Forwarder-Mod/hacBrewPack source commits are pinned in the script.
+Output: `build/forwarder/Prototype2-forwarder.nsp`. Title ID `0150524F54320000`, target `sdmc:/switch/Prototype2/prototype2.nro`,39-bit, cores0–3. The script checks both NPDM permission tables and NACP version 0.4.0. Keys are mounted read-only and excluded from releases; packer output containing keys is not printed. Forwarder-Mod/hacBrewPack source commits are pinned in the script.
 
 Defaults: `P2_RELEASE_DIAGNOSTICS_OFF=ON`, `P2_TASK_LIFETIME_AUDIT=OFF`, `P2_GUEST_STACK_AUDIT=OFF`. `switch/release_perf.cpp` provides basic FPS/mode integration without reports or stack sampling. Protected hooks are listed in `config/strong-overrides.json`; no private NRO archive is required to build.
 

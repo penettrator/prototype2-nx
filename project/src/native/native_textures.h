@@ -145,6 +145,12 @@ class TextureCache {
   // Diagnostic (HANDOFF B:98): the image and format behind a last_texture() answer.
   bool DebugTextureImage(void* texture, VkImage* image, VkFormat* format) const;
   uint64_t last_valid_until() const;
+  // PERF pass 33: the guest range [lo, hi) a resolve destination at which could change the last answer.
+  uint32_t last_range_lo() const;
+  uint32_t last_range_hi() const;
+  // PERF pass 33: true when every answers_epoch move since `since` was a targeted forget outside [lo, hi), so
+  // answers looked up for that range at `since` still hold (false when unsure).
+  bool AnswersUnchangedFor(uint64_t since, uint32_t lo, uint32_t hi) const;
   // Marks a texture as used by this submission and frame, as GetView does:
   // what frees textures and rewrites them in place goes by it.
   void Touch(void* texture, uint64_t submission);

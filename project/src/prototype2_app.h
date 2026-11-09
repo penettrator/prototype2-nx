@@ -32,6 +32,7 @@ bool prototype2_RunArmCpuSelfTest();
 bool prototype2_RunDynamicBufferSelfTest();
 void prototype2_EnableGuestStackAudit();
 unsigned int prototype2_EnableSystemScreenshots();  // switch_screenshot.cpp
+void prototype2_InitAppletMemory();  // switch_applet_memory.cpp (PERF pass 31)
 #include "native/p2_native_system.h"
 REXCVAR_DECLARE(std::string, render_target_path_vulkan);
 #endif
@@ -64,6 +65,8 @@ class Prototype2App : public rex::ReXApp {
   }
 #if defined(__SWITCH__)
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    // PERF pass 31: GPU memory from the applet pool (p2_applet_memory_mb, 0 = off), before the Vulkan device.
+    prototype2_InitAppletMemory();
     // Native renderer (src/native, from Mercs2/project8-sw): replaces the SDK's emulated GPU when
     // p2_renderer = "native". Default stays the FSI emulation below.
     rex_p2_msr_lock = int(std::min<uint32_t>(REXCVAR_GET(p2_msr_lock_mode), 5u));

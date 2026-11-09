@@ -29,6 +29,11 @@
 
 namespace p2::native {
 
+// PERF pass 32 (p2_texture_light_trust): content that has never changed since it was first seen is
+// trusted twice as long (sampled every 16th frame instead of 8th) and hashed in full every 64th frame
+// instead of 16th. Set once per frame by the renderer; data that ever changed keeps the old intervals.
+inline bool g_p2_light_trust = false;
+
 class ChangeDetector {
  public:
   static constexpr uint32_t kStableChecks = 8;
@@ -46,7 +51,8 @@ class ChangeDetector {
   // unless the content is trusted.
   uint64_t TrustedUntil(uint64_t frame, uint64_t stagger) const {
     if (unchanged_ < TrustedChecks()) return frame;
-    return frame + (kTrustedEvery - (frame + stagger) % kTrustedEvery) - 1;
+    const uint64_t every = TrustedEvery();
+    return frame + (every - (frame + stagger) % every) - 1;
   }
 
   // Mercenaries 2 (HANDOFF section 56): a full hash every time, no sampling and no trusted
@@ -70,11 +76,11 @@ class ChangeDetector {
   uint64_t Check(const uint8_t* data, size_t size, uint64_t frame, uint64_t stagger,
                  uint64_t& bytes_hashed) {
     const uint32_t trusted_checks = TrustedChecks();
-    if (unchanged_ >= trusted_checks && (frame + stagger) % kTrustedEvery) {
+    if (unchanged_ >= trusted_checks && (frame + stagger) % TrustedEvery()) {
       return hash_;
     }
     uint64_t sample = Sample(data, size);
-    if (unchanged_ >= StableChecks() && sample == sample_ && (frame + stagger) % kFullEvery) {
+    if (unchanged_ >= StableChecks() && sample == sample_ && (frame + stagger) % FullEvery()) {
       if (unchanged_ < trusted_checks) {
         ++unchanged_;
       }
@@ -124,6 +130,8 @@ class ChangeDetector {
   // frame (7% of the ring thread), and the cutscene it was meant for turned
   // out to be decoded correctly into textures that do reach the renderer.
   uint32_t StableChecks() const { return kStableChecks; }
+  uint64_t TrustedEvery() const { return g_p2_light_trust && changes_ == 0 ? 16 : kTrustedEvery; }
+  uint64_t FullEvery() const { return g_p2_light_trust && changes_ == 0 ? 64 : kFullEvery; }
   uint32_t TrustedChecks() const { return kTrustedChecks; }
 
   uint64_t hash_ = 0;

@@ -37,6 +37,8 @@ REXCVAR_DEFINE_UINT32(p2_quality_ab_period_s, 0, "Prototype2",
 REXCVAR_DEFINE_DOUBLE(p2_geo_lod_bias_scale_alt, 1.0, "Prototype2", "p2_geo_lod_bias_scale of odd A/B periods");
 REXCVAR_DEFINE_DOUBLE(p2_vehicle_max_scale_alt, 1.0, "Prototype2", "p2_vehicle_max_scale of odd A/B periods");
 REXCVAR_DEFINE_DOUBLE(p2_shadow_range_scale_alt, 1.0, "Prototype2", "p2_shadow_range_scale of odd A/B periods");
+// PERF pass 24 (user 2026-11-06: measure what the crowd costs; release value unchanged): pedestrians too.
+REXCVAR_DEFINE_DOUBLE(p2_ped_max_scale_alt, -1.0, "Prototype2", "p2_ped_max_scale of odd A/B periods (negative = same as p2_ped_max_scale)");
 REX_EXTERN(__imp__sub_8247A288);
 
 namespace {
@@ -54,6 +56,10 @@ bool QualityAlt() {
 #else
   return false;
 #endif
+}
+double PedScale() {
+  const double alt = REXCVAR_GET(p2_ped_max_scale_alt);
+  return QualityAlt() && alt >= 0.0 ? alt : REXCVAR_GET(p2_ped_max_scale);
 }
 double VehicleScale() { return QualityAlt() ? REXCVAR_GET(p2_vehicle_max_scale_alt) : REXCVAR_GET(p2_vehicle_max_scale); }
 double LodScale() { return QualityAlt() ? REXCVAR_GET(p2_geo_lod_bias_scale_alt) : REXCVAR_GET(p2_geo_lod_bias_scale); }
@@ -114,11 +120,11 @@ void ApplyAmbient(uint8_t* base, uint32_t m) {
       Load32(base, m + 1664) <= car_pool) {
     const uint32_t peds = Load32(base, m + 0);
     if (g_peds.Track(peds)) {
-      g_peds.written = ScaleCount(peds, REXCVAR_GET(p2_ped_max_scale));
+      g_peds.written = ScaleCount(peds, PedScale());
       REXLOG_INFO("[p2-quality] {}: game {} -> {}", g_peds.name, peds, g_peds.written);
     }
     // Follow live cvar changes too.
-    const uint32_t want_peds = ScaleCount(g_peds.game, REXCVAR_GET(p2_ped_max_scale));
+    const uint32_t want_peds = ScaleCount(g_peds.game, PedScale());
     if (want_peds != g_peds.written) g_peds.written = want_peds;
     if (peds != g_peds.written) Store32(base, m + 0, g_peds.written);
     if (int32_t(Load32(base, m + 4)) > int32_t(g_peds.written)) Store32(base, m + 4, g_peds.written);
