@@ -706,19 +706,62 @@ struct TextureCache::Impl {
     ++answers_epoch;
     if (!REXCVAR_GET(p2_native_targeted_memo)) {
       full_epoch = answers_epoch;
-      memo.clear();
+      ClearMemo();
       ++stats.memo_full_clears;
       return;
     }
     ++stats.memo_targeted;
     const uint32_t a = address & ~0xFFFu;
     forget_ring[forget_count++ % kForgetRing] = {answers_epoch, a};
+    if (memo_ranges_valid) {
+      // PERF pass 49: the ranges recorded at every store (see RecordMemoRange) instead of walking the whole
+      // table (profile pass 48: 3.5 % of the ring thread over up to 32k slots). Every entry holding a view
+      // had its current range recorded when it was stored, so the same entries are dropped; stale records
+      // are filtered by the entry's own range.
+      for (const MemoRange& r : memo_ranges) {
+        if (a < r.lo || a >= r.hi) continue;
+        Memo* m = memo.find(r.key);
+        if (m && m->view && a >= m->lo && a < m->hi) {
+          m->view = VK_NULL_HANDLE;
+          ++stats.memo_dropped;
+        }
+      }
+      return;
+    }
     memo.for_each_value([&](Memo& m) {
       if (m.view && a >= m.lo && a < m.hi) {
         m.view = VK_NULL_HANDLE;
         ++stats.memo_dropped;
       }
     });
+  }
+  // PERF pass 49: compact record of memo stores for ForgetAnswersAt.
+  struct MemoRange { uint64_t key; uint32_t lo, hi; };
+  std::vector<MemoRange> memo_ranges;
+  bool memo_ranges_valid = true;
+  void ClearMemo() {
+    memo.clear();
+    memo_ranges.clear();
+    memo_ranges_valid = true;
+  }
+  void RecordMemoRange(uint64_t key, const Memo& m) {
+    if (!memo_ranges_valid || !m.view) return;
+    if (memo_ranges.size() >= 32768) {
+      // Keep only the records that still describe their entry.
+      std::vector<MemoRange> kept;
+      kept.reserve(memo_ranges.size() / 2);
+      for (const MemoRange& r : memo_ranges) {
+        const Memo* e = memo.find(r.key);
+        if (e && e->view && e->lo == r.lo && e->hi == r.hi) kept.push_back(r);
+      }
+      memo_ranges.swap(kept);
+      if (memo_ranges.size() >= 24576) {
+        memo_ranges.clear();
+        memo_ranges_valid = false;  // full scans until the next clear
+        return;
+      }
+    }
+    memo_ranges.push_back({key, m.lo, m.hi});
   }
   // Set by GetViewUncached for the memo.
   uint64_t last_valid_until = 0;
@@ -1615,6 +1658,26 @@ bool TextureCache::StorageCapable(VkFormat format) {
   return capable;
 }
 
+namespace {
+ResolveDestination* ReuseDestination(ResolveDestination& dest, uint32_t width, uint32_t height,
+                                     VkFormat format, uint32_t swizzle, uint64_t frame) {
+  if (dest.width < width || dest.height < height || dest.format != format) return nullptr;
+  dest.host_swizzle = swizzle;
+  dest.last_written_frame = frame;
+  return &dest;
+}
+}  // namespace
+
+ResolveDestination* TextureCache::ReuseForQueuedCopy(uint32_t address, uint32_t width,
+                                                     uint32_t height, VkFormat format,
+                                                     uint32_t host_swizzle) {
+  auto& im = *impl_;
+  auto it = im.resolve_destinations.find(address);
+  if (it == im.resolve_destinations.end() || !it->second->sized.empty() ||
+      im.composite_index_dirty || im.composites_by_member.count(address)) return nullptr;
+  return ReuseDestination(*it->second, width, height, format, host_swizzle, im.frame);
+}
+
 void TextureCache::CopyToSized(ResolveDestination& dest, VkCommandBuffer commands) {
   Impl& im = *impl_;
   if (im.composite_index_dirty) {
@@ -1737,13 +1800,7 @@ ResolveDestination* TextureCache::GetResolveDestination(uint32_t address, uint32
   }
   if (it != im.resolve_destinations.end()) {
     ResolveDestination& dest = *it->second;
-    if (dest.width >= width && dest.height >= height && dest.format == format) {
-      if (dest.host_swizzle != host_swizzle) {
-        dest.host_swizzle = host_swizzle;
-      }
-      dest.last_written_frame = im.frame;
-      return &dest;
-    }
+    if (ReuseDestination(dest, width, height, format, host_swizzle, im.frame)) return &dest;
     width = std::max(width, dest.width);
     height = std::max(height, dest.height);
     std::vector<VkImageView> views;
@@ -1881,7 +1938,13 @@ VkImageView TextureCache::GetCompositeView(const xenos::xe_gpu_texture_fetch_t& 
       swizzle = dest->host_swizzle;
     }
     comp.none = !inside || members.size() < 2;
-    if (comp.none != was_none || !comp.none) im.composite_index_dirty = true;
+    // PERF pass 48: composites_by_member depends only on which addresses non-empty composites hold, so the
+    // index is rebuilt (CopyToSized) only when those change, not on every re-check (profile pass 48: 4 % of
+    // the ring thread in the rebuild).
+    bool member_addresses_changed = comp.members.size() != members.size();
+    for (size_t i = 0; !member_addresses_changed && i < members.size(); ++i)
+      member_addresses_changed = comp.members[i].address != members[i].address;
+    if (comp.none != was_none || (!comp.none && member_addresses_changed)) im.composite_index_dirty = true;
     if (comp.none) return VK_NULL_HANDLE;
     const bool rebuild = !comp.image || comp.format != member_format || comp.width != width ||
                          comp.height != height;
@@ -2009,7 +2072,7 @@ VkImageView TextureCache::GetView(const xenos::xe_gpu_texture_fetch_t& fetch,
   // map nodes every frame contended the allocator lock with the pipeline
   // compiler thread.
   if (im.memo.size() > 16384) {
-    im.memo.clear();
+    im.ClearMemo();
     ++im.answers_epoch;
     im.full_epoch = im.answers_epoch;
     ++stats_.memo_full_clears;
@@ -2054,6 +2117,7 @@ VkImageView TextureCache::GetView(const xenos::xe_gpu_texture_fetch_t& fetch,
                       im.last_texture ? im.last_valid_until : im.frame};
   stored.lo = range_lo;
   stored.hi = range_hi;
+  im.RecordMemoRange(memo_key, stored);
   im.out_texture = im.last_texture;
   im.out_valid_until = im.last_texture ? im.last_valid_until : im.frame;
   im.out_lo = range_lo;
@@ -2466,7 +2530,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
       for (auto& [k, v] : old.views) views.push_back(v);
       im.Retire(old.image, old.memory, std::move(views), im.frame);
       im.textures.erase(existing);
-      im.memo.clear();
+      im.ClearMemo();
       ++im.answers_epoch;
       im.full_epoch = im.answers_epoch;
       ++stats_.memo_full_clears;

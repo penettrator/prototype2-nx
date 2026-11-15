@@ -7,18 +7,22 @@
 // run110: heap 125, pass 13: 16 KiB request) and the caller (sub_82C02B38 texture load, sub_82A2BF30 ...) copies into
 // address 0: the crash. Enlarging the arenas exhausts their fixed parent (#145, never again).
 //
-// With p2_stream_arena_overflow, a request that does not fit into a part that HAS a capacity is served from the
-// guest heap the part itself lives in (same view: virtual, or physical 0xA0000000 / 0xC0000000 / 0xE0000000), with
-// the part's protection, page-aligned (covers every alignment the game asks for, up to the page size). The block
-// is outside the arena's ranges, so the arena's own free ignores it (range check) and its counts and cursors stay
-// exactly as the game keeps them; the free hook releases the block, and the destroy hook releases what is left.
+// With p2_stream_arena_overflow, requests that do not fit are suballocated from committed extents in the same
+// guest heap/view and with the part's protection. This matters for physical A-memory: its 64 KiB page size means
+// one guest page per small allocation can waste most of the remaining 512 MiB physical heap. The returned ranges
+// remain outside the game's linear arena, so its own counts/cursors stay unchanged. The free hook returns ranges;
+// an empty extent is released, and the destroy hook releases any remaining extents.
 // Nothing changes while the arenas have room. A total cap bounds a lifetime leak, should the game ever drop a block
 // without freeing it; past the cap (or when the guest heap is full) the request fails as before.
 #include "stream_arena_trace.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <iterator>
+#include <map>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
@@ -34,10 +38,23 @@ REXCVAR_DEFINE_UINT32(p2_stream_arena_overflow_cap_mb, 96, "Prototype2",
 namespace {
 struct Block {
   uint32_t arena;
+  uint32_t slab;
   uint32_t size;
+};
+struct Slab {
+  uint32_t arena;
+  uint32_t part;
+  uint32_t heap_base;
+  uint32_t base;
+  uint32_t protect;
+  uint32_t size;
+  // Free byte ranges within a committed guest page extent. Xbox physical A-memory
+  // uses 64 KiB pages, so reserving one page per tiny overflow request wastes RAM.
+  std::map<uint32_t, uint32_t> free_ranges;
 };
 std::mutex g_mutex;
 std::unordered_map<uint32_t, Block> g_blocks;  // guest address -> owner
+std::unordered_map<uint32_t, Slab> g_slabs;     // page extent base -> suballocator
 uint64_t g_live_bytes = 0;
 uint64_t g_total_allocs = 0, g_total_frees = 0, g_failures = 0;
 std::atomic<int> g_enabled{-1};
@@ -47,6 +64,44 @@ uint32_t Be32(const uint8_t* base, uint32_t address) {
   uint32_t v;
   __builtin_memcpy(&v, base + address, 4);
   return __builtin_bswap32(v);
+}
+
+uint32_t AllocateFromSlab(Slab& slab, uint32_t size, uint32_t alignment) {
+  for (auto it = slab.free_ranges.begin(); it != slab.free_ranges.end(); ++it) {
+    const uint32_t range_offset = it->first;
+    const uint32_t range_size = it->second;
+    const uint64_t absolute = uint64_t(slab.base) + range_offset;
+    const uint64_t aligned = (absolute + alignment - 1) & ~(uint64_t(alignment) - 1);
+    const uint64_t prefix64 = aligned - absolute;
+    if (prefix64 > range_size || size > range_size - prefix64) continue;
+    const uint32_t prefix = uint32_t(prefix64);
+    const uint32_t suffix_offset = range_offset + prefix + size;
+    const uint32_t suffix = range_size - prefix - size;
+    slab.free_ranges.erase(it);
+    if (prefix) slab.free_ranges.emplace(range_offset, prefix);
+    if (suffix) slab.free_ranges.emplace(suffix_offset, suffix);
+    return uint32_t(aligned);
+  }
+  return 0;
+}
+
+void FreeSlabRange(Slab& slab, uint32_t address, uint32_t size) {
+  uint32_t offset = address - slab.base;
+  auto next = slab.free_ranges.lower_bound(offset);
+  if (next != slab.free_ranges.begin()) {
+    auto previous = std::prev(next);
+    if (previous->first + previous->second == offset) {
+      offset = previous->first;
+      size += previous->second;
+      slab.free_ranges.erase(previous);
+    }
+  }
+  next = slab.free_ranges.lower_bound(offset);
+  if (next != slab.free_ranges.end() && offset + size == next->first) {
+    size += next->second;
+    slab.free_ranges.erase(next);
+  }
+  slab.free_ranges.emplace(offset, size);
 }
 }  // namespace
 
@@ -74,18 +129,40 @@ extern "C" uint32_t P2ArenaOverflowAlloc(uint8_t* base, uint32_t arena, uint32_t
   uint32_t queried = 0;
   if (heap->QueryProtect(part_base, &queried) && queried) protect = queried;
   const uint32_t page = heap->page_size();
-  uint32_t align = page;
+  uint32_t align = 1;
   while (align < alignment && align < 0x1000000u) align <<= 1;
-  const uint32_t rounded = (size + page - 1) & ~(page - 1);
+  if (!page || (page & (page - 1))) return 0;
+  const uint64_t extent_need = uint64_t(size) + align - 1;
+  const uint64_t rounded64 = std::max<uint64_t>(page, (extent_need + page - 1) & ~(uint64_t(page) - 1));
+  if (rounded64 > UINT32_MAX) return 0;
+  const uint32_t extent = uint32_t(rounded64);
   std::lock_guard<std::mutex> lock(g_mutex);
-  if (g_live_bytes + rounded > uint64_t(REXCVAR_GET(p2_stream_arena_overflow_cap_mb)) << 20) {
+  const uint32_t block_align = page;
+  for (auto& entry : g_slabs) {
+    auto& slab = entry.second;
+    if (slab.arena != arena || slab.part != part || slab.heap_base != heap->heap_base() ||
+        slab.protect != protect)
+      continue;
+    const uint32_t address = AllocateFromSlab(slab, size, align);
+    if (address) {
+      g_blocks[address] = Block{arena, entry.first, size};
+      g_live_count.store(uint32_t(g_blocks.size()), std::memory_order_release);
+      ++g_total_allocs;
+      if (g_total_allocs <= 16 || (g_total_allocs & 255) == 0)
+        REXLOG_WARN("[p2-arena-overflow] #{}: arena {:08X} part {} request {} align {} -> {:08X}; live {} blocks {} KiB",
+                    g_total_allocs, arena, part, size, alignment, address, g_blocks.size(), g_live_bytes >> 10);
+      return address;
+    }
+  }
+
+  if (g_live_bytes + extent > uint64_t(REXCVAR_GET(p2_stream_arena_overflow_cap_mb)) << 20) {
     if (g_failures++ < 8)
       REXLOG_ERROR("[p2-arena-overflow] cap reached: arena {:08X} part {} request {} live {} KiB", arena, part,
                    size, g_live_bytes >> 10);
     return 0;
   }
   uint32_t address = 0;
-  if (!heap->AllocRange(heap->heap_base(), heap->heap_base() + heap->heap_size() - 1, rounded, align,
+  if (!heap->AllocRange(heap->heap_base(), heap->heap_base() + heap->heap_size() - 1, extent, block_align,
                         rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit, protect,
                         true, &address) ||
       !address) {
@@ -94,14 +171,25 @@ extern "C" uint32_t P2ArenaOverflowAlloc(uint8_t* base, uint32_t arena, uint32_t
                    arena, part, size, heap->heap_base(), g_live_bytes >> 10);
     return 0;
   }
-  g_blocks[address] = Block{arena, rounded};
+  Slab slab{arena, part, heap->heap_base(), address, protect, extent, {}};
+  slab.free_ranges.emplace(0, extent);
+  const uint32_t allocated = AllocateFromSlab(slab, size, align);
+  if (!allocated) {
+    heap->Release(address);
+    if (g_failures++ < 8)
+      REXLOG_ERROR("[p2-arena-overflow] internal slab allocation failed: arena {:08X} part {} request {}",
+                   arena, part, size);
+    return 0;
+  }
+  g_slabs.emplace(address, std::move(slab));
+  g_blocks[allocated] = Block{arena, address, size};
   g_live_count.store(uint32_t(g_blocks.size()), std::memory_order_release);
-  g_live_bytes += rounded;
+  g_live_bytes += extent;
   ++g_total_allocs;
   if (g_total_allocs <= 16 || (g_total_allocs & 255) == 0)
     REXLOG_WARN("[p2-arena-overflow] #{}: arena {:08X} part {} request {} align {} -> {:08X}; live {} blocks {} KiB",
-                g_total_allocs, arena, part, size, alignment, address, g_blocks.size(), g_live_bytes >> 10);
-  return address;
+                g_total_allocs, arena, part, size, alignment, allocated, g_blocks.size(), g_live_bytes >> 10);
+  return allocated;
 }
 
 extern "C" void P2ArenaOverflowFree(uint8_t* /*base*/, uint32_t /*arena*/, uint32_t address) {
@@ -110,8 +198,18 @@ extern "C" void P2ArenaOverflowFree(uint8_t* /*base*/, uint32_t /*arena*/, uint3
   auto it = g_blocks.find(address);
   if (it == g_blocks.end()) return;  // ours, whichever arena object the game passes
   auto* memory = rex::system::kernel_memory();
-  if (auto* heap = memory ? memory->LookupHeap(address) : nullptr) heap->Release(address);
-  g_live_bytes -= it->second.size;
+  const uint32_t slab_base = it->second.slab;
+  auto slab_it = g_slabs.find(slab_base);
+  if (slab_it != g_slabs.end()) {
+    auto& slab = slab_it->second;
+    FreeSlabRange(slab, address, it->second.size);
+    if (slab.free_ranges.size() == 1 && slab.free_ranges.begin()->first == 0 &&
+        slab.free_ranges.begin()->second == slab.size) {
+      if (auto* heap = memory ? memory->LookupHeap(slab_base) : nullptr) heap->Release(slab_base);
+      g_live_bytes -= slab.size;
+      g_slabs.erase(slab_it);
+    }
+  }
   g_blocks.erase(it);
   g_live_count.store(uint32_t(g_blocks.size()), std::memory_order_release);
   ++g_total_frees;
@@ -121,21 +219,30 @@ extern "C" void P2ArenaOverflowDestroy(uint8_t* /*base*/, uint32_t arena) {
   if (!arena || g_live_count.load(std::memory_order_acquire) == 0) return;
   std::lock_guard<std::mutex> lock(g_mutex);
   auto* memory = rex::system::kernel_memory();
-  uint32_t released = 0;
-  for (auto it = g_blocks.begin(); it != g_blocks.end();) {
+  uint32_t released_extents = 0;
+  for (auto it = g_slabs.begin(); it != g_slabs.end();) {
     if (it->second.arena != arena) {
       ++it;
       continue;
     }
     if (auto* heap = memory ? memory->LookupHeap(it->first) : nullptr) heap->Release(it->first);
     g_live_bytes -= it->second.size;
-    it = g_blocks.erase(it);
-    ++released;
+    it = g_slabs.erase(it);
+    ++released_extents;
+  }
+  uint32_t released_allocations = 0;
+  for (auto it = g_blocks.begin(); it != g_blocks.end();) {
+    if (it->second.arena == arena) {
+      it = g_blocks.erase(it);
+      ++released_allocations;
+    } else {
+      ++it;
+    }
   }
   g_live_count.store(uint32_t(g_blocks.size()), std::memory_order_release);
-  if (released)
-    REXLOG_WARN("[p2-arena-overflow] arena {:08X} destroyed with {} overflow blocks still live (released)", arena,
-                released);
+  if (released_extents)
+    REXLOG_WARN("[p2-arena-overflow] arena {:08X} destroyed with {} allocations in {} extents (released)", arena,
+                released_allocations, released_extents);
 }
 
 // B-001 (2026-11-04, perf_results/semaphore-ab/logs1): the crash came from a NULL of the game's allocator front end

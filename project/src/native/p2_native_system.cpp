@@ -690,12 +690,20 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       uint64_t frames = std::max<uint64_t>(swaps_ - reported_swaps_before_, 1);
       uint64_t gpu_count =
           std::max<uint64_t>(s.gpu_submissions - reported_render_.gpu_submissions, 1);
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
       REXLOG_INFO(
           "[native] per frame: renderer CPU {:.1f} ms, GPU {:.1f} ms over {:.1f} submissions "
           "(GPU time as the driver reports it)",
           double(s.cpu_ns - reported_render_.cpu_ns) / 1e6 / double(frames),
           double(s.gpu_ns - reported_render_.gpu_ns) / 1e6 / double(frames),
           double(s.gpu_submissions - reported_render_.gpu_submissions) / double(frames));
+#else
+      REXLOG_INFO(
+          "[native] per frame: GPU {:.1f} ms over {:.1f} submissions "
+          "(GPU time as the driver reports it; renderer CPU timer disabled)",
+          double(s.gpu_ns - reported_render_.gpu_ns) / 1e6 / double(frames),
+          double(s.gpu_submissions - reported_render_.gpu_submissions) / double(frames));
+#endif
       REXLOG_INFO(
           "[native] binding cache per frame: hit {:.0f}, new {:.0f}, identity {:.0f}, "
           "set_generation {:.0f}, answers_epoch {:.0f}, dead_views {:.0f}, expired {:.0f}",
@@ -740,6 +748,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           s.prewarm_shaders - reported_render_.prewarm_shaders,
           s.prewarm_pipelines - reported_render_.prewarm_pipelines);
       reported_wait_ns_ = wait_ns_;
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
       {
         // The registers that most often changed the render state.
         std::vector<std::pair<uint32_t, uint32_t>> top;
@@ -756,6 +765,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         }
         REXLOG_INFO("[native] state changes by register (10 s):{}", list);
       }
+#endif
       std::string reasons;
       for (uint32_t i = 0; i < 16; ++i) {
         uint64_t n = s.skipped_by_reason[i] - reported_render_.skipped_by_reason[i];
@@ -1325,6 +1335,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         "[native] slow frame {:.0f} ms: ring idle {:.1f} ms, pacing hold {:.1f} ms, game's vblank "
         "wait {:.1f} ms, late skips {}",
         ms, double(idle_ns) / 1e6, double(hold_ns) / 1e6, double(game_vblank_ns) / 1e6, late_skips);
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
     REXLOG_INFO(
         "[native] slow frame {:.0f} ms: waited for the game {:.1f} ms, the GPU {:.1f} ms "
         "({:.1f} of it for stream space), "
@@ -1334,6 +1345,16 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         double(s.frame_stream_wait_ns) / 1e6,
         double(s.frame_upload_wait_ns) / 1e6, double(s.frame_drain_wait_ns) / 1e6,
         double(s.frame_texture_ns) / 1e6, s.frame_draws, textures, created, shaders, pipelines);
+#else
+    REXLOG_INFO(
+        "[native] slow frame {:.0f} ms: waited for the game {:.1f} ms, the GPU {:.1f} ms "
+        "({:.1f} of it for stream space), texture untiling {:.1f} ms, the draw thread {:.1f} ms; "
+        "texture CPU timer disabled; {} draws, {} texture uploads ({} made now), {} shaders, {} pipelines",
+        ms, double(game_wait_ns) / 1e6, double(s.frame_fence_wait_ns) / 1e6,
+        double(s.frame_stream_wait_ns) / 1e6,
+        double(s.frame_upload_wait_ns) / 1e6, double(s.frame_drain_wait_ns) / 1e6,
+        s.frame_draws, textures, created, shaders, pipelines);
+#endif
   }
 
   // The frame rate cap (p2_min_frame_vblanks): a frame is presented at a

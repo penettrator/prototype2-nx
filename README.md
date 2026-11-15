@@ -1,8 +1,8 @@
-# Prototype 2 для Nintendo Switch — 0.4.0
+# Prototype 2 для Nintendo Switch — 0.5.0
 
 [English](README.en.md)
 
-Автор порта: [penettrator](https://github.com/penettrator). Поддержка: [Boosty](https://boosty.to/itgenius).
+Автор порта: [penettrator](https://github.com/penettrator). Поддержка: [Boosty](https://boosty.to/itgenius). Telegram-группа разработки: [t.me/naigrovomdvije](https://t.me/naigrovomdvije).
 
 Нативный порт Xbox 360 версии Prototype 2 на Nintendo Switch. Нужна собственная официальная копия игры; игровые данные в скачиваемые файлы порта не входят.
 

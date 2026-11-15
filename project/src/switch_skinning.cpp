@@ -41,6 +41,8 @@ REXCVAR_DEFINE_UINT32(p2_skinning_helper_mask, 0x6, "Prototype2",
     "Core mask of the skinning helper thread (WORKLOG #101: 0x8 = core 3 when the process may use it)");
 REXCVAR_DEFINE_UINT32(p2_skinning_helper_spin_us, 150, "Prototype2",
     "The skinning helper keeps polling this long after its last chunk before it sleeps (calls come in bursts)");
+REXCVAR_DEFINE_UINT32(p2_skinning_wait_sleep_us, 0, "Prototype2",
+    "After 64 yield hints, sleep this many microseconds while the owner waits for skinning helpers; 0 keeps the old yield-only wait");
 // PERF pass 7 (perf_results/pass_6: skinning ~12 % of the simulation thread with one helper on core 3).
 REXCVAR_DEFINE_UINT32(p2_skinning_helpers, 1, "Prototype2",
     "Skinning helper threads: 1 = one helper (previous), 2 = a second helper; calls then split into per-chunk "
@@ -78,6 +80,7 @@ static void p2_skin_priority_ab() {
 
 p2skinpar::Parallel ParallelRunner() {
   const uint32_t min = REXCVAR_GET(p2_skinning_parallel_min);
+  p2skinpar::g_wait_sleep_us.store(REXCVAR_GET(p2_skinning_wait_sleep_us), std::memory_order_relaxed);
   p2_skin_priority_ab();
   if (min) p2skinpar::Start(int(REXCVAR_GET(p2_skinning_helper_priority)), REXCVAR_GET(p2_skinning_helper_mask),
                            REXCVAR_GET(p2_skinning_helper_spin_us));

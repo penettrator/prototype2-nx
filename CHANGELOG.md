@@ -1,3 +1,27 @@
+# Prototype 2 — 0.5.0
+
+## Русский
+
+- Исправлено слишком яркое белое небо и пересвеченные асфальт и здания в солнечные дни (например, в миссии «Идите к координатам последнего места, где видели доктора Гутьерреса»). Игра подбирает экспозицию по яркости уменьшенного кадра, который читает процессор; теперь этот кадр попадает в память игры (`p2_native_resolve_cpu_writeback`).
+- Производительность: средняя частота кадров в игре выросла примерно с 24–25 до 26–27, кадры дольше 50 мс стали реже, самые тяжёлые места в бою стали ровнее.
+  - Свой микшер звука и декодер XMA, который не пересоздаётся на каждый звук.
+  - Нативное копирование памяти для самой частой функции игры.
+  - Поток перевода команд GPU: объединённые привязки ресурсов, таблица регистров, меньше лишних сравнений и перебора кэша текстур.
+  - Из релизной сборки убраны остатки диагностики.
+  - Профили PGO сняты заново и теперь покрывают и библиотеки SDK.
+- Telegram-группа разработки: https://t.me/naigrovomdvije
+
+## English
+
+- Fixed the overly bright white sky and over-exposed asphalt and buildings on sunny days (for example in the mission to go to Dr. Gutierrez's last known location). The game sets exposure from the brightness of a shrunk frame that the CPU reads; that frame now reaches the game's memory (`p2_native_resolve_cpu_writeback`).
+- Performance: the average frame rate in play went from about 24–25 to 26–27, frames over 50 ms are less frequent, and the heaviest combat moments are smoother.
+  - A native sound mixer, and an XMA decoder that is no longer recreated for every sound.
+  - A native memory copy for the game's most frequent function.
+  - The GPU command thread: merged resource binds, a register table, fewer redundant comparisons and texture-cache walks.
+  - Leftover diagnostics removed from the release build.
+  - PGO profiles retrained, now covering the SDK libraries as well.
+- Development Telegram group: https://t.me/naigrovomdvije
+
 # Prototype 2 — 0.4.0
 
 ## Русский

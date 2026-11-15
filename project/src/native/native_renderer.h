@@ -99,6 +99,35 @@ struct RendererStats {
   uint64_t skipped_by_reason[16] = {};
 };
 
+// PERF pass 47: register classes for Renderer::RegisterWritten (indices below 0x4000), built at compile time from
+// the comparisons the function used to make for every changed register.
+inline constexpr uint8_t kRegisterState = 0, kRegisterStateHashed = 1, kRegisterIndex = 2, kRegisterIgnored = 3;
+constexpr uint8_t ClassifyRegister(uint32_t index) {
+  // Vertex index range and offset: system constants only.
+  if (index >= 0x2100 && index <= 0x2102) return kRegisterIndex;
+  // Registers written for every draw, or only read by resolves and the
+  // ring, do not invalidate the render state the draws cache.
+  if (index == 0x2103 || (index >= 0x21F9 && index <= 0x21FC) ||
+      (index >= 0x2318 && index <= 0x231F) || index == 0x2324 || index == 0x2325 ||
+      index == 0x2293 || (index >= 0x0578 && index <= 0x057F) || index == 0x01DC ||
+      index == 0x01DD || (index >= 0x0A2F && index <= 0x0A31) || index == 0x0C44 ||
+      index == 0x0C45 || index == 0x01C5) {
+    return kRegisterIgnored;
+  }
+  return (index >= 0x2000 && index < 0x2400) ? kRegisterStateHashed : kRegisterState;
+}
+struct RegisterClassTable {
+  uint8_t v[0x4000];
+  constexpr RegisterClassTable() : v{} {
+    for (uint32_t i = 0; i < 0x4000; ++i) v[i] = ClassifyRegister(i);
+  }
+};
+inline constexpr RegisterClassTable kRegisterClasses{};
+static_assert(kRegisterClasses.v[0x2101] == kRegisterIndex && kRegisterClasses.v[0x2103] == kRegisterIgnored &&
+              kRegisterClasses.v[0x2200] == kRegisterStateHashed && kRegisterClasses.v[0x0100] == kRegisterState &&
+              kRegisterClasses.v[0x0C45] == kRegisterIgnored && kRegisterClasses.v[0x2400] == kRegisterState,
+              "register classes");
+
 class Renderer {
  public:
   Renderer();
@@ -177,26 +206,22 @@ class Renderer {
       }
       return;
     }
-    // Vertex index range and offset: system constants only.
-    if (index >= 0x2100 && index <= 0x2102) {
+    // PERF pass 47: one table load instead of the range comparisons (same classes, see ClassifyRegister).
+    const uint8_t register_class = kRegisterClasses.v[index];
+    if (register_class == kRegisterIndex) {
+      // Vertex index range and offset: system constants only.
       ++index_generation_;
       return;
     }
-    // Registers written for every draw, or only read by resolves and the
-    // ring, do not invalidate the render state the draws cache.
-    if (index == 0x2103 || (index >= 0x21F9 && index <= 0x21FC) ||
-        (index >= 0x2318 && index <= 0x231F) || index == 0x2324 || index == 0x2325 ||
-        index == 0x2293 || (index >= 0x0578 && index <= 0x057F) || index == 0x01DC ||
-        index == 0x01DD || (index >= 0x0A2F && index <= 0x0A31) || index == 0x0C44 ||
-        index == 0x0C45 || index == 0x01C5) {
-      return;
-    }
+    if (register_class == kRegisterIgnored) return;
     ++state_generation_;
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
     ++state_change_counts_[index];
+#endif
     // The render state is the context block; its hash is kept up to date one
     // register at a time (each register contributes Mix(index, value), and
     // an XOR swaps the old contribution for the new one).
-    if (index >= 0x2000 && index < 0x2400) {
+    if (register_class == kRegisterStateHashed) {
       state_hash_ ^= Mix(index, old_value) ^ Mix(index, new_value);
     }
   }
@@ -236,7 +261,9 @@ class Renderer {
   // Hash of the render state registers (all zero at the start: hash 0).
   uint64_t state_hash_ = 0;
   // Which registers changed the render state, for the report.
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
   uint32_t state_change_counts_[0x4000] = {};
+#endif
   // Fetch constant slots (6 registers each) written since the renderer last
   // looked at them, for textures and for vertex buffers.
   uint32_t texture_fetch_dirty_ = ~0u;

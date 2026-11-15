@@ -10,10 +10,12 @@
 // (tests/skinning_diff.cpp checks the same shape). The helper runs with the owner's FPCR (flush mode).
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <rex/thread.h>
 
 extern "C" void RexSwitchSetCurrentThreadPriority(int priority);  // SDK threading_switch
 extern "C" bool RexSwitchSetCurrentThreadMask(uint32_t mask);
@@ -45,6 +47,8 @@ inline std::atomic<bool> g_started{false};
 inline std::mutex g_mutex;
 inline std::condition_variable g_cv;
 inline std::atomic<uint32_t> g_spin_us{150};
+// Optional bounded backoff while the owner waits for the last helper. 0 keeps the historical yield-only path.
+inline std::atomic<uint32_t> g_wait_sleep_us{0};
 inline std::atomic<uint64_t> g_calls{0}, g_split{0}, g_vertices{0}, g_helper_vertices{0};
 inline std::atomic<uint32_t> g_helpers{0};       // helper threads started
 inline std::atomic<uint32_t> g_multi_period{0};  // 0: several helpers whenever started; else in-run A/B period (s)
@@ -66,6 +70,25 @@ inline int64_t Claim(Task* t, bool back) {
 
 inline uint64_t ReadFpcr() { uint64_t v; asm volatile("mrs %0, fpcr" : "=r"(v)); return v; }
 inline void WriteFpcr(uint64_t v) { asm volatile("msr fpcr, %0" : : "r"(v)); }
+
+inline void WaitForHelpers() {
+  const uint32_t sleep_us = g_wait_sleep_us.load(std::memory_order_relaxed);
+  if (!sleep_us) {
+    while (g_active.load(std::memory_order_seq_cst) != 0) asm volatile("yield");
+    return;
+  }
+  // Preserve the fast completion path. If a helper is still active after 64 scheduler hints, sleep briefly
+  // instead of continuously consuming the owner core; recheck the same seq_cst counter after every sleep.
+  uint32_t yields = 0;
+  while (g_active.load(std::memory_order_seq_cst) != 0) {
+    if (yields < 64) {
+      asm volatile("yield");
+      ++yields;
+    } else {
+      rex::thread::Sleep(std::chrono::microseconds(sleep_us));
+    }
+  }
+}
 
 inline void HelperWork(Task* t) {
   const uint64_t saved = ReadFpcr();
@@ -216,7 +239,7 @@ struct Parallel {
       range(k0, std::min(n, k0 + kChunk), v32, v33);
     }
     g_task.store(nullptr, std::memory_order_seq_cst);
-    while (g_active.load(std::memory_order_seq_cst) != 0) asm volatile("yield");
+    WaitForHelpers();
     std::atomic_thread_fence(std::memory_order_acquire);
     if (t.helper_folded) {
       v32 = simde_mm_min_ps(v32, t.helper_lo);  // ties keep the helper's: its vertices come later
@@ -257,7 +280,7 @@ struct Parallel {
       phi[c] = hi;
     }
     g_task.store(nullptr, std::memory_order_seq_cst);
-    while (g_active.load(std::memory_order_seq_cst) != 0) asm volatile("yield");
+    WaitForHelpers();
     std::atomic_thread_fence(std::memory_order_acquire);
     simde__m128 lo = plo[0], hi = phi[0];
     for (uint32_t c = 1; c < chunks; ++c) {

@@ -118,6 +118,12 @@ void Native(PPCContext& ctx, uint8_t* base) {
         const float32x4_t d = dot(c1, c2, c3, vdupq_n_f32(nrm[j][1]), vdupq_n_f32(nrm[j][2]),
                                   vdupq_n_f32(nrm[j][3]));
         for (int q = 0; q < 4; ++q) pass = vandq_u32(pass, vcgeq_f32(vdupq_n_f32(nd[j][q]), d));
+        // Every remaining plane only ANDs more predicates into `pass`. If all
+        // four lanes are already rejected, later plane tests cannot restore a
+        // lane, so skip their dot products. Groups with fewer than four live
+        // boxes duplicate lane 0, which is safe: an all-zero vector then means
+        // every real box in the group has failed too.
+        if (j < 5 && vmaxvq_u32(pass) == 0) break;
       }
       alignas(16) uint32_t ok[4];
       vst1q_u32(ok, pass);
@@ -261,8 +267,14 @@ bool OccluderNative(PPCContext& ctx, uint8_t* base) {
           const float32x4_t d = vaddq_f32(vaddq_f32(zero4, vmulq_f32(c1, vdupq_n_f32(pl.n1))),
                                           vaddq_f32(vmulq_f32(c2, vdupq_n_f32(pl.n2)), vmulq_f32(c3, vdupq_n_f32(pl.n3))));
           for (int q = 0; q < 4; ++q) outside = vorrq_u32(outside, vcgtq_f32(d, vdupq_n_f32(pl.nd[q])));
+          // `outside` only gains bits as planes are checked. Once every lane is
+          // outside this volume, no later plane can make any lane occluded by it.
+          if (vminvq_u32(outside) == UINT32_MAX) break;
         }
         occluded = vorrq_u32(occluded, vmvnq_u32(outside));
+        // Occlusion is an OR across volumes. If all four lanes are already
+        // occluded, the remaining volumes cannot change the result.
+        if (vminvq_u32(occluded) == UINT32_MAX) break;
       }
       alignas(16) uint32_t occ[4];
       vst1q_u32(occ, occluded);

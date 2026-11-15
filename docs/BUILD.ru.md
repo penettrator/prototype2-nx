@@ -1,4 +1,4 @@
-# Сборка Prototype 2 — 0.4.0
+# Сборка Prototype 2 — 0.5.0
 
 [English](BUILD.en.md)
 
@@ -63,13 +63,13 @@ bash tools/build_switch.sh
 
 ## 5. Пакет
 
-Поместите NRO и `config/prototype2.toml` в `switch/Prototype2/`, добавьте `p2mem.nsp` (`bash tools/build_p2mem.sh` → `out/p2mem/exefs.nsp`, переименовать в `p2mem.nsp`), VERSION 0.4.0, лицензии и двуязычные инструкции. Для публичного релиза не добавляйте game_root, prod.keys/title.keys, личные сохранения/журналы. Для собственной установки добавьте данные своего диска отдельно. Метод title takeover не требует NSP-форвардера. 
+Поместите NRO и `config/prototype2.toml` в `switch/Prototype2/`, добавьте `p2mem.nsp` (`bash tools/build_p2mem.sh` → `out/p2mem/exefs.nsp`, переименовать в `p2mem.nsp`), VERSION 0.5.0, лицензии и двуязычные инструкции. Для публичного релиза не добавляйте game_root, prod.keys/title.keys, личные сохранения/журналы. Для собственной установки добавьте данные своего диска отдельно. Метод title takeover не требует NSP-форвардера. 
 
 ## Структура исходников
 
 `project/src` — ручные хуки/нативный renderer; `switch` — CMake/Horizon; `tools` — кодогенерация/сборка/проверки; `patches` — изменения SDK/Mesa; `config` — профиль 0.4.0; `docs` — RU/EN. Ни одна сборка автоматически не подключается к Switch и не перезаписывает SD.
 
-## NSP-форвардер 0.4.0
+## NSP-форвардер 0.5.0
 
 После сборки NRO с иконкой/NACP используйте Git Bash, Git, Docker и собственный prod.keys:
 
@@ -84,6 +84,6 @@ SWITCH_PROD_KEYS=/path/to/your/prod.keys bash tools/build_forwarder.sh build/swi
 
 ## PGO
 
-`tools/build_switch.sh` по умолчанию использует `PGO=USE` и 228 профилей GCC из `config/pgo-data`. Оптимизируются гостевой код и нативная часть приложения; в готовом NRO нет обучающего дампера gcov. Для совместимости профилей используйте GCC 15.2 и Docker-разметку `/work`, заданную скриптом. Если версия GCC в образе не совпадает с профилями, сборка останавливается (`tools/check_pgo_compiler.py`). Релиз собран в образе `DEVKITA64_IMAGE=devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282`. Файлы профилей содержат счётчики компилятора, игровых данных в них нет.
+`tools/build_switch.sh` по умолчанию использует `PGO=USE` и 375 профилей GCC из `config/pgo-data` (код игры, нативная часть и библиотеки SDK runtime/core/audio). Оптимизируются гостевой код и нативная часть приложения; в готовом NRO нет обучающего дампера gcov. Для совместимости профилей используйте GCC 15.2 и Docker-разметку `/work`, заданную скриптом. Если версия GCC в образе не совпадает с профилями, сборка останавливается (`tools/check_pgo_compiler.py`). Релиз собран в образе `DEVKITA64_IMAGE=devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282`. Файлы профилей содержат счётчики компилятора, игровых данных в них нет.
 
 Обычная сборка без PGO: `PGO=OFF bash tools/build_switch.sh`. Для самостоятельного обучения: `PGO=GEN bash tools/build_switch.sh`, запустите полученный NRO и поиграйте в разных сценах; профили записываются в `SD:/pgo/` раз в три минуты. Скопируйте `.gcda` в `config/pgo-data/` и повторите сборку с `PGO=USE`. Стадии GEN/USE должны использовать совместимые исходники, компилятор и один каталог сборки. GEN использует только счётчики переходов (`-fno-profile-values`), а USE — коррекцию непоследовательных счётчиков. Обучающая запись может надолго задерживать игру; её FPS не сравнивают с готовой сборкой.

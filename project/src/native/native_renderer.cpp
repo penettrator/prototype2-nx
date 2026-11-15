@@ -44,6 +44,7 @@ extern "C" void RexSwitchPerfSceneFrame(uint32_t draws);
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+#include <variant>
 
 #include <xxhash.h>
 
@@ -182,9 +183,8 @@ REXCVAR_DEFINE_BOOL(p2_native_shadow_empty_lit, false, "Prototype2",
                     "(HANDOFF B:110; restart required)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_UINT32(p2_native_shadow_max_cascades, 4, "Prototype2",
-                      "HANDOFF B:129: shadow cascades drawn (1-4). The game draws 4 (to ~11, 41, 131 and "
-                      "401 m); a lower value skips the far ones' caster draws (their maps stay empty = "
-                      "lit), saving hundreds of draws per frame when driving");
+                      "HANDOFF B:129: shadow cascades drawn (0-4). The game draws 4 (to ~11, 41, 131 and "
+                      "401 m); 0 skips all casters but preserves depth clears, leaving shadow maps lit");
 REXCVAR_DEFINE_BOOL(p2_native_shadow_stagger, false, "Prototype2",
                     "With p2_native_shadow_atlas_direct: the two far shadow cascades (3rd and 4th, "
                     "beyond ~41 m) are redrawn on alternate frames, one per frame, instead of both every "
@@ -255,6 +255,9 @@ REXCVAR_DEFINE_BOOL(p2_occlusion_fallback_last, false, "Prototype2",
 REXCVAR_DEFINE_UINT32(p2_ring_hash_memo, 0, "Prototype2",
                       "Texture-binding key of the previous draw reused when its inputs are identical: 0 off, 1 on, "
                       "2 A/B every 30 s");
+REXCVAR_DEFINE_BOOL(p2_pipeline_hash_memo, false, "Prototype2",
+                    "Reuse the previous graphics-pipeline key hash when the complete key bytes are identical; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(p2_occlusion_provisional, false, "Prototype2",
                     "Occlusion queries: publish the last measured result of the address at the query's end at "
                     "once (0 if none), then the real result when the GPU has it (instead of 'not ready' = 1 sample)");
@@ -264,6 +267,9 @@ REXCVAR_DEFINE_BOOL(p2_sun_probe_flip, false, "Prototype2",
 REXCVAR_DEFINE_BOOL(p2_occlusion_report, false, "Prototype2",
                     "Every 10 s: a warning line with occlusion query outcomes (measured, zero, fallback, not "
                     "written) and the draws inside queries without a depth buffer or depth test");
+REXCVAR_DEFINE_UINT32(p2_native_record_passes, 0, "Prototype2",
+                    "Pass recorder: 0 immediate, 1 queued, 2 compare in 30-second ABBA windows after submit")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(p2_native_record_thread, false, "Prototype2",
                     "Make the Vulkan calls of draws on a second thread, so the command ring "
                     "thread prepares the next draw meanwhile");
@@ -281,6 +287,16 @@ REXCVAR_DEFINE_BOOL(p2_native_sampled_stable_ranges, true, "Prototype2",
                     "With p2_native_dynamic_buffer_upload: vertex/index ranges that stopped changing are "
                     "checked by samples plus a full hash every 16 frames instead of hashing every byte "
                     "every frame. false = exact hash each frame (clothing-twitch diagnostic)");
+REXCVAR_DEFINE_BOOL(p2_native_resolve_cpu_writeback, false, "Prototype2",
+                    "B-009: small colour resolves into k_16_16_16_16 unsigned-integer textures (the game's "
+                    "8x8 scene luminance, read back by the CPU for auto exposure) are copied back to guest "
+                    "memory in the console's tiled layout once the GPU is done. Off: the CPU reads stale "
+                    "memory and the exposure runs away in bright scenes. Restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_merge_set_binds, false, "Prototype2",
+                    "PERF pass 46: descriptor sets 0-3 changed by one draw are bound with one call per contiguous "
+                    "run instead of one call per set (same Vulkan state; fewer driver calls). Restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(p2_native_skin_unique, true, "Prototype2",
                     "Vertex ranges on pages the skinning routine wrote in the last 3 frames get a new identity "
                     "(copied, not hashed); false = exact hash checks (WORKLOG #115)");
@@ -613,6 +629,11 @@ struct Renderer::Impl {
   VulkanShader* active_ps = nullptr;
   bool specialize_signs = false;
   bool structured_jumps = false;  // p2_native_structured_jumps
+  bool pipeline_hash_memo = false;
+  PipelineKey previous_pipeline_hash_key = {};
+  uint64_t previous_pipeline_hash = 0;
+  bool previous_pipeline_hash_valid = false;
+  uint64_t pipeline_hash_memo_hits = 0, pipeline_hash_memo_misses = 0;
 
   // Layouts.
   VkDescriptorSetLayout layout_empty = VK_NULL_HANDLE;
@@ -905,10 +926,14 @@ struct Renderer::Impl {
   }
   void ProfileCollect(uint32_t slot);
   struct TextureTimer {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
     uint64_t& total;
     uint64_t start;
     explicit TextureTimer(uint64_t& t) : total(t), start(NowNs()) {}
     ~TextureTimer() { total += NowNs() - start; }
+#else
+    explicit TextureTimer(uint64_t&) {}
+#endif
   };
   void ProfileReport();
   uint32_t HostMsaa(xenos::MsaaSamples guest) const {
@@ -1189,6 +1214,8 @@ struct Renderer::Impl {
   uint64_t settled_skips = 0, vertex_hash_prunes = 0;
   uint64_t skin_page_ranges = 0, skin_page_exact = 0, skin_page_unique = 0;
   bool skin_unique = true;
+  // PERF pass 46: one vkCmdBindDescriptorSets per contiguous run of changed sets (record thread only).
+  bool merge_set_binds = false;
   uint32_t skin_page_window = 600;
   FlatMap64<VertexHash> vertex_hashes;
 
@@ -1437,6 +1464,9 @@ struct Renderer::Impl {
   uint64_t fetch_words_frame = 0;
   uint64_t fetch_words_submission = 0;
   uint32_t last_fetch_words[6 * 32] = {};
+  // PERF pass 47: false only while fetch_words is known equal to last_fetch_words (every write that changes a
+  // word sets it), so the 768-byte comparison per draw runs only after a change.
+  bool fetch_words_changed = true;
 
   uint32_t bound_offsets[SpirvShaderTranslator::kConstantBufferCount] = {};
   bool bound_offsets_valid = false;
@@ -1482,8 +1512,8 @@ struct Renderer::Impl {
   // ring thread and made on the recording thread (p2_native_record_thread)
   // or straight away. In the busiest areas the driver's share of a draw was
   // about a quarter of the ring thread's time; on another core it overlaps
-  // with the ring preparing the next draw. Everything else recorded into the
-  // main command buffer goes through cmd(), which waits for the queue to
+  // with the ring preparing the next draw. Pass commands can share that FIFO.
+  // Direct access to the main buffer goes through cmd(), which waits for the queue to
   // empty, and the texture uploads go into the setup command buffer, which
   // has a pool of its own so the two threads never share one.
   struct DrawCommand {
@@ -1529,6 +1559,35 @@ struct Renderer::Impl {
     if (d.flags & kDrawPipeline) {
       f.vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
     }
+    // PERF pass 46 (p2_native_merge_set_binds): sets 0-3 that change together are bound by one call per
+    // contiguous run. Vulkan defines binding [first, first + count) as binding each set in order with the
+    // same layout; the only dynamic offsets are the constants set's, consumed in set order. Fewer driver
+    // entries (pass 41 profile: nvk_bind_descriptor_sets 6 % of a core).
+    const uint32_t set_bits = (d.flags >> 1) & 0xFu;
+    static_assert(kDrawSharedSet == 1u << 1 && kDrawConstants == 1u << 2 && kDrawTexturesVertex == 1u << 3 &&
+                  kDrawTexturesPixel == 1u << 4, "set flags must be contiguous, in set order");
+    static_assert(SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram == 0 &&
+                  SpirvShaderTranslator::kDescriptorSetConstants == 1 &&
+                  SpirvShaderTranslator::kDescriptorSetTexturesVertex == 2 &&
+                  SpirvShaderTranslator::kDescriptorSetTexturesPixel == 3, "descriptor set order");
+    if (merge_set_binds && set_bits && (set_bits & (set_bits - 1))) {
+      const VkDescriptorSet sets[4] = {d.set_shared, d.set_constants, d.texture_sets[0], d.texture_sets[1]};
+      uint32_t first = 0;
+      while (first < 4) {
+        if (!(set_bits & (1u << first))) {
+          ++first;
+          continue;
+        }
+        uint32_t end = first;
+        while (end < 4 && (set_bits & (1u << end))) ++end;
+        const bool constants = first <= 1 && end > 1;
+        f.vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout, first, end - first,
+                                  &sets[first],
+                                  constants ? uint32_t(SpirvShaderTranslator::kConstantBufferCount) : 0u,
+                                  constants ? d.offsets : nullptr);
+        first = end;
+      }
+    } else {
     if (d.flags & kDrawSharedSet) {
       f.vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout,
                                 SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram, 1,
@@ -1549,6 +1608,7 @@ struct Renderer::Impl {
       f.vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout,
                                 SpirvShaderTranslator::kDescriptorSetTexturesPixel, 1,
                                 &d.texture_sets[1], 0, nullptr);
+    }
     }
     if (d.flags & kDrawViewport) f.vkCmdSetViewport(c, 0, 1, &d.viewport);
     if (d.flags & kDrawScissor) f.vkCmdSetScissor(c, 0, 1, &d.scissor);
@@ -1579,9 +1639,85 @@ struct Renderer::Impl {
     }
 
   }
+  struct BeginCommand {
+    VkCommandBuffer commands;
+    VkExtent2D extent;
+    VkImageView colors[4], depth;
+    uint32_t color_count;
+    bool stencil;
+  };
+  struct EndCommand { VkCommandBuffer commands; };
+  struct BarrierCommand {
+    VkCommandBuffer commands;
+    VkPipelineStageFlags src, dst;
+    VkMemoryBarrier barrier;
+  };
+  struct ClearCommand {
+    VkCommandBuffer commands;
+    VkClearAttachment attachments[2];
+    uint32_t count;
+    VkClearRect rect;
+  };
+  struct ComputeCommand {
+    VkCommandBuffer commands;
+    VkPipeline pipeline;
+    VkDescriptorSet set;
+    std::array<int32_t, 10> params;
+  };
+  using RecordCommand = std::variant<DrawCommand, BeginCommand, EndCommand, BarrierCommand,
+                                     ClearCommand, ComputeCommand>;
+  uint32_t record_pass_mode = 0;
+  bool record_passes = false;
+  std::chrono::steady_clock::time_point record_ab_start{};
+  uint64_t queued_clears = 0, queued_copies = 0;
+
+  void Execute(const DrawCommand& d) { ExecuteDrawCommand(d); }
+  void Execute(const BeginCommand& b) {
+    auto attachment = [](VkImageView view) {
+      VkRenderingAttachmentInfo a = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+      if (view) {
+        a.imageView = view;
+        a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      }
+      return a;
+    };
+    VkRenderingAttachmentInfo colors[4];
+    for (uint32_t i = 0; i < b.color_count; ++i) colors[i] = attachment(b.colors[i]);
+    auto depth = attachment(b.depth);
+    VkRenderingInfo info = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea.extent = b.extent;
+    info.layerCount = 1;
+    info.colorAttachmentCount = b.color_count;
+    info.pColorAttachments = colors;
+    info.pDepthAttachment = b.depth ? &depth : nullptr;
+    info.pStencilAttachment = b.stencil ? &depth : nullptr;
+    dfn().vkCmdBeginRendering(b.commands, &info);
+  }
+  void Execute(const EndCommand& e) {
+    occlusion_commands.Close([&](uint32_t i){ dfn().vkCmdEndQuery(e.commands, occlusion_pool, i); });
+    dfn().vkCmdEndRendering(e.commands);
+  }
+  void Execute(const BarrierCommand& b) {
+    dfn().vkCmdPipelineBarrier(b.commands, b.src, b.dst, 0, 1, &b.barrier, 0, nullptr, 0, nullptr);
+  }
+  void Execute(const ClearCommand& c) {
+    dfn().vkCmdClearAttachments(c.commands, c.count, c.attachments, 1, &c.rect);
+  }
+  void Execute(const ComputeCommand& copy);
+  template<class Command>
+  void RecordPassCommand(const Command& command) {
+    if (record_passes) {
+      if (!record_work.Push(command)) REX_FATAL("Native pass recorder closed before submission");
+    } else {
+      DrainRecorder();
+      Execute(command);
+    }
+  }
   static constexpr uint32_t kRecordQueueSize = 4096;
-  BlockingRecordQueue<DrawCommand,kRecordQueueSize,32> record_work;
-  BlockingRecordQueue<DrawCommand,kRecordQueueSize,32>::WaitStats record_reported{};
+  BlockingRecordQueue<RecordCommand,kRecordQueueSize,32> record_work;
+  BlockingRecordQueue<RecordCommand,kRecordQueueSize,32>::WaitStats record_reported{};
   std::thread record_thread;
   bool record_threaded = false;
 
@@ -1596,10 +1732,14 @@ struct Renderer::Impl {
       svcSetThreadCoreMask(CUR_THREAD_HANDLE, __builtin_ctz(mask), mask);
     }
 #endif
-    while (const DrawCommand* draw=record_work.FrontOrWait()) {
+    while (const auto* command = record_work.FrontOrWait()) {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
       const uint64_t t0 = NowNs();
-      ExecuteDrawCommand(*draw);
+#endif
+      std::visit([this](const auto& value) { Execute(value); }, *command);
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
       record_busy_ns.store(record_busy_ns.load(std::memory_order_relaxed) + (NowNs() - t0), std::memory_order_relaxed);
+#endif
       record_work.CompleteFront();
     }
   }
@@ -1609,12 +1749,18 @@ struct Renderer::Impl {
   uint64_t cpu_phase_ns[8] = {};
   uint64_t cpu_phase_mark = 0;
   bool cpu_phase_on = false;
-  void PhaseStart() { if (cpu_phase_on) cpu_phase_mark = NowNs(); }
+  void PhaseStart() {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+    if (cpu_phase_on) cpu_phase_mark = NowNs();
+#endif
+  }
   void PhaseAdd(int i) {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
     if (!cpu_phase_on) return;
     const uint64_t n = NowNs();
     cpu_phase_ns[i] += n - cpu_phase_mark;
     cpu_phase_mark = n;
+#endif
   }
   void SubmitDraw(const DrawCommand& d) {
     if (!record_threaded) { ExecuteDrawCommand(d); return; }
@@ -2037,8 +2183,8 @@ struct Renderer::Impl {
     if (!recording) {
       return;
     }
-    DrainRecorder();
     EndPass(PassEnd::Submit);
+    DrainRecorder();
     // The setup command buffer copies staging data the upload worker fills.
     {
       uint64_t start = NowNs();
@@ -2310,6 +2456,22 @@ struct Renderer::Impl {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     uint64_t submission = 0;
   };
+  // B-009 (p2_native_resolve_cpu_writeback): GPU -> guest memory copies of small resolves.
+  struct CpuWriteback {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    bool busy = false;
+    uint64_t submission = 0;
+    uint32_t address = 0, width = 0, height = 0, pitch = 0, endian = 0;
+  };
+  static constexpr uint32_t kCpuWritebackMaxTexels = 256;
+  std::vector<CpuWriteback> cpu_writebacks;
+  bool resolve_cpu_writeback = false;
+  uint64_t cpu_writebacks_done = 0;
+  void RecordCpuWriteback(VkCommandBuffer c, VkImage image, uint32_t address, uint32_t width,
+                          uint32_t height, uint32_t pitch, uint32_t endian);
+  void FinishCpuWritebacks();
   static uint32_t DumpTexelBytes(VkFormat format);
   // Records a copy of mip 0 / layer 0 (width x height from 0,0) into the current submission.
   bool RecordImageDump(VkImage image, VkFormat format, uint32_t width, uint32_t height,
@@ -2462,11 +2624,9 @@ struct Renderer::Impl {
   void EndPass(PassEnd reason) {
     if (in_pass) {
       if (work_stats_enabled) ++pass_end_counts[size_t(reason)];
-      VkCommandBuffer commands=cmd();  // Drain before touching recorder-local state.
-      occlusion_commands.Close([&](uint32_t index){dfn().vkCmdEndQuery(commands,occlusion_pool,index);});
+      RecordPassCommand(EndCommand{current().main});
       occlusion_batch_index=QueryTracker::invalid;
       occlusion_batch_owners={};
-      dfn().vkCmdEndRendering(commands);
       in_pass = false;
     }
   }
@@ -2507,6 +2667,8 @@ bool Renderer::Impl::Initialize() {
   }
   specialize_signs = REXCVAR_GET(gpu_specialize_texture_signs);
   exact_vertex_check = REXCVAR_GET(p2_native_exact_vertex_check);
+  pipeline_hash_memo = REXCVAR_GET(p2_pipeline_hash_memo);
+  REXLOG_INFO("[native] pipeline-key hash memo={}", pipeline_hash_memo);
   dynamic_buffer_upload = REXCVAR_GET(p2_native_dynamic_buffer_upload);
   sampled_stable_ranges = REXCVAR_GET(p2_native_sampled_stable_ranges);
   skin_write_log = REXCVAR_GET(p2_skin_write_log);
@@ -2515,6 +2677,10 @@ bool Renderer::Impl::Initialize() {
   settled_frames = REXCVAR_GET(p2_native_settled_frames);
   settled_min_bytes = REXCVAR_GET(p2_native_settled_min_bytes);
   skin_unique = REXCVAR_GET(p2_native_skin_unique);
+  merge_set_binds = REXCVAR_GET(p2_native_merge_set_binds);
+  resolve_cpu_writeback = REXCVAR_GET(p2_native_resolve_cpu_writeback);
+  REXLOG_WARN("[native] resolve CPU writeback={}", resolve_cpu_writeback);
+  REXLOG_WARN("[native] merged descriptor set binds={}", merge_set_binds);
   REXLOG_INFO("[native] dynamic buffer fresh uploads={}", dynamic_buffer_upload);
   work_stats_enabled = REXCVAR_GET(p2_native_work_stats);
   resolve_probe_enabled = REXCVAR_GET(p2_native_resolve_probe);
@@ -2750,6 +2916,8 @@ bool Renderer::Impl::Initialize() {
   if (REXCVAR_GET(p2_native_record_thread)) {
     record_thread = std::thread([this]() { RecordThread(); });
     record_threaded = true;
+    record_pass_mode = REXCVAR_GET(p2_native_record_passes);
+    record_passes = record_pass_mode == 1;
   }
   worker_translator = std::make_unique<SpirvShaderTranslator>(
       SpirvShaderTranslator::Features(device), true, true, false);
@@ -2891,9 +3059,13 @@ bool Renderer::Impl::CreateDepthConversion() {
   if (!depth_copy_pipeline) {
     REXLOG_WARN("[native] No direct depth resolve; resolving depth through a buffer");
   }
-  shadow_atlas_direct = REXCVAR_GET(p2_native_shadow_atlas_direct);
+  shadow_max_cascades = std::clamp<uint32_t>(REXCVAR_GET(p2_native_shadow_max_cascades), 0, 4);
+  // The cascade skip path identifies P2's shadow depth target from its atlas resolve.
+  // Without the direct-atlas resolve, shadow_rt_known is never set and the skip is a no-op.
+  // Enable this resolve path when the user requests zero cascades so all later frames can
+  // recognize the target and retain only the depth clears that leave the atlas lit.
+  shadow_atlas_direct = REXCVAR_GET(p2_native_shadow_atlas_direct) || shadow_max_cascades == 0;
   shadow_stagger = shadow_atlas_direct && REXCVAR_GET(p2_native_shadow_stagger);
-  shadow_max_cascades = std::clamp<uint32_t>(REXCVAR_GET(p2_native_shadow_max_cascades), 1, 4);
   REXLOG_INFO("[native] shadow cascades drawn: {}", shadow_max_cascades);
   shadow_empty_lit = shadow_atlas_direct && REXCVAR_GET(p2_native_shadow_empty_lit);
   shadow_depth_clamp = shadow_atlas_direct && REXCVAR_GET(p2_native_shadow_depth_clamp);
@@ -3106,6 +3278,30 @@ bool Renderer::Impl::ComputeColorCopy(VkCommandBuffer c, VkImageView source, VkI
     writes[i].pImageInfo = &images[i];
   }
   dfn().vkUpdateDescriptorSets(vk, 2, writes, 0, nullptr);
+  std::array<int32_t, 10> params = {sx, sy, dx, dy, int32_t(width), int32_t(height),
+                        int32_t(sample_x), int32_t(sample_y), 0, int32_t(clamp_mode)};
+  std::memcpy(&params[8], &scale, sizeof(scale));
+  VkPipeline copy_pipeline = copy_color_pipeline;
+  if (specialize_copy && sample_x == 1 && sample_y == 1 &&
+      clamp_mode < copy_color_specialized.size() && copy_color_specialized[clamp_mode]) {
+    copy_pipeline = copy_color_specialized[clamp_mode];
+  }
+  if (resolve_probe_enabled) {
+    if (copy_pipeline == copy_color_pipeline) ++probe_copy_universal;
+    else ++probe_copy_specialized;
+  }
+  ComputeCommand copy{c ? c : current().main, copy_pipeline, set, params};
+  if (c) {
+    Execute(copy);
+  } else {
+    RecordPassCommand(copy);
+    ++queued_copies;
+  }
+  return true;
+}
+
+void Renderer::Impl::Execute(const ComputeCommand& copy) {
+  VkCommandBuffer c = copy.commands;
   // Earlier writes of the source (rendering, copies, compute) before the
   // reads, and earlier reads of the destination before the writes.
   VkMemoryBarrier before = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -3118,24 +3314,12 @@ bool Renderer::Impl::ComputeColorCopy(VkCommandBuffer c, VkImageView source, VkI
           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
-  int32_t params[10] = {sx, sy, dx, dy, int32_t(width), int32_t(height),
-                        int32_t(sample_x), int32_t(sample_y), 0, int32_t(clamp_mode)};
-  std::memcpy(&params[8], &scale, sizeof(scale));
-  VkPipeline copy_pipeline = copy_color_pipeline;
-  if (specialize_copy && sample_x == 1 && sample_y == 1 &&
-      clamp_mode < copy_color_specialized.size() && copy_color_specialized[clamp_mode]) {
-    copy_pipeline = copy_color_specialized[clamp_mode];
-  }
-  if (resolve_probe_enabled) {
-    if (copy_pipeline == copy_color_pipeline) ++probe_copy_universal;
-    else ++probe_copy_specialized;
-  }
-  dfn().vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, copy_pipeline);
-  dfn().vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, copy_color_layout, 0, 1, &set,
+  dfn().vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, copy.pipeline);
+  dfn().vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, copy_color_layout, 0, 1, &copy.set,
                                 0, nullptr);
-  dfn().vkCmdPushConstants(c, copy_color_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params),
-                           params);
-  dfn().vkCmdDispatch(c, (width + 7) / 8, (height + 7) / 8, 1);
+  dfn().vkCmdPushConstants(c, copy_color_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(copy.params),
+                           copy.params.data());
+  dfn().vkCmdDispatch(c, (copy.params[4] + 7) / 8, (copy.params[5] + 7) / 8, 1);
   VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
@@ -3147,7 +3331,6 @@ bool Renderer::Impl::ComputeColorCopy(VkCommandBuffer c, VkImageView source, VkI
           VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
       0, 1, &after, 0, nullptr, 0, nullptr);
-  return true;
 }
 
 void Renderer::Impl::ProfileCollect(uint32_t slot) {
@@ -3340,6 +3523,8 @@ void Renderer::Impl::Shutdown() {
     record_work.Close();
     record_thread.join();
     record_threaded = false;
+    record_passes = false;
+    record_pass_mode = 0;
   }
   if (driver_cache_writer.joinable()) {
     driver_cache_writer.join();
@@ -3644,7 +3829,20 @@ VkPipeline Renderer::Impl::GetPipeline(const PipelineKey& key,
   *pending_out = false;
   DrainCompletedPipelines();
   DrainPrewarmed();
-  uint64_t hash = XXH3_64bits(&key, sizeof(key));
+  uint64_t hash;
+  if (pipeline_hash_memo && previous_pipeline_hash_valid &&
+      std::memcmp(&previous_pipeline_hash_key, &key, sizeof(key)) == 0) {
+    hash = previous_pipeline_hash;
+    ++pipeline_hash_memo_hits;
+  } else {
+    hash = XXH3_64bits(&key, sizeof(key));
+    if (pipeline_hash_memo) {
+      std::memcpy(&previous_pipeline_hash_key, &key, sizeof(key));
+      previous_pipeline_hash = hash;
+      previous_pipeline_hash_valid = true;
+      ++pipeline_hash_memo_misses;
+    }
+  }
   auto it = pipelines.find(hash);
   if (it != pipelines.end()) {
     return it->second;
@@ -4675,6 +4873,100 @@ bool Renderer::Impl::RecordImageDump(VkImage image, VkFormat format, uint32_t wi
   return true;
 }
 
+void Renderer::Impl::RecordCpuWriteback(VkCommandBuffer c, VkImage image, uint32_t address,
+                                        uint32_t width, uint32_t height, uint32_t pitch,
+                                        uint32_t endian) {
+  CpuWriteback* slot = nullptr;
+  for (auto& w : cpu_writebacks) {
+    if (!w.busy) { slot = &w; break; }
+  }
+  if (!slot) {
+    if (cpu_writebacks.size() >= 32) return;  // never more in flight than the game's ring of buffers
+    CpuWriteback w;
+    if (!rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            device, VkDeviceSize(kCpuWritebackMaxTexels) * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            rex::ui::vulkan::util::MemoryPurpose::kReadback, w.buffer, w.memory)) {
+      return;
+    }
+    if (dfn().vkMapMemory(vk, w.memory, 0, VK_WHOLE_SIZE, 0, &w.mapped) != VK_SUCCESS) {
+      dfn().vkDestroyBuffer(vk, w.buffer, nullptr);
+      dfn().vkFreeMemory(vk, w.memory, nullptr);
+      return;
+    }
+    cpu_writebacks.push_back(w);
+    slot = &cpu_writebacks.back();
+  }
+  VkMemoryBarrier before = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
+                            VK_ACCESS_TRANSFER_READ_BIT};
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &before, 0, nullptr, 0, nullptr);
+  VkBufferImageCopy region = {};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  region.imageExtent = {width, height, 1};
+  dfn().vkCmdCopyImageToBuffer(c, image, VK_IMAGE_LAYOUT_GENERAL, slot->buffer, 1, &region);
+  VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_ACCESS_HOST_READ_BIT};
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+                             &after, 0, nullptr, 0, nullptr);
+  slot->busy = true;
+  slot->submission = submission_number;
+  slot->address = address;
+  slot->width = width;
+  slot->height = height;
+  slot->pitch = std::max<uint32_t>(pitch, width);
+  slot->endian = endian;
+}
+
+void Renderer::Impl::FinishCpuWritebacks() {
+  for (auto& w : cpu_writebacks) {
+    if (!w.busy) continue;
+    const Submission& s = submissions[w.submission % kSubmissionSlots];
+    if (submission_number <= w.submission || (s.pending && s.number == w.submission)) continue;
+    VkMappedMemoryRange range = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, w.memory, 0,
+                                 VK_WHOLE_SIZE};
+    dfn().vkInvalidateMappedMemoryRanges(vk, 1, &range);
+    const auto* texels = static_cast<const __fp16*>(w.mapped);
+    uint8_t* guest = memory->TranslatePhysical<uint8_t*>(w.address);
+    for (uint32_t y = 0; y < w.height; ++y) {
+      for (uint32_t x = 0; x < w.width; ++x) {
+        // The resolve's packing (Xenia XePackFixed for unsigned integers): the value (exponent
+        // bias already applied by the copy) rounded and clamped to 16 bits, R in the low word.
+        uint8_t bytes[8];
+        for (uint32_t ch = 0; ch < 4; ++ch) {
+          const float v = float(texels[(size_t(y) * w.width + x) * 4 + ch]);
+          const uint16_t u = !(v > 0.0f) ? 0 : v >= 65535.0f ? 65535 : uint16_t(v + 0.5f);
+          bytes[ch * 2] = uint8_t(u);
+          bytes[ch * 2 + 1] = uint8_t(u >> 8);
+        }
+        // xenos::Endian: 1 = 8in16, 2 = 8in32, 3 = 16in32.
+        if (w.endian == 1) {
+          for (uint32_t i = 0; i < 8; i += 2) std::swap(bytes[i], bytes[i + 1]);
+        } else if (w.endian == 2) {
+          for (uint32_t i = 0; i < 8; i += 4) {
+            std::swap(bytes[i], bytes[i + 3]);
+            std::swap(bytes[i + 1], bytes[i + 2]);
+          }
+        } else if (w.endian == 3) {
+          for (uint32_t i = 0; i < 8; i += 4) {
+            std::swap(bytes[i], bytes[i + 2]);
+            std::swap(bytes[i + 1], bytes[i + 3]);
+          }
+        }
+        const int32_t offset =
+            rex::graphics::texture_util::GetTiledOffset2D(int32_t(x), int32_t(y), w.pitch, 3);
+        std::memcpy(guest + offset, bytes, 8);
+      }
+    }
+    if (cpu_writebacks_done++ == 0) {
+      REXLOG_WARN("[native] resolve CPU writeback: first {}x{} at {:08X} (pitch {}, endian {}), "
+                  "texel 0 = {} {} {} {}",
+                  w.width, w.height, w.address, w.pitch, w.endian, float(texels[0]),
+                  float(texels[1]), float(texels[2]), float(texels[3]));
+    }
+    w.busy = false;
+  }
+}
+
 void Renderer::Impl::RecordWaterDumps() {
   if (water_dump_requests.empty()) return;
   for (const auto& [address, fetch_index] : water_dump_requests) {
@@ -5301,44 +5593,26 @@ bool Renderer::Impl::BeginPass(const PassTargets& targets) {
   ProfileMark((kProfilePass << 60) | (ProfileTargetBits(targets.color[0]) << 24) |
               ProfileTargetBits(targets.depth));
   pass = targets;
-  VkRenderingAttachmentInfo colors[4] = {};
-  uint32_t color_count = 0;
+  BeginCommand begin{};
+  begin.commands = current().main;
   uint32_t width = UINT32_MAX, height = UINT32_MAX;
   for (uint32_t i = 0; i < 4; ++i) {
-    colors[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     if (RenderTarget* rt = targets.color[i]) {
-      colors[i].imageView = rt->view;
-      colors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-      colors[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-      colors[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-      color_count = i + 1;
+      begin.colors[i] = rt->view;
+      begin.color_count = i + 1;
       width = std::min(width, rt->width);
       height = std::min(height, rt->height);
     }
   }
-  VkRenderingAttachmentInfo depth = {};
-  depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
   if (targets.depth) {
-    depth.imageView = targets.depth->view;
-    depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    begin.depth = targets.depth->view;
+    begin.stencil = HasStencil(targets.depth->format);
     width = std::min(width, targets.depth->width);
     height = std::min(height, targets.depth->height);
   }
-  if (width == UINT32_MAX) {
-    return false;
-  }
-  VkRenderingInfo info = {};
-  info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-  info.renderArea.extent = {width, height};
-  info.layerCount = 1;
-  info.colorAttachmentCount = color_count;
-  info.pColorAttachments = colors;
-  info.pDepthAttachment = targets.depth ? &depth : nullptr;
-  info.pStencilAttachment =
-      targets.depth && HasStencil(targets.depth->format) ? &depth : nullptr;
-  dfn().vkCmdBeginRendering(cmd(), &info);
+  if (width == UINT32_MAX) return false;
+  begin.extent = {width, height};
+  RecordPassCommand(begin);
   in_pass = true;
   pass_extent = {width, height};
   ++stats().render_passes;
@@ -6489,6 +6763,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
         std::memcpy(&fetch_words[slot * 6],
                     &r[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6],
                     6 * sizeof(uint32_t));
+        fetch_words_changed = true;
       }
     }
   }
@@ -6507,7 +6782,9 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       uint32_t dword1 =
           r[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_index * 2 + 1];
       uint32_t& dword0 = fetch_words[fetch_index * 2];
+      const uint32_t dword0_before = dword0;
       dword0 = guest_dword0;
+      if (dword0 != dword0_before) fetch_words_changed = true;
       uint32_t address = guest_dword0 & 0x1FFFFFFC;
       uint32_t size = (dword1 >> 2) & 0xFFFFFF;  // in words
       uint32_t bytes = std::min(size * 4, 16u << 20);
@@ -6531,6 +6808,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
         AddRange(range_key, stream_head - bytes);
       }
       dword0 = (guest_dword0 & 0x3) | uint32_t(range_offset);
+      if (dword0 != dword0_before) fetch_words_changed = true;
     }
   }
   if (vertex_ranges.size() > 65536) {
@@ -6552,14 +6830,17 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
   VkDeviceSize fetch_offset;
   if (last_fetch.submission == submission_number &&
-      !std::memcmp(last_fetch_words, fetch_words.data(), sizeof(last_fetch_words))) {
+      (!fetch_words_changed ||
+       !std::memcmp(last_fetch_words, fetch_words.data(), sizeof(last_fetch_words)))) {
     fetch_offset = last_fetch.offset;
+    fetch_words_changed = false;
   } else {
     uint8_t* fetch_out = Allocate(kFetchConstantsBytes, ubo_alignment, fetch_offset);
     if (!fetch_out) return skip(9);
     std::memcpy(fetch_out, fetch_words.data(), kFetchConstantsBytes);
     std::memcpy(last_fetch_words, fetch_words.data(), sizeof(last_fetch_words));
     last_fetch = {submission_number, 0, nullptr, frame, fetch_offset};
+    fetch_words_changed = false;
   }
 
   uint8_t* last_float_out = nullptr;
@@ -7128,10 +7409,12 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
 // --- Resolves ------------------------------------------------------------------------
 
 void Renderer::Impl::Resolve() {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
   struct ResolvePhase {
     Impl* impl; uint64_t t0;
     ~ResolvePhase() { if (impl->cpu_phase_on) impl->cpu_phase_ns[7] += NowNs() - t0; }
   } resolve_phase{this, cpu_phase_on ? NowNs() : 0};
+#endif
   p2::gpuwait::Scope gpu_wait_scope(p2::gpuwait::Resolve);
   const RegisterFile& r = *regs;
   auto copy_control = r.Get<reg::RB_COPY_CONTROL>();
@@ -7187,7 +7470,7 @@ void Renderer::Impl::Resolve() {
   ProfileMark((kProfileResolve << 60) | (uint64_t(is_depth) << 56) |
               (uint64_t(surface_info.surface_pitch & 0x7FF) << 32) |
               (uint64_t(uint32_t(x1 - x0) & 0xFFFF) << 16) | uint32_t(y1 - y0));
-  VkCommandBuffer c = cmd();
+  VkCommandBuffer c = VK_NULL_HANDLE;
 
   RenderTargetKey source_key = {};
   source_key.pitch = surface_info.surface_pitch * sample_x;
@@ -7252,7 +7535,6 @@ void Renderer::Impl::Resolve() {
                                 uint32_t(r.Get<reg::RB_COPY_DEST_INFO>().copy_dest_format),
                                 int32_t(r.Get<reg::RB_COPY_DEST_INFO>().copy_dest_exp_bias)));
   }
-  c = cmd();
   uint32_t width = uint32_t(x1 - x0);
   const uint32_t source_rows = source->height / sample_y;
   uint32_t height = std::min(uint32_t(y1 - y0), source_rows - std::min(uint32_t(y0), source_rows));
@@ -7274,12 +7556,10 @@ void Renderer::Impl::Resolve() {
                                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                                        VK_ACCESS_TRANSFER_WRITE_BIT,
                                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
-    dfn().vkCmdPipelineBarrier(c,
-                               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+    RecordPassCommand(BarrierCommand{current().main, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &to_transfer, 0, nullptr,
-                               0, nullptr);
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, to_transfer});
     // Sized by what the resolve covers, not by the destination pitch (aligned
     // to 32): textures sample the image across its whole size, and the game
     // samples its full-screen resolves at 1040 wide, where the pitch made the
@@ -7423,8 +7703,20 @@ void Renderer::Impl::Resolve() {
     if (!is_depth && dest_info.copy_dest_swap) {
       host_swizzle = XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A);
     }
-    ResolveDestination* dest = textures.GetResolveDestination(
-        dest_base & 0x1FFFFFFF, dest_width, dest_height, dest_format, host_swizzle, c);
+    // A cache hit only updates metadata. Every path that may record resource
+    // creation, composite/sized copies or fragment draws takes the buffer first.
+    ResolveDestination* dest = nullptr;
+    if (record_passes && !is_depth && !msaa && !fragment_copies &&
+        textures.StorageCapable(dest_format)) {
+      dest = textures.ReuseForQueuedCopy(dest_base & 0x1FFFFFFF, dest_width, dest_height,
+                                         dest_format, host_swizzle);
+    }
+    const bool defer_copy = dest != nullptr;
+    if (!defer_copy) {
+      c = cmd();
+      dest = textures.GetResolveDestination(dest_base & 0x1FFFFFFF, dest_width, dest_height,
+                                            dest_format, host_swizzle, c);
+    }
     if (dest) dest->guest_pitch = r.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch;
     uint32_t probe_path = 0;  // 0=no destination, 1=color compute, 2=depth compute,
     // 3=depth scratch, 4=blit, 5=resolve image, 6=copy image,
@@ -7639,6 +7931,7 @@ void Renderer::Impl::Resolve() {
         // Mercenaries 2: done by compute with the resolve's exponent bias, the destination
         // format's range and the samples averaged (copy_color.cs.glsl).
       } else if (sample_x * sample_y > 1) {
+        if (!c) c = cmd();
         probe_path = 4;
         // Samples drawn as pixels (SampleScaleX/Y): a filtered blit averages each
         // pixel's samples, as the guest's resolve does.
@@ -7671,6 +7964,7 @@ void Renderer::Impl::Resolve() {
         probe_path = 1;
         // Done by compute (see copy_color.cs.glsl).
       } else {
+        if (!c) c = cmd();
         probe_path = 6;
         VkImageCopy region = {};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -7683,7 +7977,16 @@ void Renderer::Impl::Resolve() {
       }
       if (!atlas_written) {
         CountSizedCopies(*dest);
-        textures.CopyToSized(*dest, c);
+        if (!defer_copy) textures.CopyToSized(*dest, c);
+      }
+      if (resolve_cpu_writeback && !is_depth && !defer_copy && c &&
+          dest->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+          dest_info.copy_dest_format == xenos::ColorFormat::k_16_16_16_16 &&
+          dest_info.copy_dest_number == xenos::SurfaceNumberFormat::kUnsignedInteger &&
+          uint64_t(uint32_t(x0) + width) * (uint32_t(y0) + height) <= kCpuWritebackMaxTexels) {
+        RecordCpuWriteback(c, dest->image, dest_base & 0x1FFFFFFF, uint32_t(x0) + width,
+                           uint32_t(y0) + height, r.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch,
+                           uint32_t(dest_info.copy_dest_endian));
       }
       if (post_dump_next_resolve) {
         post_dump_next_resolve = false;
@@ -7716,10 +8019,9 @@ void Renderer::Impl::Resolve() {
                                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
-      dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      RecordPassCommand(BarrierCommand{current().main, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-                                 0, 1, &to_clear, 0, nullptr, 0, nullptr);
+                                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, to_clear});
     }
     PassTargets clear_targets;
     RenderTarget* depth_target = nullptr;
@@ -7741,8 +8043,9 @@ void Renderer::Impl::Resolve() {
     }
     EndPass(PassEnd::ClearBegin);
     if (BeginPass(clear_targets)) {
-      c = cmd();
-      VkClearAttachment attachments[2] = {};
+      ClearCommand clear_cmd{};
+      clear_cmd.commands = current().main;
+      auto& attachments = clear_cmd.attachments;
       uint32_t count = 0;
       if (depth_target) {
         VkClearAttachment& a = attachments[count++];
@@ -7825,7 +8128,10 @@ void Renderer::Impl::Resolve() {
                           std::min(height * sample_y, pass_extent.height - std::min(cy, pass_extent.height))};
       rect.layerCount = 1;
       if (rect.rect.extent.width && rect.rect.extent.height) {
-        dfn().vkCmdClearAttachments(c, count, attachments, 1, &rect);
+        clear_cmd.count = count;
+        clear_cmd.rect = rect;
+        RecordPassCommand(clear_cmd);
+        if (record_passes) ++queued_clears;
       }
       EndPass(PassEnd::ClearEnd);
     }
@@ -7850,16 +8156,14 @@ void Renderer::Impl::FlushResolveBarrier() {
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                                VK_ACCESS_TRANSFER_READ_BIT};
-  dfn().vkCmdPipelineBarrier(cmd(),
-                             VK_PIPELINE_STAGE_TRANSFER_BIT |
+  RecordPassCommand(BarrierCommand{current().main, VK_PIPELINE_STAGE_TRANSFER_BIT |
                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 1, &after, 0, nullptr, 0, nullptr);
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, after});
 }
 
 // --- Swap ------------------------------------------------------------------------------
@@ -7874,6 +8178,7 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
     FinishWaterDumps(false);
     RecordWaterDumps();
   }
+  if (resolve_cpu_writeback) FinishCpuWritebacks();
   if (capture_all && frame > water_sim_trace_frame) {
     capture_all = false;
     REXLOG_INFO("[native] CAPTURE {} done ({} lines)", capture_count, water_sim_trace_lines);
@@ -8014,6 +8319,7 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
     }
   }
   if (last_swap_time.time_since_epoch().count()) {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
     if (REXCVAR_GET(p2_frame_diagnostics) && frame_draw_count >= 1200) {
       p2_frame_ms[p2_frame_count++] = std::chrono::duration<double, std::milli>(now-last_swap_time).count();
       if (p2_frame_count == p2_frame_ms.size()) {
@@ -8026,6 +8332,7 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
         p2_frame_count = 0;
       }
     } else { p2_frame_count = 0; }
+#endif
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_swap_time).count();
     if (ms > 50) {
       RendererStats& st = stats();
@@ -8038,7 +8345,11 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
           st.render_targets_created - at_last_swap.render_targets_created;
     }
   }
+#if defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  cpu_phase_on = false;
+#else
   cpu_phase_on = REXCVAR_GET(p2_frame_cpu_csv);
+#endif
   bool light_on = false, ab_column = false;
   {
     const uint32_t mode = REXCVAR_GET(p2_ring_light_checks);
@@ -8081,6 +8392,7 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
       settled_min_bytes = light_on ? 256u : REXCVAR_GET(p2_native_settled_min_bytes);
     }
   }
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
   if (cpu_phase_on) {
     static uint64_t prev_record = 0, prev_ring = 0;
     // PERF pass 32: per-frame deltas of the counters behind the parts (textures, vertices, resolves).
@@ -8122,6 +8434,13 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
       for (int i = 0; i < 16 && n > 0 && n < int(sizeof(more)); ++i)
         n += std::snprintf(more + n, sizeof(more) - n, ",%llu", (unsigned long long)d_c[i]);
       rows += more;
+      if (record_pass_mode == 2) {
+        const auto waits = record_work.GetWaitStats();
+        std::snprintf(more, sizeof(more), ",%u,%.3f,%llu,%llu,%llu", unsigned(record_passes),
+                      double(frame_drain_wait_ns) * 1e-6, (unsigned long long)queued_copies,
+                      (unsigned long long)queued_clears, (unsigned long long)waits.full_parks);
+        rows += more;
+      }
       rows += '\n';
     }
     prev_record = record;
@@ -8135,6 +8454,19 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
         std::fclose(f);
       }
       rows.clear();
+    }
+  }
+#endif
+  queued_clears = queued_copies = 0;
+  if (record_pass_mode == 2) {
+    // Both Submit paths above have drained the recorder. Label the frame just
+    // finished before selecting the recording policy for the next one.
+    if (record_ab_start == std::chrono::steady_clock::time_point{} && frame_draw_count >= 1200)
+      record_ab_start = now;
+    if (record_ab_start != std::chrono::steady_clock::time_point{}) {
+      auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now - record_ab_start).count();
+      auto window = (seconds / 30) % 4;
+      record_passes = window == 1 || window == 2;
     }
   }
   last_swap_time = now;
@@ -8182,6 +8514,11 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
     REXLOG_INFO("[native] pass 23 binding-key memo: {} reused, {} hashed (mode {})", tbm_hits, tbm_misses,
                 REXCVAR_GET(p2_ring_hash_memo));
     tbm_hits = tbm_misses = 0;
+    if (pipeline_hash_memo) {
+      REXLOG_INFO("[native] pipeline-key hash memo: {} reused, {} hashed", pipeline_hash_memo_hits,
+                  pipeline_hash_memo_misses);
+      pipeline_hash_memo_hits = pipeline_hash_memo_misses = 0;
+    }
     REXLOG_INFO("[native] settled small ranges not hashed: {} checks; range table pruned {} times, {} entries",
                 settled_skips, vertex_hash_prunes, vertex_hashes.size());
     REXLOG_INFO("[native] skinned-page ranges: {} new, {} exact checks, {} fresh (not hashed)", skin_page_ranges,
@@ -8616,6 +8953,7 @@ void Renderer::LoadShader(xenos::ShaderType type, const uint32_t* ucode, uint32_
 }
 
 namespace {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
 struct CpuTimer {
   uint64_t& total;
   std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
@@ -8626,21 +8964,28 @@ struct CpuTimer {
                           .count());
   }
 };
+#endif
 }  // namespace
 
 void Renderer::Draw(const uint32_t* immediate_indices, uint32_t immediate_index_words) {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
   CpuTimer timer(stats_.cpu_ns);
+#endif
   impl_->Draw(immediate_indices, immediate_index_words);
 }
 
 void Renderer::Resolve() {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
   CpuTimer timer(stats_.cpu_ns);
+#endif
   impl_->Resolve();
 }
 
 void Renderer::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, uint32_t width,
                     uint32_t height) {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
   CpuTimer timer(stats_.cpu_ns);
+#endif
   impl_->Swap(presenter, frontbuffer, width, height);
 }
 

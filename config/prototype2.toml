@@ -1,4 +1,4 @@
-# Prototype 2 / Nintendo Switch — version 0.3.0
+# Prototype 2 / Nintendo Switch — version 0.5.0
 # Release settings; diagnostics disabled. / Диагностика выключена.
 render_target_path_vulkan = "fsi"
 user_language = 12
@@ -110,7 +110,7 @@ p2_native_reap_unused_streams = true
 
 # B-001 (city crash): the first stream-arena failure is written to logs/rex/p2_arena_failure.bin; a full arena part
 # gets an overflow block from its own guest heap instead of a null result.
-p2_stream_arena_trace = true
+p2_stream_arena_trace = false
 p2_stream_arena_overflow = true
 p2_stream_arena_overflow_cap_mb = 96
 
@@ -128,7 +128,7 @@ p2_msr_hot4_ab_period_s = 0
 p2_wait_histogram = false
 
 # Performance (0.3.0): second skinning helper on core 2.
-p2_skinning_helpers = 2
+p2_skinning_helpers = 1
 p2_skinning_helper2_mask = 4
 p2_skinning_helper2_priority = 42
 p2_skinning_multi_ab_period_s = 0
@@ -152,3 +152,17 @@ p2_applet_memory_mb = 256
 # 0.4.0: lighter change checks for vertex/index data and textures that never changed.
 p2_ring_light_checks = 1
 p2_texture_light_trust = 1
+# 0.5.0: sky/asphalt over-exposure fix — small luminance resolves are written back to guest memory for the
+# game's CPU auto exposure.
+# 0.5.0: native audio mixer, XMA decoder reset without reopening, native memcpy, merged descriptor binds.
+p2_native_record_passes = 0
+p2_frame_cpu_csv = false
+p2_skinning_wait_sleep_us = 1
+p2_native_shadow_max_cascades = 0
+p2_pipeline_hash_memo = true
+p2_native_sync_texture_creates = 0
+p2_audio_mix_native = 1
+p2_native_merge_set_binds = true
+audio_xma_fast_reset = true
+p2_memcpy_native = 1
+p2_native_resolve_cpu_writeback = true

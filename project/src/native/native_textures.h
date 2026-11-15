@@ -167,6 +167,9 @@ class TextureCache {
   const ResolveDestination* FindResolveDestination(uint32_t address) const;
   // After a resolve wrote dest (transfer writes recorded in commands): brings
   // its sized copies up to date.
+  // Reuse only a resident image with no composite or sized destinations to update.
+  ResolveDestination* ReuseForQueuedCopy(uint32_t address, uint32_t width, uint32_t height,
+                                         VkFormat format, uint32_t host_swizzle);
   void CopyToSized(ResolveDestination& dest, VkCommandBuffer commands);
   // HANDOFF B:105: a sized copy (written by compute) of another resolve destination that a
   // resolve of width x height to address falls inside of, whole rows of 32-line tiles below its

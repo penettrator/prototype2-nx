@@ -17,15 +17,20 @@ p2collision::Trace trace;
 std::array<std::atomic<uint32_t>,4> live{0,0,0,0};
 thread_local std::array<uint32_t,4> sample_count{};
 thread_local p2collision::Event* active_mesh=nullptr;
-bool Begin(PPCContext& ctx,unsigned kind,p2collision::Event& e){
- if(!REXCVAR_GET(p2_collision_diagnostics))return false;
- if(!trace.Sample(kind,sample_count[kind]))return false;
+bool ShouldSample(unsigned kind){
+ return REXCVAR_GET(p2_collision_diagnostics) && trace.Sample(kind,sample_count[kind]);
+}
+void StartEvent(PPCContext& ctx,unsigned kind,p2collision::Event& e){
  e.kind=kind;e.begin=P2CollisionClock();e.caller=uint32_t(ctx.lr);
 #ifndef P2_COLLISION_PROBE_TEST
  e.thread=threadGetCurHandle();
 #else
  e.thread=42;
 #endif
+}
+bool Begin(PPCContext& ctx,unsigned kind,p2collision::Event& e){
+ if(!ShouldSample(kind))return false;
+ StartEvent(ctx,kind,e);
  return true;
 }
 void Segment(uint8_t* base,uint32_t address,p2collision::Event& e){
@@ -71,6 +76,21 @@ extern "C" REX_FUNC(sub_822425A8){
  if(matched && !before && REX_LOAD_U8(e->request+60))++e->contact_flag_sets;
 }
 REX_EXTERN(__imp__sub_8299F1B0);
+#if P2_LAZY_PAIR_TRACE
+// Keep the event and its initialization off the unsampled worker stack.
+[[gnu::noinline]] static REX_FUNC(RecordSampledPair){
+ p2collision::Event e;
+ StartEvent(ctx,2,e);
+ e.object=ctx.r3.u32;e.other=ctx.r4.u32;e.request=ctx.r5.u32;
+ if(e.object!=e.other){e.type_a=REX_LOAD_U8(e.object+72);e.type_b=REX_LOAD_U8(e.other+72);}
+ __imp__sub_8299F1B0(ctx,base);
+ End(e);
+}
+extern "C" REX_FUNC(sub_8299F1B0){
+ if(ShouldSample(2)){RecordSampledPair(ctx,base);return;}
+ __imp__sub_8299F1B0(ctx,base);
+}
+#else
 extern "C" REX_FUNC(sub_8299F1B0){
  p2collision::Event e;const bool sampled=Begin(ctx,2,e);
  if(sampled){e.object=ctx.r3.u32;e.other=ctx.r4.u32;e.request=ctx.r5.u32;
@@ -79,6 +99,7 @@ extern "C" REX_FUNC(sub_8299F1B0){
  // This function is void; result is deliberately not labelled hit/miss.
  if(sampled){End(e);}
 }
+#endif
 REX_EXTERN(__imp__sub_822833E8);
 extern "C" REX_FUNC(sub_822833E8){
  p2collision::Event e;const bool enabled=REXCVAR_GET(p2_collision_diagnostics);

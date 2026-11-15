@@ -28,7 +28,15 @@ const char* roles[]={"other","ring","guest-query","presenter"};
 struct Site {std::atomic<int64_t> key{0};Counter c;};
 std::array<Site,32> sites;
 }
-extern "C" bool P2GpuWaitEnabled(){return REXCVAR_GET(p2_gpu_wait_diagnostics);}
+// PERF pass 46: release builds never time waits (two clock reads and four atomics per wait scope, plus the
+// GetData hook's bookkeeping, were still active when a test TOML left p2_gpu_wait_diagnostics=true).
+extern "C" bool P2GpuWaitEnabled(){
+#if defined(P2_RELEASE_DIAGNOSTICS_OFF)
+ return false;
+#else
+ return REXCVAR_GET(p2_gpu_wait_diagnostics);
+#endif
+}
 extern "C" uint32_t P2GpuWaitRole(uint32_t role){const auto old=tls.role;if(role<4)tls.role=role;return old;}
 extern "C" uint64_t P2GpuWaitBegin(uint32_t c){
  if(!P2GpuWaitEnabled())return 0;

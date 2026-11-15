@@ -18,7 +18,7 @@ template<class T,uint32_t Capacity,uint32_t Batch=32> class BlockingRecordQueue 
  mutable std::mutex mutex_;
  std::condition_variable work_cv_,done_cv_;
 public:
- struct WaitStats {uint64_t producer_parks=0,consumer_parks=0,completion_notifications=0;};
+ struct WaitStats {uint64_t producer_parks=0,consumer_parks=0,completion_notifications=0,full_parks=0;};
 private:
  WaitStats stats_{}; // accessed only under mutex_
  static bool Reached(uint32_t cursor,uint32_t target){return uint32_t(cursor-target)<0x80000000u;}
@@ -29,6 +29,7 @@ private:
   producer_waiting_.store(true,std::memory_order_seq_cst);
   work_cv_.notify_one();
   ++stats_.producer_parks;
+  if(cancel_on_close) ++stats_.full_parks;
   done_cv_.wait(lock,[&]{return Reached(tail_.load(std::memory_order_seq_cst),target) || (cancel_on_close && closed_.load(std::memory_order_seq_cst));});
   producer_waiting_.store(false,std::memory_order_seq_cst);
   return !cancel_on_close || !closed_.load(std::memory_order_seq_cst);
@@ -36,7 +37,7 @@ private:
 public:
  // Initial cursor is for testing rollover; production starts at zero.
  explicit BlockingRecordQueue(uint32_t initial=0):head_(initial),tail_(initial){}
- bool Push(const T& value) {
+ template<class U=T> bool Push(const U& value) {
   if(closed_.load(std::memory_order_seq_cst))return false;
   const uint32_t head=head_.load(std::memory_order_relaxed);
   if(head-tail_.load(std::memory_order_acquire)>=Capacity && !WaitUntil(head-Capacity+1,true))return false;

@@ -3,7 +3,7 @@
 # separate host step (tools/codegen.ps1) because a cross-built rexglue cannot run here.
 # Scheme follows Mercenaries2-NX app/CMakeLists.txt (see X360_TO_SWITCH_PORTING_GUIDE.md stage 4).
 cmake_minimum_required(VERSION 3.25)
-project(prototype2 VERSION 0.4.0 LANGUAGES C CXX)
+project(prototype2 VERSION 0.5.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(P2_PROJECT "${CMAKE_CURRENT_SOURCE_DIR}/../project")
@@ -48,6 +48,11 @@ set(P2_APP_SOURCES
     "${P2_PROJECT}/src/main.cpp"
     "${P2_PROJECT}/src/switch_screenshot.cpp")
 file(GLOB P2_SWITCH_EXTRA CONFIGURE_DEPENDS "${P2_PROJECT}/src/switch_*.cpp" "${P2_PROJECT}/src/native/*.cpp")
+option(P2_LAZY_PAIR_TRACE "Construct collision-pair trace records only for sampled calls" ON)
+if(P2_LAZY_PAIR_TRACE)
+    set_property(SOURCE "${P2_PROJECT}/src/switch_collision_probe.cpp" APPEND PROPERTY
+                 COMPILE_DEFINITIONS P2_LAZY_PAIR_TRACE=1)
+endif()
 list(APPEND P2_APP_SOURCES ${P2_SWITCH_EXTRA})
 list(REMOVE_DUPLICATES P2_APP_SOURCES)
 add_executable(prototype2 ${P2_APP_SOURCES})
@@ -55,6 +60,9 @@ target_include_directories(prototype2 PRIVATE "${P2_PROJECT}" "${P2_PROJECT}/src
     "${REXSDK_DIR}/src/core" "${REXSDK_DIR}/src/graphics" "${REXSDK_DIR}/thirdparty/glslang")
 target_link_libraries(prototype2 PRIVATE prototype2_recomp rex::runtime)
 rexglue_configure_target(prototype2 GPU_PLUGINS xenos)
+if(P2_RELEASE_DIAGNOSTICS_OFF)
+    target_compile_definitions(prototype2 PRIVATE P2_RELEASE_DIAGNOSTICS_OFF=1)
+endif()
 
 set_property(TARGET prototype2 APPEND PROPERTY LINK_DEPENDS "${REXGLUE_SWITCH_NVK_SDK}/lib/libvulkan.a")
 set(P2_SWITCH_HEAP_MB 2048 CACHE STRING "Capped Switch heap size in MiB")
@@ -69,7 +77,7 @@ set_source_files_properties("${P2_PROJECT}/generated/default/prototype2_register
 foreach(t prototype2 prototype2_recomp)
     target_compile_options(${t} PRIVATE -ffp-contract=off -fno-strict-aliasing)
 endforeach()
-rexglue_switch_add_nro(prototype2 NAME "Prototype 2" AUTHOR "penettrator" VERSION "0.4.0" ICON "${CMAKE_CURRENT_SOURCE_DIR}/../extras/icon.jpg")
+rexglue_switch_add_nro(prototype2 NAME "Prototype 2" AUTHOR "penettrator" VERSION "0.5.0" ICON "${CMAKE_CURRENT_SOURCE_DIR}/../extras/icon.jpg")
 
 option(P2_GUEST_STACK_AUDIT "Instrument generated function returns (diagnostic overhead)" OFF)
 foreach(t prototype2 prototype2_recomp)
@@ -170,6 +178,7 @@ target_link_options(prototype2 PRIVATE "LINKER:--wrap=bqQueueBuffer")
 # Both stages must use the same build directory layout (-fprofile-prefix-path strips it from the file names).
 set(P2_PGO "OFF" CACHE STRING "Application and guest code PGO stage: OFF, GEN or USE")
 set(P2_PGO_DATA "${CMAKE_CURRENT_SOURCE_DIR}/../config/pgo-data" CACHE STRING "Directory with the .gcda files for P2_PGO=USE")
+option(P2_PGO_SDK "PERF pass 47: also profile the SDK runtime/core/audio libraries" ON)
 set(P2_PGO_GEN_DIR "/pgo" CACHE STRING "SD folder the GEN build writes its .gcda files to (PERF pass 13: a fresh one per session)")
 if(P2_PGO STREQUAL "GEN")
     # run97: the indirect-call value profiler uses a thread-local libgcov variable, null on guest threads (crash at
@@ -181,10 +190,27 @@ if(P2_PGO STREQUAL "GEN")
     # WORKLOG #127: the port's own code too (native renderer, skinning, culling: ring and sim thread work).
     target_compile_options(prototype2 PRIVATE -fprofile-generate=${P2_PGO_GEN_DIR} -fno-profile-values -fprofile-update=single
       "-fprofile-prefix-path=${CMAKE_BINARY_DIR}")
+    # PERF pass 47: the SDK's runtime, core and audio libraries too (HLE kernel, threading, XMA wrapper).
+    if(P2_PGO_SDK)
+      foreach(_p2_sdk_target rexruntime rexcore rexaudio)
+        if(TARGET ${_p2_sdk_target})
+          target_compile_options(${_p2_sdk_target} PRIVATE -fprofile-generate=${P2_PGO_GEN_DIR} -fno-profile-values
+            -fprofile-update=single "-fprofile-prefix-path=${CMAKE_BINARY_DIR}")
+        endif()
+      endforeach()
+    endif()
 elseif(P2_PGO STREQUAL "USE")
     target_compile_options(prototype2_recomp PRIVATE "-fprofile-use=${P2_PGO_DATA}" -fprofile-partial-training -fprofile-correction
       "-fprofile-prefix-path=${CMAKE_BINARY_DIR}" -Wno-missing-profile -Wno-coverage-mismatch)
     target_link_options(prototype2 PRIVATE "-fprofile-use=${P2_PGO_DATA}" -fprofile-partial-training)
     target_compile_options(prototype2 PRIVATE "-fprofile-use=${P2_PGO_DATA}" -fprofile-partial-training
       -fprofile-correction "-fprofile-prefix-path=${CMAKE_BINARY_DIR}" -Wno-missing-profile -Wno-coverage-mismatch)
+    if(P2_PGO_SDK)
+      foreach(_p2_sdk_target rexruntime rexcore rexaudio)
+        if(TARGET ${_p2_sdk_target})
+          target_compile_options(${_p2_sdk_target} PRIVATE "-fprofile-use=${P2_PGO_DATA}" -fprofile-partial-training
+            -fprofile-correction "-fprofile-prefix-path=${CMAKE_BINARY_DIR}" -Wno-missing-profile -Wno-coverage-mismatch)
+        endif()
+      endforeach()
+    endif()
 endif()

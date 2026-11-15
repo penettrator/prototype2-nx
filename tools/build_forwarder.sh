@@ -99,7 +99,7 @@ for src, dst in (("control/control.nacp", "control.nacp"), ("exefs/main.npdm", "
     pathlib.Path("/output", dst).write_bytes(pathlib.Path(src).read_bytes())
 nacp = pathlib.Path("control/control.nacp").read_bytes()
 version = nacp[0x3060:0x3070].split(bytes([0]))[0].decode()
-assert version == "0.4.0"
+assert version == "0.5.0"
 checks.update(version=version, title_id=__import__("os").environ["TITLE_ID"], address_space_type=3,
               nro_path=__import__("os").environ["NRO_SD_PATH"])
 pathlib.Path("/output/forwarder-validation.json").write_text(json.dumps(checks, indent=2)+"\n")
