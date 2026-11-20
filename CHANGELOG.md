@@ -1,3 +1,19 @@
+# Prototype 2 — 1.0
+
+## Русский
+
+- Выше производительность.
+- Исправлено: чутьё охотника снова подсвечивает красным тех, кто видит игрока; бесконечная загрузка уровня из-за нехватки памяти; вылет при загрузке после долгой игры; мерцание цветов в начале видеовставок.
+- Автоматическая запись видео консоли выключена в NSP: игре остаётся на 96 МиБ памяти больше. Скриншоты работают, сохранение роликов кнопкой захвата недоступно.
+- Внутреннее разрешение 800×448 с FSR 1. Профили PGO сняты заново.
+
+## English
+
+- Better performance.
+- Fixed: Hunter Sense highlights enemies who can see the player in red again; an endless level load caused by running out of memory; a crash during loading after a long session; colours flickering at the start of cutscene videos.
+- The console's automatic video recording is off in the NSP: the game keeps 96 MiB more memory. Screenshots work; saving video clips with the Capture button is unavailable.
+- Internal resolution 800×448 with FSR 1. PGO profiles retrained.
+
 # Prototype 2 — 0.5.0
 
 ## Русский
@@ -9,7 +25,6 @@
   - Поток перевода команд GPU: объединённые привязки ресурсов, таблица регистров, меньше лишних сравнений и перебора кэша текстур.
   - Из релизной сборки убраны остатки диагностики.
   - Профили PGO сняты заново и теперь покрывают и библиотеки SDK.
-- Telegram-группа разработки: https://t.me/naigrovomdvije
 
 ## English
 
@@ -20,7 +35,6 @@
   - The GPU command thread: merged resource binds, a register table, fewer redundant comparisons and texture-cache walks.
   - Leftover diagnostics removed from the release build.
   - PGO profiles retrained, now covering the SDK libraries as well.
-- Development Telegram group: https://t.me/naigrovomdvije
 
 # Prototype 2 — 0.4.0
 

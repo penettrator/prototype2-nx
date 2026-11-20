@@ -9,7 +9,7 @@ s=(ROOT/'project/src/native/native_renderer.cpp').read_text()
 start=s.index('  static constexpr uint32_t kRecordQueueSize');end=s.index('  RendererStats& stats()',start)
 block=s[start:end]
 assert 'wait_for(' not in block and 'yield(' not in block and 'record_tail' not in block
-assert 'record_work.CompleteFront();' in block and block.index('ExecuteDrawCommand(*draw);')<block.index('record_work.CompleteFront();')
+assert 'record_work.CompleteFront();' in block and block.index('std::visit([this](const auto& value) { Execute(value); }, *command);')<block.index('record_work.CompleteFront();')
 assert 'record_work.Drain();' in block and 'record_work.Close();' in s
 assert not any(x in s for x in ['record_mutex','record_sleeping','record_stop','record_queue =','record_cv'])
 print('PASS actual renderer executes command before release/completion, uses blocking queue, retains drain/close, no legacy polling fields')

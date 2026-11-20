@@ -199,6 +199,7 @@ class Renderer {
         uint32_t slot_bit = 1u << ((index - 0x4800) / 6);
         texture_fetch_dirty_ |= slot_bit;
         vertex_fetch_dirty_ |= slot_bit;
+        tb_key_dirty_ |= slot_bit;
       } else if (index < 0x4928) {
         ++bool_loop_generation_;
       } else {
@@ -235,6 +236,7 @@ class Renderer {
       ++fetch_generation_;
       texture_fetch_dirty_ |= fetch_slots;
       vertex_fetch_dirty_ |= fetch_slots;
+      tb_key_dirty_ |= fetch_slots;
     }
     if (bool_loop) ++bool_loop_generation_;
   }
@@ -268,6 +270,9 @@ class Renderer {
   // looked at them, for textures and for vertex buffers.
   uint32_t texture_fetch_dirty_ = ~0u;
   uint32_t vertex_fetch_dirty_ = ~0u;
+  // PERF pass 53 (R-2): fetch slots written since the texture-binding key memo last read them (only that memo
+  // clears bits). Set in the same places as texture_fetch_dirty_.
+  uint32_t tb_key_dirty_ = ~0u;
   uint64_t index_generation_ = 1;
   uint64_t vs_float_generation_ = 1;
   uint64_t ps_float_generation_ = 1;

@@ -7,10 +7,11 @@
 REXCVAR_DEFINE_BOOL(p2_resource_failure_probe, false, "Prototype2",
     "Failure-only guest resource diagnostics; requires restart")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+extern "C" bool P2DevTelemetry();  // switch_quality.cpp
 namespace {
 std::atomic<unsigned> failures{0};
 bool Record() {
-  return REXCVAR_GET(p2_resource_failure_probe) &&
+  return (REXCVAR_GET(p2_resource_failure_probe) || P2DevTelemetry()) &&
       failures.fetch_add(1, std::memory_order_relaxed) < 16;
 }
 }

@@ -39,6 +39,27 @@ REXCVAR_DEFINE_DOUBLE(p2_vehicle_max_scale_alt, 1.0, "Prototype2", "p2_vehicle_m
 REXCVAR_DEFINE_DOUBLE(p2_shadow_range_scale_alt, 1.0, "Prototype2", "p2_shadow_range_scale of odd A/B periods");
 // PERF pass 24 (user 2026-11-06: measure what the crowd costs; release value unchanged): pedestrians too.
 REXCVAR_DEFINE_DOUBLE(p2_ped_max_scale_alt, -1.0, "Prototype2", "p2_ped_max_scale of odd A/B periods (negative = same as p2_ped_max_scale)");
+// PERF pass 80: physics substeps per frame. The physics step sub_82266440 reads the game global 0x82DBBF1C
+// (image default 2; the game's own debug command pm_Substeps, handler sub_82304DC8, clamps it to 1..10) and runs
+// the whole pipeline (including Main's wait on the pair jobs 829AC940 via 8228BEF0 -> 82283888) once per
+// substep with dt / substeps. 0 = never touch the global (game behaviour). Changes physics: test only.
+REXCVAR_DEFINE_UINT32(p2_physics_substeps, 0, "Prototype2",
+    "Physics substeps per frame written to the game's pm_Substeps global (1..10); 0 = game's own (2)");
+REXCVAR_DEFINE_INT32(p2_physics_substeps_alt, -1, "Prototype2",
+    "p2_physics_substeps of odd p2_quality_ab_period_s periods (negative = same as p2_physics_substeps)");
+// PERF pass 80: CPU busy % per core every 10 s window into logs/rex/cpu_idle.csv (switch/release_perf.cpp,
+// needs p2_frame_pacing_report). Read-only telemetry; the FPS worker visits each core briefly.
+REXCVAR_DEFINE_BOOL(p2_cpu_idle_report, false, "Prototype2",
+    "Write per-core CPU busy % (kernel idle time) to cpu_idle.csv with each frame_pacing.csv window");
+// 2026-11-20: one switch for the development telemetry (user request): true = frame_pacing.csv / memory_streaming.csv,
+// cpu_idle.csv, the failure-only resource probe and the stream arena trace, whatever their own flags say. The
+// release profile keeps all of them and this off; the start-up *_verify checks are separate and stay.
+REXCVAR_DEFINE_BOOL(p2_dev_telemetry, false, "Prototype2",
+    "Development telemetry on: frame pacing + memory CSVs, per-core CPU CSV, resource failure probe, stream arena "
+    "trace (restart required)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+extern "C" bool P2DevTelemetry() { return REXCVAR_GET(p2_dev_telemetry); }
+extern "C" bool P2CpuIdleReportEnabled() { return REXCVAR_GET(p2_cpu_idle_report) || P2DevTelemetry(); }
 REX_EXTERN(__imp__sub_8247A288);
 
 namespace {
@@ -151,6 +172,33 @@ extern "C" REX_FUNC(sub_821F9BF0) {
   if (self && self == g_ambient.load(std::memory_order_acquire)) ApplyAmbient(base, self);
 }
 
+namespace {
+// Pass 80. Read once per physics step at its start; a write from the flip thread lands on the next step.
+constexpr uint32_t kPhysicsSubsteps = 0x82DBBF1C;
+bool g_substeps_have = false, g_substeps_touched = false;
+uint32_t g_substeps_game = 0, g_substeps_written = 0;
+void ApplySubsteps(uint8_t* base) {
+  uint32_t want = REXCVAR_GET(p2_physics_substeps);
+  const int32_t alt = REXCVAR_GET(p2_physics_substeps_alt);
+  if (alt >= 0 && QualityAlt()) want = uint32_t(alt);
+  if (!want && !g_substeps_touched) return;  // flag off: the global is never read or written
+  const uint32_t cur = Load32(base, kPhysicsSubsteps);
+  if (!g_substeps_have || (cur != g_substeps_written && cur != g_substeps_game)) {
+    if (cur - 1 >= 10) return;  // not the expected 1..10 value: leave it alone
+    g_substeps_game = cur;
+    g_substeps_have = true;
+    REXLOG_WARN("[p2-quality] physics substeps: game {}", cur);
+  }
+  const uint32_t target = want ? std::min<uint32_t>(want, 10) : g_substeps_game;
+  if (target != g_substeps_written) {
+    REXLOG_WARN("[p2-quality] physics substeps -> {}", target);
+    g_substeps_written = target;
+  }
+  g_substeps_touched = want != 0;
+  if (cur != target) Store32(base, kPhysicsSubsteps, target);
+}
+}  // namespace
+
 // Once per guest frame (flip hook).
 extern "C" void p2_quality_frame() {
   uint8_t* base = g_base.load(std::memory_order_relaxed);
@@ -168,26 +216,35 @@ extern "C" void p2_quality_frame() {
   const float want = float(double(game_lod) * LodScale());
   std::memcpy(&g_lod.written, &want, 4);
   if (lod != g_lod.written) Store32(base, kLodBias, g_lod.written);
+  ApplySubsteps(base);
 }
 
-// WORKLOG #107: the game's internal render size (its renderer init parameters, sub_82258D70, hard-code 1200x672;
-// tools/prepare_switch_codegen.py routes them here). Read once at renderer init. Rounded down to the Xbox 360
-// EDRAM tile grid (80 x 16 pixels) and kept within 640x352 .. 1200x672.
+// WORKLOG #107: the game's internal render size (sub_82258D70).
+// Keep the EDRAM tile-aligned choices and allow the explicit 700x392 test
+// mode. The renderer rounds physical tile pitch separately from logical size.
 REXCVAR_DEFINE_UINT32(p2_render_width, 1200, "Prototype2",
-                      "Internal render width (the game's own 1200). Lower = fewer pixels for the GPU; the "
-                      "picture is scaled to the screen (see present_effect = fsr). Multiple of 80; restart");
+                      "Internal render width. Tile-aligned except in 700x392 mode; restart");
 REXCVAR_DEFINE_UINT32(p2_render_height, 672, "Prototype2",
-                      "Internal render height (the game's own 672). Multiple of 16; restart");
+                      "Internal render height. Tile-aligned except in 700x392 mode; restart");
+
+static bool UseRenderSize700x392() {
+  return REXCVAR_GET(p2_render_width) == 700 && REXCVAR_GET(p2_render_height) == 392;
+}
+
+extern "C" int64_t p2_render_height() {
+  if (UseRenderSize700x392()) return 392;
+  return std::clamp<uint32_t>(REXCVAR_GET(p2_render_height), 352, 672) / 16 * 16;
+}
+
 extern "C" int64_t p2_render_width() {
-  const uint32_t w = std::clamp<uint32_t>(REXCVAR_GET(p2_render_width), 640, 1200) / 80 * 80;
+  const uint32_t width = UseRenderSize700x392()
+                             ? 700
+                             : std::clamp<uint32_t>(REXCVAR_GET(p2_render_width), 640, 1200) / 80 * 80;
   static bool logged = false;
   if (!logged) {
     logged = true;
-    REXLOG_INFO("[p2-quality] internal render size {}x{} (game 1200x672)", w,
-                std::clamp<uint32_t>(REXCVAR_GET(p2_render_height), 352, 672) / 16 * 16);
+    REXLOG_INFO("[p2-quality] internal render size {}x{} (game 1200x672)", width,
+                p2_render_height());
   }
-  return w;
-}
-extern "C" int64_t p2_render_height() {
-  return std::clamp<uint32_t>(REXCVAR_GET(p2_render_height), 352, 672) / 16 * 16;
+  return width;
 }

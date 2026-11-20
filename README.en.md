@@ -1,8 +1,8 @@
-# Prototype 2 for Nintendo Switch — 0.5.0
+# Prototype 2 for Nintendo Switch — 1.0
 
 [Русский](README.md)
 
-Port author: [penettrator](https://github.com/penettrator). Support: [Boosty](https://boosty.to/itgenius). Development Telegram group: [t.me/naigrovomdvije](https://t.me/naigrovomdvije).
+Port author: [penettrator](https://github.com/penettrator). Support: [Boosty](https://boosty.to/itgenius).
 
 A native port of the Xbox 360 version of Prototype 2 to Nintendo Switch. You need your own official copy of the game; port downloads do not include game data.
 
@@ -52,6 +52,8 @@ SD:/switch/Prototype2/
 Install **`Prototype2-forwarder.nsp`** using DBI and start Prototype 2 from its HOME icon. The NSP loads the NRO from SD, so keep the `switch/Prototype2/` folder on the card.
 
 **This NSP already permits the fourth core and the settings are prepared. There is no need to replace `atmosphere/hbl.nsp` or edit system files.**
+
+The console's automatic video recording is off in the NSP: this leaves the game 96 MiB more memory. Screenshots work; saving video clips with the Capture button is unavailable.
 
 Alternatively, hold **R** while starting a normal installed game, wait for hbmenu and select Prototype 2. Fourth-core access through this method depends on your loader. **Do not launch through Album:** applet memory is insufficient.
 

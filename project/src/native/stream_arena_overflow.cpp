@@ -114,20 +114,63 @@ extern "C" bool P2ArenaOverflowEnabled() {
   return e != 0;
 }
 
-// part: 0 = normal (+88 base, +92 capacity), 1 = GPU / write-combine (+100 base, +104 capacity).
-extern "C" uint32_t P2ArenaOverflowAlloc(uint8_t* base, uint32_t arena, uint32_t size, uint32_t alignment,
-                                         uint32_t part) {
-  if (!P2ArenaOverflowEnabled() || !arena || !size) return 0;
-  const uint32_t part_base = Be32(base, arena + (part ? 100 : 88));
-  const uint32_t part_capacity = Be32(base, arena + (part ? 104 : 92));
-  if (!part_base || !part_capacity) return 0;  // a part without capacity: the caller has its own fallback
+namespace {
+// B-013: one-time map of the guest physical heap at the first refused overflow (free bytes, largest
+// free range, 64 KiB-aligned largest range, histogram of free ranges, largest allocations). Read only.
+std::atomic<bool> g_phys_dumped{false};
+void DumpPhysicalHeapOnce(rex::memory::Memory* memory, uint32_t request) {
+  if (g_phys_dumped.exchange(true)) return;
+  auto* phys = memory->GetPhysicalHeap();
+  if (!phys) return;
+  const uint64_t base = phys->heap_base(), end = base + uint64_t(phys->heap_size());
+  uint64_t free_bytes = 0, used_bytes = 0, largest = 0, largest64 = 0;
+  uint32_t free_ranges = 0, regions = 0;
+  uint32_t hist[6] = {};  // <64K, <256K, <1M, <4M, <16M, >=16M
+  std::pair<uint32_t, uint32_t> top[12] = {};  // size, base
+  uint32_t last_alloc_base = UINT32_MAX;
+  for (uint64_t a = base; a < end && regions < 2000000;) {
+    rex::memory::HeapAllocationInfo info{};
+    if (!phys->QueryRegionInfo(uint32_t(a), &info) || !info.region_size) break;
+    ++regions;
+    const uint64_t size = info.region_size;
+    if (!info.state) {
+      free_bytes += size; ++free_ranges; largest = std::max(largest, size);
+      const uint64_t s64 = (a + 0xFFFF) & ~uint64_t(0xFFFF), e64 = (a + size) & ~uint64_t(0xFFFF);
+      if (e64 > s64) largest64 = std::max(largest64, e64 - s64);
+      const int h = size < (64u << 10) ? 0 : size < (256u << 10) ? 1 : size < (1u << 20) ? 2
+                  : size < (4u << 20) ? 3 : size < (16u << 20) ? 4 : 5;
+      ++hist[h];
+    } else {
+      used_bytes += size;
+      if (info.allocation_base != last_alloc_base) {
+        last_alloc_base = info.allocation_base;
+        std::pair<uint32_t, uint32_t> cur{info.allocation_size, info.allocation_base};
+        for (auto& slot : top) if (cur.first > slot.first) std::swap(cur, slot);
+      }
+    }
+    a += size;
+  }
+  REXLOG_ERROR("[p2-physmap] request {} : free {} KiB in {} ranges, largest {} KiB (64K-aligned {} KiB), used {} KiB, "
+               "{} regions; free ranges <64K {} <256K {} <1M {} <4M {} <16M {} >=16M {}",
+               request, free_bytes >> 10, free_ranges, largest >> 10, largest64 >> 10, used_bytes >> 10, regions,
+               hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+  for (const auto& slot : top)
+    if (slot.first) REXLOG_ERROR("[p2-physmap] large allocation {:08X} {} KiB", slot.second, slot.first >> 10);
+}
+}  // namespace
+
+namespace {
+// Common overflow path. part is the slab key (0/1: dual arena normal/GPU, 2/3: second arena class normal/GPU);
+// probe is a guest address inside the part (heap and protection), default_protect is used when it has none.
+uint32_t OverflowAlloc(uint32_t arena, uint32_t size, uint32_t alignment, uint32_t part, uint32_t probe,
+                       uint32_t default_protect) {
   auto* memory = rex::system::kernel_memory();
   if (!memory) return 0;
-  rex::memory::BaseHeap* heap = memory->LookupHeap(part_base);
+  rex::memory::BaseHeap* heap = memory->LookupHeap(probe);
   if (!heap) return 0;
-  uint32_t protect = rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite;
+  uint32_t protect = default_protect;
   uint32_t queried = 0;
-  if (heap->QueryProtect(part_base, &queried) && queried) protect = queried;
+  if (heap->QueryProtect(probe, &queried) && queried) protect = queried;
   const uint32_t page = heap->page_size();
   uint32_t align = 1;
   while (align < alignment && align < 0x1000000u) align <<= 1;
@@ -169,6 +212,7 @@ extern "C" uint32_t P2ArenaOverflowAlloc(uint8_t* base, uint32_t arena, uint32_t
     if (g_failures++ < 8)
       REXLOG_ERROR("[p2-arena-overflow] guest heap full: arena {:08X} part {} request {} (heap {:08X}) live {} KiB",
                    arena, part, size, heap->heap_base(), g_live_bytes >> 10);
+    DumpPhysicalHeapOnce(memory, size);
     return 0;
   }
   Slab slab{arena, part, heap->heap_base(), address, protect, extent, {}};
@@ -190,6 +234,38 @@ extern "C" uint32_t P2ArenaOverflowAlloc(uint8_t* base, uint32_t arena, uint32_t
     REXLOG_WARN("[p2-arena-overflow] #{}: arena {:08X} part {} request {} align {} -> {:08X}; live {} blocks {} KiB",
                 g_total_allocs, arena, part, size, alignment, allocated, g_blocks.size(), g_live_bytes >> 10);
   return allocated;
+}
+}  // namespace
+
+// part: 0 = normal (+88 base, +92 capacity), 1 = GPU / write-combine (+100 base, +104 capacity).
+extern "C" uint32_t P2ArenaOverflowAlloc(uint8_t* base, uint32_t arena, uint32_t size, uint32_t alignment,
+                                         uint32_t part) {
+  if (!P2ArenaOverflowEnabled() || !arena || !size) return 0;
+  const uint32_t part_base = Be32(base, arena + (part ? 100 : 88));
+  const uint32_t part_capacity = Be32(base, arena + (part ? 104 : 92));
+  if (!part_base || !part_capacity) return 0;  // a part without capacity: the caller has its own fallback
+  return OverflowAlloc(arena, size, alignment, part, part_base,
+                       rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite);
+}
+
+// B-001 (2026-11-17, run134: [p2-heap-null-aligned] heap 148 obj A13B87C0 alloc 82CA2090 size 131072 flags 2):
+// the second arena class (vtable[10] sub_82CA2090) is one block [+92, +104) of +88 bytes. Its GPU part
+// (sub_82CA1B40) grows up from +92 (cursor +96) and switches whole 64 KiB pages to write-combine up to +100; its
+// normal part (sub_82CA1AA8) grows down from +104 (low end +108). A GPU request fails when the 64 KiB-rounded end
+// would reach the normal part's page - even when the bytes fit (run134: 128 KiB request, 136 KiB free) - and the
+// stream loader sub_82C02B38 copies into address 0. Same overflow as above: part 2 = normal, part 3 = GPU.
+extern "C" uint32_t P2ArenaOverflowAlloc2(uint8_t* base, uint32_t arena, uint32_t size, uint32_t alignment,
+                                          uint32_t gpu) {
+  if (!P2ArenaOverflowEnabled() || !arena || !size) return 0;
+  const uint32_t block_size = Be32(base, arena + 88);
+  const uint32_t block_base = Be32(base, arena + 92);
+  const uint32_t block_end = Be32(base, arena + 104);
+  if (!block_size || !block_base || block_end <= block_base) return 0;
+  const uint32_t rw = rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite;
+  // The GPU part's pages are write-combine (the game protects them with 0x404); the top page belongs to the normal
+  // part. Probe the page that matches the part; fall back to the part's documented protection.
+  return gpu ? OverflowAlloc(arena, size, alignment, 3, block_base, rw | rex::memory::kMemoryProtectWriteCombine)
+             : OverflowAlloc(arena, size, alignment, 2, block_end - 1, rw);
 }
 
 extern "C" void P2ArenaOverflowFree(uint8_t* /*base*/, uint32_t /*arena*/, uint32_t address) {
@@ -253,4 +329,91 @@ extern "C" void P2HeapNull(uint32_t index, uint32_t size, uint32_t alloc_fn, uin
   const uint32_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
   if (n <= 64 || (n & (n - 1)) == 0)
     REXLOG_ERROR("[p2-heap-null] #{}: heap {} size {} alloc {:08X} caller {:08X}", n, index, size, alloc_fn, caller);
+}
+
+// B-001 (2026-11-16, user-reported 0.5.0 crash): the 128 KiB 4 KiB-aligned buffer of the stream loader
+// (sub_82C02B38 -> sub_82C02AB0) is allocated with heaps[index]->vtable[10](size, align, flags) and, on NULL, again
+// through sub_8222F980 (same call with flags 2, then the game's out-of-memory callback). That path is neither
+// sub_8222FE80 (P2HeapNull) nor necessarily the hooked arena: vtable[10] of the second arena class sub_82CA2090
+// goes to sub_82CA1AA8/sub_82CA1B40, which return 0 when the 64 KiB-rounded cursor passes the limit, silently.
+// Report every final NULL of sub_8222F980: heap index, object, its vtable[10] function, request, whether an OOM
+// callback was installed, the caller (return address into the caller) and the object's words +88..+124
+// (cursor/commit/limit/counts for both arena classes). Report only; the result is unchanged.
+extern "C" void P2HeapNullAligned(uint32_t index, uint32_t heap, uint32_t alloc_fn, uint32_t size, uint32_t align,
+                                  uint32_t flags, uint32_t oom_callback, uint32_t caller, const uint32_t* state) {
+  static std::atomic<uint32_t> count{0};
+  const uint32_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 64 || (n & (n - 1)) == 0)
+    REXLOG_ERROR("[p2-heap-null-aligned] #{}: heap {} obj {:08X} alloc {:08X} size {} align {} flags {} "
+                 "oom-callback {:08X} caller {:08X}; obj+88: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+                 "{:08X} {:08X} {:08X}",
+                 n, index, heap, alloc_fn, size, align, flags, oom_callback, caller, state[0], state[1], state[2],
+                 state[3], state[4], state[5], state[6], state[7], state[8], state[9]);
+}
+
+// B-014 (2026-11-18, user report, 0.5.0 after 97 min): sub_82CA2970 creates a second-class
+// stream arena from heaps[index]->vtable[8](size, 64 KiB) (sub_821CE038) and does not check the result. A NULL block
+// gives an arena with base 0 (+92/+96/+100 = 0, +104/+108 = size); its normal part then hands out addresses just below
+// `size` (crash: 72-byte object at 0x003AFFB0 = 0x3B0000 - 72, aligned 16, written by sub_829C6DC0). Every such NULL
+// is reported. With p2_arena2_block_fallback the block comes from the guest physical heap (64 KiB pages, read/write:
+// the arena's own XPhysicalProtect calls switch its GPU pages to write-combine as for a normal block). The arena's
+// destroy (sub_82CA23E8) frees the block through sub_822BD600(index, block), hooked: a fallback block is released
+// here and never reaches the game's heap. Nothing changes while the game's allocator succeeds.
+REXCVAR_DEFINE_BOOL(p2_arena2_block_fallback, false, "Prototype2",
+    "B-014: when the game cannot allocate the block of a new stream arena (sub_82CA2970), take it from the guest "
+    "physical heap and release it with the arena; false = the original arena at address 0 (crash)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace {
+std::mutex g_block_mutex;
+std::unordered_map<uint32_t, uint32_t> g_fallback_blocks;  // guest address -> extent
+std::atomic<uint32_t> g_fallback_count{0};
+std::atomic<uint32_t> g_block_reports{0};          // fallback creations (B-016: own budget, was shared)
+std::atomic<uint32_t> g_block_release_reports{0};  // releases
+}  // namespace
+
+extern "C" uint32_t P2Arena2BlockFallback(uint8_t* /*base*/, uint32_t heap_index, uint32_t size) {
+  auto* memory = rex::system::kernel_memory();
+  const bool enabled = REXCVAR_GET(p2_arena2_block_fallback);
+  uint32_t address = 0;
+  rex::memory::BaseHeap* heap = memory ? memory->LookupHeap(0xA0000000u) : nullptr;
+  if (enabled && size && heap) {
+    const uint32_t page = std::max<uint32_t>(heap->page_size(), 0x10000u);
+    const uint64_t extent64 = (uint64_t(size) + page - 1) & ~(uint64_t(page) - 1);
+    if (extent64 <= UINT32_MAX &&
+        heap->AllocRange(heap->heap_base(), heap->heap_base() + heap->heap_size() - 1, uint32_t(extent64), page,
+                         rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit,
+                         rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite, true, &address) &&
+        address) {
+      std::lock_guard<std::mutex> lock(g_block_mutex);
+      g_fallback_blocks[address] = uint32_t(extent64);
+      g_fallback_count.store(uint32_t(g_fallback_blocks.size()), std::memory_order_release);
+    } else {
+      address = 0;
+    }
+  }
+  // B-016 (user report, 2026-11-19): releases used up the shared 32-line budget, so later failures went unseen.
+  const uint32_t n = g_block_reports.fetch_add(1) + 1;
+  if (n <= 256 || (n & (n - 1)) == 0)
+    REXLOG_ERROR("[p2-arena2-block] heap {} could not allocate a {} KiB arena block; fallback {} -> {:08X} (live {})",
+                 heap_index, size >> 10, enabled ? "on" : "off", address, g_fallback_count.load());
+  if (!address && memory) DumpPhysicalHeapOnce(memory, size);
+  return address;
+}
+
+// Entry of sub_822BD600 (heaps[index]->vtable[9](address)): true = a fallback block, released here.
+extern "C" bool P2Arena2BlockFree(uint8_t* /*base*/, uint32_t heap_index, uint32_t address) {
+  if (!address || g_fallback_count.load(std::memory_order_acquire) == 0) return false;
+  std::lock_guard<std::mutex> lock(g_block_mutex);
+  auto it = g_fallback_blocks.find(address);
+  if (it == g_fallback_blocks.end()) return false;
+  auto* memory = rex::system::kernel_memory();
+  if (auto* heap = memory ? memory->LookupHeap(address) : nullptr) heap->Release(address);
+  const uint32_t extent = it->second;
+  g_fallback_blocks.erase(it);
+  g_fallback_count.store(uint32_t(g_fallback_blocks.size()), std::memory_order_release);
+  if (g_block_release_reports.fetch_add(1) < 64)
+    REXLOG_WARN("[p2-arena2-block] heap {} released fallback block {:08X} ({} KiB), live {}", heap_index, address,
+                extent >> 10, g_fallback_blocks.size());
+  return true;
 }

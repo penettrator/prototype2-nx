@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exact register-local specialization of the game's skinning routine.
 #include "generated/default/prototype2_pch.h"
+#include "native/ring_ab.h"  // PERF pass 87 A/B channel
 #include <rex/cvar.h>
 #include <algorithm>
 #include <array>
@@ -20,11 +21,18 @@ REX_EXTERN(__imp__sub_829F5978);
 #include "p2_skin_cache.h"
 #include <rex/logging.h>
 #include "native/skin_write_log.h"
+#include "native/skin_gpu_jobs.h"
 #include <rex/thread.h>
 
 REXCVAR_DEFINE_BOOL(p2_skinning_fast, true, "Prototype2",
     "Per-vertex rewrite of the skinning routine (p2_skinning_fast.h, same operations, memory byte-identical); "
     "false = the register-local generated kernel");
+REXCVAR_DEFINE_BOOL(p2_skin_scan_neon, false, "Prototype2",
+    "Use integer NEON for the skinning input scan on cache misses (restart required)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(p2_skin_scan_neon_verify, 0, "Prototype2",
+    "Compare the first N NEON input scans with the scalar scan and disable NEON on mismatch")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_UINT32(p2_skinning_fast_verify, 64, "Prototype2",
     "First N skinning calls run both the generated kernel and the rewrite and compare every byte written; a "
     "difference keeps the generated result and turns the rewrite off");
@@ -201,6 +209,53 @@ static void SkinTrace(uint8_t* base, uint32_t input, uint32_t n, uint32_t palett
   if (skintrace::g_calls.size() < 20000) skintrace::g_calls.push_back(c);
 }
 
+static inline uint64_t SkinInputHash(const uint8_t* base, uint32_t input, uint32_t n, [[maybe_unused]] unsigned path) {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  struct Totals { uint64_t calls[2]{}, bytes[2]{}, ns[2]{}; };
+  static thread_local Totals t;
+  const auto start = std::chrono::steady_clock::now();
+#endif
+  const uint64_t hash = p2skincache::InputHash(base, input, n);
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  ++t.calls[path]; t.bytes[path] += uint64_t(n) * 32;
+  t.ns[path] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now() - start).count());
+  if ((t.calls[0] + t.calls[1]) % 4096 == 0)
+    REXLOG_INFO("[p2-skin-hash] scan calls={} bytes={} ns={}; result-cache calls={} bytes={} ns={}",
+      t.calls[0], t.bytes[0], t.ns[0], t.calls[1], t.bytes[1], t.ns[1]);
+#endif
+  return hash;
+}
+
+static p2skin::SkinInputScan ScanSkinInput(const uint8_t* data, uint32_t n) {
+#if defined(__aarch64__) && defined(__AARCH64EL__)
+  static const bool enabled = REXCVAR_GET(p2_skin_scan_neon);
+  static const uint32_t verify = REXCVAR_GET(p2_skin_scan_neon_verify);
+  static std::atomic<bool> failed{false};
+  static std::atomic<uint32_t> started{0}, checked{0};
+
+  if (enabled && !failed.load(std::memory_order_relaxed) && !p2::ringab::Off87()) {
+    const auto candidate = p2skin::ScanInputNeon(data, n);
+    if (started.load(std::memory_order_relaxed) < verify &&
+        started.fetch_add(1, std::memory_order_relaxed) < verify) {
+      const auto reference = p2skin::ScanInputScalar(data, n);
+      if (candidate.finite != reference.finite || candidate.max_index != reference.max_index) {
+        if (!failed.exchange(true, std::memory_order_relaxed)) {
+          REXLOG_WARN("[p2-skin-scan] NEON mismatch; scalar path restored");
+        }
+      }
+      if (checked.fetch_add(1, std::memory_order_acq_rel) + 1 == verify) {
+        REXLOG_WARN("[p2-skin-scan] NEON verified={} enabled={}", verify,
+                    !failed.load(std::memory_order_relaxed));
+      }
+      return reference;
+    }
+    return candidate;
+  }
+#endif
+  return p2skin::ScanInputScalar(data, n);
+}
+
 static REX_FUNC(P2SkinningDispatch) {
   if (!REXCVAR_GET(p2_skinning_local) || failed.load(std::memory_order_relaxed)) {
     __imp__sub_829F5978(ctx, base); return;
@@ -224,23 +279,11 @@ static REX_FUNC(P2SkinningDispatch) {
   uint32_t max_index = 0;
   // WORKLOG #122: the input's hash (also the cache key's first half) finds an earlier scan of the same bytes.
   const bool use_scan_cache = REXCVAR_GET(p2_skin_scan_cache);
-  const uint64_t input_hash = use_scan_cache ? p2skincache::InputHash(base, input, n) : 0;
+  const uint64_t input_hash = use_scan_cache ? SkinInputHash(base, input, n, 0) : 0;
   if (!use_scan_cache || !p2skincache::ScanLookup(input_hash, input, &max_index)) {
-    bool finite = true;
-    const uint8_t* v = base + input;
-    for (uint32_t i = 0; i < n; ++i, v += 32) {
-      uint32_t xyz[3];
-      std::memcpy(xyz, v, 12);
-      finite &= ((__builtin_bswap32(xyz[0]) & 0x7F800000u) != 0x7F800000u) &
-                ((__builtin_bswap32(xyz[1]) & 0x7F800000u) != 0x7F800000u) &
-                ((__builtin_bswap32(xyz[2]) & 0x7F800000u) != 0x7F800000u);
-      uint16_t idx[4];
-      std::memcpy(idx, v + 12, 8);
-      const uint32_t a = std::max(__builtin_bswap16(idx[0]), __builtin_bswap16(idx[1]));
-      const uint32_t b = std::max(__builtin_bswap16(idx[2]), __builtin_bswap16(idx[3]));
-      max_index = std::max(max_index, std::max(a, b));
-    }
-    if (!finite) {
+    const p2skin::SkinInputScan scan = ScanSkinInput(base + input, n);
+    max_index = scan.max_index;
+    if (!scan.finite) {
       __imp__sub_829F5978(ctx, base); return;
     }
     if (use_scan_cache) p2skincache::ScanStore(input_hash, input, max_index);
@@ -256,6 +299,13 @@ static REX_FUNC(P2SkinningDispatch) {
       if (approx) {
         ctx.fpscr.enableFlushMode();
         const uint32_t bbox_addr = ctx.r7.u32;
+        // PERF pass 81: positions on the CPU, normal/tangent words patched by the renderer on the GPU.
+        const bool gpu_normals = p2::skingpu::Eligible(out, input, n) && !REXCVAR_GET(p2_skin_half_rate);
+        auto publish = [&] {
+          if (gpu_normals)
+            p2::skingpu::Publish(base, out, input, n, palette, max_index,
+                                 p2::skinlog::g_frame.load(std::memory_order_relaxed));
+        };
         auto replayed = [&] {
           p2skincache::StackWords(base, bbox_addr, ctx.r1.u32, uint32_t(ctx.lr), p2skin::kBig);
         };
@@ -264,7 +314,9 @@ static REX_FUNC(P2SkinningDispatch) {
         const bool cache = REXCVAR_GET(p2_skin_cache) && p2skincache::Cacheable(n);
         if (cache) {
           key = p2skincache::Key(
-              base, use_scan_cache ? input_hash : p2skincache::InputHash(base, input, n), palette, max_index);
+              base, use_scan_cache ? input_hash : SkinInputHash(base, input, n, 1), palette, max_index);
+          // Entries stored in GPU-normals mode lack their normal words: never replayed in the other mode.
+          if (gpu_normals) key ^= 0x5C1A9E3D7F4B2861ull;
           const uint64_t calls = p2skincache::g_calls.fetch_add(1, std::memory_order_relaxed) + 1;
           p2skincache::g_vertices.fetch_add(n, std::memory_order_relaxed);
           if (calls % 200000 == 0)
@@ -276,6 +328,7 @@ static REX_FUNC(P2SkinningDispatch) {
                         p2halfrate::g_replayed_vertices.load());
           if (p2skincache::Replay(base, key, n, out, bbox_addr)) {
             replayed();
+            publish();
             p2skincache::g_hits.fetch_add(1, std::memory_order_relaxed);
             p2skincache::g_hit_vertices.fetch_add(n, std::memory_order_relaxed);
             return;
@@ -300,7 +353,8 @@ static REX_FUNC(P2SkinningDispatch) {
           }
         }
         p2skin::Skin(base, out, input, n, palette, bbox_addr, ctx.r1.u32, uint32_t(ctx.lr), max_index,
-                     ParallelRunner(), true);
+                     ParallelRunner(), true, gpu_normals);
+        publish();
         if (cache) p2skincache::Store(base, key, n, out, bbox_addr);
         if (crowd) p2halfrate::Remember(base, id, n, out, bbox_addr, frame);
         return;

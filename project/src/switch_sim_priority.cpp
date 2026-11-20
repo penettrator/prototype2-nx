@@ -536,6 +536,13 @@ REXCVAR_DEFINE_UINT32(p2_min_present_interval, 2, "Prototype2",
     "30 fps, 1 = 60); only slower frames flip at once instead of at the next vblank")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// PERF pass 82: the game asks for present interval 1/2/3 (WORKLOG #82); run 173 sat at exactly 20.0 fps for 4 min in
+// the main menu with CPU at 60-70 % - interval 3 is the likely request there (HYPOTHESIS). 0 = the game's interval;
+// N = requests above N are treated as N (2 = the menu capped at 30 like gameplay).
+REXCVAR_DEFINE_UINT32(p2_max_present_interval, 0, "Prototype2",
+    "With p2_immediate_flip: cap the game's requested present interval at this many vblanks (0 = the game's own)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 extern "C" void p2_quality_frame();  // switch_quality.cpp
 extern "C" void p2_timeline_frame();  // switch_timeline.cpp
 
@@ -583,12 +590,16 @@ extern "C" uint32_t p2_flip_target(uint32_t target, uint32_t now, uint32_t inter
   if (interval != last_interval || threshold != last_threshold) {
     last_interval = interval;
     last_threshold = threshold;
-    REXLOG_INFO("[flip] present interval {} late threshold {}% (target {} now {} last {})", interval,
-                threshold, target, now, last_flip);
+    static uint32_t changes = 0;
+    if (++changes <= 64 || changes % 256 == 0)
+      REXLOG_WARN("[flip] present interval {} late threshold {}% (target {} now {} last {}), cap {}, change {}",
+                  interval, threshold, target, now, last_flip, REXCVAR_GET(p2_max_present_interval), changes);
   }
   uint32_t result = target;
   if (REXCVAR_GET(p2_immediate_flip)) {
-    const uint32_t cap = last_flip + std::max<uint32_t>(interval, REXCVAR_GET(p2_min_present_interval));
+    const uint32_t max_interval = REXCVAR_GET(p2_max_present_interval);
+    const uint32_t wanted = max_interval && interval > max_interval ? max_interval : interval;
+    const uint32_t cap = last_flip + std::max<uint32_t>(wanted, REXCVAR_GET(p2_min_present_interval));
     if (int32_t(cap - now) > 0) {
       result = cap;  // faster than the cap: flip at that vblank (frame rate limit, even pacing)
       ++capped;

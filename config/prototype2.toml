@@ -1,4 +1,4 @@
-# Prototype 2 / Nintendo Switch — version 0.5.0
+# Prototype 2 / Nintendo Switch — version 1.0
 # Release settings; diagnostics disabled. / Диагностика выключена.
 render_target_path_vulkan = "fsi"
 user_language = 12
@@ -20,7 +20,7 @@ p2_native_resolve_xenia_pack = true
 p2_native_auto_capture_draws = 0
 p2_native_gpu_profile = false
 p2_native_work_stats = false
-p2_native_max_anisotropy = 1
+p2_native_max_anisotropy = 2
 p2_native_gpu_profile_draws = false
 p2_msr_lock_mode = 5
 p2_guest_priorities = false
@@ -60,9 +60,9 @@ p2_native_motion_blur = false
 p2_native_edge_blur = false
 p2_ped_max_scale = 0.3
 p2_vehicle_max_scale = 0.15
-p2_geo_lod_bias_scale = 4.0
-p2_ring_wait_sleep_us = 50
-p2_skinning_parallel_min = 128
+p2_geo_lod_bias_scale = 6.0
+p2_ring_wait_sleep_us = 20
+p2_skinning_parallel_min = 64
 p2_skinning_helper_priority = 42
 p2_skinning_helper_spin_us = 150
 p2_collision_diagnostics = false
@@ -104,7 +104,7 @@ masseffect_io_warning_ms = 0
 masseffect_io_summary_s = 0
 p2_native_staging_pool_mb = 16
 p2_frame_pacing_report = false
-p2_resource_failure_probe = false
+p2_resource_failure_probe = true
 p2_stream_heap_margin_kib = 0
 p2_native_reap_unused_streams = true
 
@@ -116,7 +116,7 @@ p2_stream_arena_overflow_cap_mb = 96
 
 # Performance (0.3.0): texture memory pool, ring read pointer write-back, WAIT_REG_MEM poll sleep.
 p2_native_texture_pool = true
-p2_native_rptr_writeback_words = 64
+p2_native_rptr_writeback_words = 16
 p2_native_wait_reg_mem_sleep_us = 10
 
 # Performance (0.3.0): lock-free interrupt-region sets for the hottest job-system functions.
@@ -166,3 +166,48 @@ p2_native_merge_set_binds = true
 audio_xma_fast_reset = true
 p2_memcpy_native = 1
 p2_native_resolve_cpu_writeback = true
+
+# 1.0: settings of the 1.0 release (performance, video planes, memory, crash report on allocation failure).
+p2_arena2_block_fallback = true
+p2_mm_available_reserve_mb = 32
+kernel_tls_fast_path = true
+p2_nvk_dyn_pair_cache = true
+p2_native_tb_key_gen = true
+p2_native_tb_key_verify = 0
+p2_native_texture_trim_sort_guard = true
+p2_native_range_lookup_memo = true
+p2_native_range_lookup_verify = 0
+p2_native_sparse_record_copy = true
+p2_native_sparse_record_verify = 0
+p2_native_setup_pointer_cache = true
+p2_native_depth_fragment_resolve = true
+p2_native_depth_max_attachment_only = true
+p2_native_shadow_atlas_fragment = true
+p2_native_scene_r11g11b10 = false
+p2_native_stream_guard_cache = true
+p2_native_stream_guard_verify = 0
+p2_native_shader_role_cache = true
+p2_native_float_constant_runs = true
+p2_native_system_cpu_cache = true
+p2_native_system_cpu_verify = 0
+p2_wait_borrow_conditions = true
+p2_native_copy_full_groups = false
+p2_native_merge_stencil_faces = false
+p2_native_untile_bc16_table = false
+p2_native_prewarm_spirv_cache = false
+p2_semaphore_empty_poll_fast = true
+p2_ribbon_locals = true
+p2_ribbon_ab_period_s = 0
+p2_pair_locals = true
+p2_pair_ab_period_s = 0
+p2_physics_substeps = 1
+p2_skin_gpu_normals = true
+p2_skin_gpu_normals_verify = 0
+p2_max_present_interval = 2
+p2_native_fast_constant_writes = true
+p2_native_fast_constant_verify = 0
+p2_native_lookup_front = true
+p2_native_lookup_front_verify = 0
+p2_native_wait_rptr_writeback = true
+p2_native_exact_video_planes = true
+p2_dev_telemetry = false

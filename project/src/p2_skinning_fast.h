@@ -189,6 +189,105 @@ inline void SkinRange(uint8_t* base, const simde__m128* rows, const Consts& c, u
   }
 }
 
+// PERF pass 81 (GPU normals, p2_skin_gpu_normals): the approx path's per-vertex work split in two.
+// ApproxVertex: everything up to the outputs, from the vertex's 32 input bytes (guest order) and the rows.
+struct ApproxOut {
+  simde__m128 pos;
+  simde__m128i v17, p10;
+};
+// p0/p1: the two 16-byte blocks SkinRange loads (base + (r4 & ~15), base + ((r4 + 16) & ~15)); pidx: r4 + 12.
+template <bool Normals>
+inline ApproxOut ApproxVertex(const uint8_t* p0, const uint8_t* p1, const uint8_t* pidx, const simde__m128* rows,
+                              const Consts& c) {
+  const simde__m128i v0i = c.v0i, v2 = c.v2, v7 = c.v7, v13 = c.v13, v14 = c.v14;
+  const simde__m128 v1 = c.v1, v3 = c.v3, v4 = c.v4, v8 = c.v8, v9 = c.v9;
+  uint32_t m[4];
+  for (int b = 0; b < 4; ++b) m[b] = Load16BE(pidx + 2 * b);
+  const simde__m128 q0 = simde_mm_castsi128_ps(LoadBE(p0));
+  const simde__m128i q1 = LoadBE(p1);
+  const simde__m128i v76 = simde_mm_and_si128(q1, v13);
+  simde__m128i v59 = simde_mm_slli_si128(q1, 4);
+  simde__m128i v56 = simde_mm_srli_epi32(v59, 10);
+  simde__m128i v53 = simde_mm_and_si128(v59, v7);
+  v59 = simde_mm_srli_epi32(v56, 10);
+  v56 = simde_mm_and_si128(v56, v7);
+  simde__m128 n53 = simde_mm_cvtepi32_ps(v53);
+  v59 = simde_mm_and_si128(v59, v7);
+  simde__m128 t56 = simde_mm_cvtepi32_ps(v56);
+  simde__m128 w59 = simde_mm_cvtepi32_ps(v59);
+  n53 = simde_mm_mul_ps(n53, v4);
+  t56 = simde_mm_mul_ps(t56, v4);
+  w59 = simde_mm_mul_ps(w59, v3);
+  n53 = simde_mm_sub_ps(n53, v1);
+  t56 = simde_mm_sub_ps(t56, v1);
+  auto spl = [](simde__m128 v, int imm) {
+    return simde_mm_castsi128_ps(simde_mm_shuffle_epi32(simde_mm_castps_si128(v), imm));
+  };
+  const simde__m128 w0 = spl(w59, 0xFF), w1 = spl(w59, 0xAA), w2 = spl(w59, 0x55);
+  const simde__m128 px = spl(q0, 0xFF), py = spl(q0, 0xAA), pz = spl(q0, 0x55);
+  simde__m128 w3 = simde_mm_add_ps(simde_mm_add_ps(simde_mm_add_ps(simde_mm_castsi128_ps(simde_mm_setzero_si128()), w0), w1), w2);
+  w3 = simde_mm_sub_ps(v1, w3);
+  const simde__m128* R0 = &rows[m[0] * 4];
+  const simde__m128* R1 = &rows[m[1] * 4];
+  const simde__m128* R2 = &rows[m[2] * 4];
+  const simde__m128* R3 = &rows[m[3] * 4];
+  simde__m128 M[4];
+  for (int r = 0; r < 4; ++r)
+    M[r] = simde_mm_add_ps(simde_mm_add_ps(simde_mm_mul_ps(R0[r], w0), simde_mm_mul_ps(R1[r], w1)),
+                           simde_mm_add_ps(simde_mm_mul_ps(R2[r], w2), simde_mm_mul_ps(R3[r], w3)));
+  ApproxOut o;
+  o.pos = simde_mm_add_ps(simde_mm_add_ps(simde_mm_mul_ps(px, M[0]), simde_mm_mul_ps(py, M[1])),
+                          simde_mm_add_ps(simde_mm_mul_ps(pz, M[2]), M[3]));
+  o.v17 = P2_VMX_PERMUTE(simde_mm_castps_si128(o.pos), v0i, v2);
+  if constexpr (Normals) {
+    const simde__m128 nx = spl(n53, 0xFF), ny = spl(n53, 0xAA), nz = spl(n53, 0x55);
+    const simde__m128 tx = spl(t56, 0xFF), ty = spl(t56, 0xAA), tz = spl(t56, 0x55);
+    const simde__m128 nrm = simde_mm_add_ps(simde_mm_add_ps(simde_mm_mul_ps(nx, M[0]), simde_mm_mul_ps(ny, M[1])), simde_mm_mul_ps(nz, M[2]));
+    const simde__m128 tan = simde_mm_add_ps(simde_mm_add_ps(simde_mm_mul_ps(tx, M[0]), simde_mm_mul_ps(ty, M[1])), simde_mm_mul_ps(tz, M[2]));
+    simde__m128 v10 = simde_mm_dp_ps(nrm, nrm, 0xEF);
+    v10 = simde_mm_set1_ps(1.0f / __builtin_sqrtf(simde_mm_cvtss_f32(v10)));
+    simde__m128 v11 = simde_mm_mul_ps(nrm, v10);
+    const simde__m128 v12 = simde_mm_mul_ps(tan, v10);
+    v10 = simde_mm_add_ps(simde_mm_mul_ps(v11, v9), v8);
+    v11 = simde_mm_add_ps(simde_mm_mul_ps(v12, v9), v8);
+    simde__m128i p10 = Pack2101010(v10, 3, simde_mm_castps_si128(v10));
+    const simde__m128i p11 = Pack2101010(v11, 2, simde_mm_castps_si128(v11));
+    p10 = simde_mm_or_si128(simde_mm_andnot_si128(v14, p10), simde_mm_and_si128(v14, p11));
+    o.p10 = simde_mm_or_si128(p10, v76);
+  } else {
+    o.p10 = simde_mm_setzero_si128();
+  }
+  return o;
+}
+
+// The 8 bytes the approx path leaves at out + 24 * k + 16 (packed normal and tangent words), for one vertex.
+// `base`/`in`/`k` as SkinRange (guest memory, input address, vertex index).
+inline void ApproxNormalWords(const uint8_t* base, uint32_t in, uint32_t k, const simde__m128* rows, const Consts& c,
+                              uint8_t out8[8]) {
+  const uint32_t r4 = in + 32 * k;
+  StoreBE8(out8, ApproxVertex<true>(base + (r4 & ~15u), base + (uint32_t(r4 + 16) & ~15u), base + uint32_t(r4 + 12),
+                                    rows, c).p10);
+}
+
+// Positions only: the first 16-byte store of each vertex and the bounds, as SkinRange<true>; bytes +16..+23
+// are left for the GPU (ApproxNormalWords). The call's last vertex is written in full (its store spills 8 bytes
+// past the output, which the GPU patch does not cover).
+inline void SkinRangePositions(uint8_t* base, const simde__m128* rows, const Consts& c, uint32_t in,
+                               uint32_t out, uint32_t k0, uint32_t k1, uint32_t n, simde__m128& v32,
+                               simde__m128& v33) {
+  const uint32_t stop = std::min(k1, n - 1);
+  uint32_t r4 = in + 32 * k0, r3 = out + 24 * k0;
+  for (uint32_t k = k0; k < stop; ++k, r4 += 32, r3 += 24) {
+    __builtin_prefetch(base + uint32_t(r4 + 256));
+    const ApproxOut o = ApproxVertex<false>(base + (r4 & ~15u), base + (uint32_t(r4 + 16) & ~15u),
+                                            base + uint32_t(r4 + 12), rows, c);
+    v32 = simde_mm_min_ps(v32, o.pos);
+    v33 = simde_mm_max_ps(v33, o.pos);
+    StoreBE(base + r3, o.v17);
+  }
+  if (k1 == n && k0 < n) SkinRange<true>(base, rows, c, in, out, std::max(k0, n - 1), n, n, v32, v33);
+}
+
 // out = r3, in = r4, n = r5 (>= 2), palette = r6, bbox = r7, sp = r1, lr = ctx.lr. Guest memory at `base`.
 // `run(n, range)` runs range(k0, k1, v32, v33) over [0, n) and returns the folded bounds (sequential by default;
 // switch_skinning.cpp splits big meshes with a helper thread: same per-vertex operations, min/max fold order
@@ -199,7 +298,8 @@ struct Sequential {
 };
 template <class Run = Sequential>
 inline void Skin(uint8_t* base, uint32_t out, uint32_t in, uint32_t n, uint32_t palette, uint32_t bbox,
-                 uint32_t sp, uint32_t lr, uint32_t max_index = UINT32_MAX, const Run& run = Run(), bool approx = false) {
+                 uint32_t sp, uint32_t lr, uint32_t max_index = UINT32_MAX, const Run& run = Run(), bool approx = false,
+                 bool positions_only = false) {
   // Prologue and constant helper: the stack words it leaves.
   Store32BE(base + uint32_t(sp - 16), bbox);
   Store32BE(base + uint32_t(sp - 8), lr);
@@ -230,11 +330,22 @@ inline void Skin(uint8_t* base, uint32_t out, uint32_t in, uint32_t n, uint32_t 
       rows[i * 4 + r] = simde_mm_castsi128_ps(LoadBE(base + (uint32_t(mb + 16 * r) & ~15u)));
   }
   run(n, [&](uint32_t k0, uint32_t k1, simde__m128& lo, simde__m128& hi) {
-    if (approx) SkinRange<true>(base, rows, c, in, out, k0, k1, n, lo, hi);
+    if (approx && positions_only) SkinRangePositions(base, rows, c, in, out, k0, k1, n, lo, hi);
+    else if (approx) SkinRange<true>(base, rows, c, in, out, k0, k1, n, lo, hi);
     else SkinRange<false>(base, rows, c, in, out, k0, k1, n, lo, hi);
   }, v32, v33);
   StoreBE(base + (bbox & ~15u), simde_mm_castps_si128(v32));
   StoreBE(base + (uint32_t(bbox + 16) & ~15u), simde_mm_castps_si128(v33));
+}
+
+// The rows Skin uses (bones 0..max_index of `palette`), for the normal-word work done elsewhere (pass 81).
+inline void BuildRows(const uint8_t* base, uint32_t palette, uint32_t max_index, std::vector<simde__m128>& rows) {
+  rows.resize(size_t(max_index + 1) * 4);
+  for (uint32_t i = 0; i <= max_index; ++i) {
+    const uint32_t mb = __builtin_rotateleft32(i, 6) + palette;
+    for (uint32_t r = 0; r < 4; ++r)
+      rows[i * 4 + r] = simde_mm_castsi128_ps(LoadBE(base + (uint32_t(mb + 16 * r) & ~15u)));
+  }
 }
 
 }  // namespace p2skin

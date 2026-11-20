@@ -22,6 +22,8 @@
 #include "p2_native_system.h"
 #include "../guest_pacing_stats.h"
 #include "native_renderer.h"
+#include "constant_writes.h"
+#include "ring_ab.h"
 
 #include <algorithm>
 #include <atomic>
@@ -99,11 +101,28 @@ REXCVAR_DEFINE_UINT32(p2_msr_lock_mode, 2, "Prototype2",
                       "run19/21), 1 = one lock per address stripe, 2 = the SDK's single global mutex (slowest)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// PERF pass 75: shader-constant register writes (WriteRegisters) without per-word reloads of the reader and the
+// register pointer (constant_writes.h). Same registers, change flags and reader position; the first
+// p2_native_fast_constant_verify calls also run the original loop on a copy and fall back on any difference.
+REXCVAR_DEFINE_BOOL(p2_native_fast_constant_writes, false, "Prototype2",
+                    "Shader-constant register writes from the ring in one pass with local stream state; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(p2_native_fast_constant_verify, 20000, "Prototype2",
+                      "With p2_native_fast_constant_writes: compare this many first calls against the original loop")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_UINT32(p2_native_rptr_writeback_words, 0, "Prototype2",
     "Write the ring read pointer back to the game every this many consumed words within a batch "
     "(the game waits for ring space on it); 0 = only at the end of each batch (previous behaviour)");
 REXCVAR_DEFINE_UINT32(p2_native_rptr_writeback_alt_words, 0, "Prototype2",
     "With p2_native_rptr_ab_period_s: p2_native_rptr_writeback_words of the odd periods (0 = end of batch)");
+// PERF pass 89 (run 183 profile: the simulation thread slept 20 % in D3D's wait for ring space while the ring
+// thread slept 25 % in WAIT_REG_MEM): the read pointer was published every p2_native_rptr_writeback_words and at
+// the end of a batch only, so during a WAIT_REG_MEM the game could see up to that many consumed words as still in
+// use. With this flag the ring publishes its read pointer (the end of the packet being executed, already read)
+// when a WAIT_REG_MEM starts waiting. In-run A/B: p2_native_set87_ab_period_s (odd periods off).
+REXCVAR_DEFINE_BOOL(p2_native_wait_rptr_writeback, false, "Prototype2",
+    "Publish the ring read pointer when a PM4 WAIT_REG_MEM has to wait (restart not required)");
 REXCVAR_DEFINE_UINT32(p2_native_wait_reg_mem_sleep_us, 50, "Prototype2",
     "Sleep per poll of a PM4 WAIT_REG_MEM after 64 yields (us); 50 = previous fixed value");
 REXCVAR_DEFINE_UINT32(p2_native_wait_reg_mem_sleep_alt_us, 50, "Prototype2",
@@ -413,6 +432,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   // the register traffic (every draw sets its matrices), skip the per-register
   // call and switch: a changed one only bumps a counter in the renderer.
   void WriteRegisters(uint32_t index, uint32_t count, Reader& data) {
+    if (index >= 0x4000 && index + count <= 0x4928 && FastConstantWrites() && !p2::ringab::Off()) {
+      WriteConstantsFast(index, count, data);
+      return;
+    }
     if (index >= 0x4000 && index + count <= 0x4928) {
       bool vs_float = false, ps_float = false, bool_loop = false;
       uint32_t fetch_slots = 0;
@@ -437,6 +460,45 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     for (uint32_t i = 0; i < count; ++i) {
       WriteRegister(index + i, data.Read());
     }
+  }
+
+  // PERF pass 75 (p2_native_fast_constant_writes): read once, the flag is init-only.
+  bool FastConstantWrites() {
+    if (fast_constant_state_ < 0) {
+      fast_constant_state_ = REXCVAR_GET(p2_native_fast_constant_writes) ? 1 : 0;
+      fast_constant_verify_left_ = REXCVAR_GET(p2_native_fast_constant_verify);
+      if (fast_constant_state_ && fast_constant_verify_left_) fast_constant_scratch_.assign(kRegisterCount, 0);
+      REXLOG_WARN("[native] PERF75 fast constant writes={} verify={}", fast_constant_state_ == 1,
+                  fast_constant_verify_left_);
+    }
+    return fast_constant_state_ == 1;
+  }
+  void WriteConstantsFast(uint32_t index, uint32_t count, Reader& data) {
+    namespace cw = constant_writes;
+    cw::Changes changes;
+    if (fast_constant_verify_left_) {
+      --fast_constant_verify_left_;
+      uint32_t* ref = fast_constant_scratch_.data();
+      std::memcpy(ref + index, registers_ + index, size_t(count) * sizeof(uint32_t));
+      cw::Changes ref_changes;
+      const uint32_t ref_pos = cw::Reference(ref, index, count, data.base, data.mask, data.pos, ref_changes);
+      const uint32_t pos = cw::Fast(registers_, index, count, data.base, data.mask, data.pos, changes);
+      if (pos != ref_pos || !(changes == ref_changes) ||
+          std::memcmp(ref + index, registers_ + index, size_t(count) * sizeof(uint32_t)) != 0) {
+        REXLOG_WARN("[native] PERF75 fast constant writes mismatch at {:04X}+{}; original loop restored", index,
+                    count);
+        std::memcpy(registers_ + index, ref + index, size_t(count) * sizeof(uint32_t));
+        changes = ref_changes;
+        data.pos = ref_pos;
+        fast_constant_state_ = 0;
+      } else {
+        data.pos = pos;
+        if (!fast_constant_verify_left_) REXLOG_WARN("[native] PERF75 fast constant writes verified");
+      }
+    } else {
+      data.pos = cw::Fast(registers_, index, count, data.base, data.mask, data.pos, changes);
+    }
+    renderer_.ConstantsWritten(changes.vs_float, changes.ps_float, changes.fetch_slots, changes.bool_loop);
   }
 
   void WriteRegister(uint32_t index, uint32_t value) {
@@ -631,6 +693,8 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       // RB_CNTL block, not only at its end: the game's D3D waits for ring space on this word.
       const uint32_t writeback_words = RingWritebackWords();
       uint32_t written_back = read;
+      ring_reader_ = &reader;
+      ring_written_back_ = &written_back;
       while (reader.Pending()) {
         if (renderer_ready_ && (packets_ & 63u)==0) renderer_.PollOcclusionQueries();
         if (!Packet(reader, 0)) {
@@ -644,6 +708,8 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           written_back = reader.pos;
         }
       }
+      ring_reader_ = nullptr;
+      ring_written_back_ = nullptr;
       read = reader.pos;
       const uint32_t writeback = read_pointer_writeback_.load(std::memory_order_acquire);
       if (writeback) {
@@ -928,6 +994,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
             gpu_wait_blocked=P2GpuWaitBegin(gpu_wait_kind);
           }
           if(renderer_ready_ && (attempt & 63u)==0)renderer_.PollOcclusionQueries(true);
+          if (!waited) PublishReadPointerForWait();  // PERF pass 89
           if (!waited && renderer_ready_) {
             // Idle time: let the draw recording thread empty its queue.
             renderer_.KickRecorder();
@@ -1620,6 +1687,22 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   std::atomic<uint32_t> ring_generation_{0};
   std::atomic<uint32_t> write_pointer_{0};
   std::atomic<uint32_t> read_pointer_writeback_{0};
+  // PERF pass 89: the ring batch reader and its last published position while a batch is consumed (ring thread).
+  const Reader* ring_reader_ = nullptr;
+  uint32_t* ring_written_back_ = nullptr;
+  uint64_t wait_rptr_published_ = 0;
+  void PublishReadPointerForWait() {
+    if (!ring_reader_ || !ring_written_back_ || p2::ringab::Off87()) return;
+    static const bool enabled = REXCVAR_GET(p2_native_wait_rptr_writeback);
+    if (!enabled) return;
+    const uint32_t pos = ring_reader_->pos;
+    if (pos == *ring_written_back_) return;
+    if (const uint32_t wb = read_pointer_writeback_.load(std::memory_order_acquire)) {
+      rex::memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(wb), pos);
+      *ring_written_back_ = pos;
+      if (wait_rptr_published_++ == 0) REXLOG_WARN("[native] PERF89 read pointer published at a WAIT_REG_MEM");
+    }
+  }
   // p2_native_rptr_writeback_words, or in-run A/B by p2_native_rptr_ab_period_s (even periods: words,
   // odd periods: 0 = only at the end of a batch, the previous behaviour). Same clock as frame_pacing.csv.
   static uint32_t RingWritebackWords() {
@@ -1662,6 +1745,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   // so its helpers (draw_util and the rest) work on it unchanged.
   std::unique_ptr<rex::graphics::RegisterFile> register_file_;
   uint32_t* registers_;
+  int8_t fast_constant_state_ = -1;  // PERF pass 75: -1 = flag not read yet
+  uint32_t fast_constant_verify_left_ = 0;
+  std::vector<uint32_t> fast_constant_scratch_;
   Renderer renderer_;
   bool renderer_ready_ = false;
   // Packet history for the water diagnostic (Renderer::water_dump_enabled).

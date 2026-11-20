@@ -2,7 +2,7 @@
 # 39-bit full-application NSP forwarder (HOME menu icon) for sdmc:/switch/Prototype2/prototype2.nro.
 # Adapted from reference/masseffect-nx/tools/build_nsp.sh (Forwarder-Mod + hacBrewPack, pinned commits).
 # Usage: SWITCH_PROD_KEYS=/path/prod.keys tools/build_forwarder.sh <release.nro> <output-dir>
-# The icon and version 0.4.0 NACP are taken from the release NRO.
+# The icon and version 1.0 NACP are taken from the release NRO. Automatic video recording is off (NACP).
 set -euo pipefail
 NRO="$1"; OUT="$2"
 KEYS="${SWITCH_PROD_KEYS:?set SWITCH_PROD_KEYS to your own prod.keys}"
@@ -45,7 +45,7 @@ nacp = bytearray((control / "control.nacp").read_bytes())
 assert len(nacp) == 0x4000
 nacp[0x3025] = 0  # StartupUserAccount: None (saves are files on SD)
 nacp[0x3034] = 0  # screenshots enabled
-nacp[0x3035] = 2  # video capture enabled
+nacp[0x3035] = 0  # automatic video recording off (its 96 MiB buffer came out of game memory)
 nacp[0x3080:0x3090] = bytes(16)
 (control / "control.nacp").write_bytes(nacp)
 p = root / "loader/hbl.json"; j = json.loads(p.read_text())
@@ -99,7 +99,7 @@ for src, dst in (("control/control.nacp", "control.nacp"), ("exefs/main.npdm", "
     pathlib.Path("/output", dst).write_bytes(pathlib.Path(src).read_bytes())
 nacp = pathlib.Path("control/control.nacp").read_bytes()
 version = nacp[0x3060:0x3070].split(bytes([0]))[0].decode()
-assert version == "0.5.0"
+assert version == "1.0"
 checks.update(version=version, title_id=__import__("os").environ["TITLE_ID"], address_space_type=3,
               nro_path=__import__("os").environ["NRO_SD_PATH"])
 pathlib.Path("/output/forwarder-validation.json").write_text(json.dumps(checks, indent=2)+"\n")

@@ -2809,8 +2809,203 @@ index e63104958c0..863317d45dd 100644
 +#endif
     .cmd_bind_shaders = nvk_cmd_bind_shaders,
  };
+diff --git a/src/vulkan/runtime/vk_graphics_state.c b/src/vulkan/runtime/vk_graphics_state.c
+index 990c3d5f378..0af808a8398 100644
+--- a/src/vulkan/runtime/vk_graphics_state.c
++++ b/src/vulkan/runtime/vk_graphics_state.c
+@@ -2158,7 +2158,14 @@ vk_dynamic_graphics_state_fill(struct vk_dynamic_graphics_state *dyn,
+    BITSET_AND(dyn->set, dyn->set, needed);
+ }
+ 
++#ifdef P2_NVK_DYN_PAIR_CACHE
++#define P2_TOUCH(dst, STATE) BITSET_SET((dst)->p2_touched, MESA_VK_DYNAMIC_##STATE)
++#else
++#define P2_TOUCH(dst, STATE) do { } while (0)
++#endif
++
+ #define SET_DYN_VALUE(dst, STATE, state, value) do {        \
++   P2_TOUCH(dst, STATE);                                    \
+    if (!BITSET_TEST((dst)->set, MESA_VK_DYNAMIC_##STATE) || \
+        (dst)->state != (value)) {                           \
+       (dst)->state = (value);                               \
+@@ -2175,6 +2182,7 @@ vk_dynamic_graphics_state_fill(struct vk_dynamic_graphics_state *dyn,
+    assert(start + count <= ARRAY_SIZE((dst)->state));             \
+    STATIC_ASSERT(sizeof(*(dst)->state) == sizeof(*(src)));        \
+    const size_t __state_size = sizeof(*(dst)->state) * (count);   \
++   P2_TOUCH(dst, STATE);                                          \
+    if (!BITSET_TEST((dst)->set, MESA_VK_DYNAMIC_##STATE) ||       \
+        memcmp((dst)->state + start, src, __state_size)) {         \
+       memcpy((dst)->state + start, src, __state_size);            \
+@@ -2183,12 +2191,16 @@ vk_dynamic_graphics_state_fill(struct vk_dynamic_graphics_state *dyn,
+    }                                                              \
+ } while(0)
+ 
+-void
+-vk_dynamic_graphics_state_copy(struct vk_dynamic_graphics_state *dst,
+-                               const struct vk_dynamic_graphics_state *src)
++/* The copy of the state bits in `mask` (src->set for a normal copy); the set/dirty bookkeeping at the end is
++ * always for all of src->set. A bit of src->set outside `mask` must already hold src's values in dst.
++ */
++static inline void
++vk_dynamic_graphics_state_copy_masked(struct vk_dynamic_graphics_state *dst,
++                                      const struct vk_dynamic_graphics_state *src,
++                                      const BITSET_WORD *mask)
+ {
+ #define IS_SET_IN_SRC(STATE) \
+-   BITSET_TEST(src->set, MESA_VK_DYNAMIC_##STATE)
++   BITSET_TEST(mask, MESA_VK_DYNAMIC_##STATE)
+ 
+ #define COPY_MEMBER(STATE, state) \
+    SET_DYN_VALUE(dst, STATE, state, src->state)
+@@ -2417,11 +2429,115 @@ vk_dynamic_graphics_state_copy(struct vk_dynamic_graphics_state *dst,
+    }
+ }
+ 
++void
++vk_dynamic_graphics_state_copy(struct vk_dynamic_graphics_state *dst,
++                               const struct vk_dynamic_graphics_state *src)
++{
++   vk_dynamic_graphics_state_copy_masked(dst, src, src->set);
++}
++
++#ifdef P2_NVK_DYN_PAIR_CACHE
++int p2_nvk_dyn_pair_cache = 0;
++uint32_t p2_nvk_dyn_pipeline_epoch = 0;
++uint64_t p2_nvk_dyn_pair_stats[4]; /* fast, miss (computed), fallback (no prev/touched/epoch), disabled */
++
++#define P2_DYN_WORDS BITSET_WORDS(MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX)
++struct p2_dyn_pair {
++   const struct vk_dynamic_graphics_state *prev, *next;
++   uint32_t epoch;
++   BITSET_WORD diff[P2_DYN_WORDS];
++};
++#define P2_DYN_PAIRS 1024
++static __thread struct p2_dyn_pair *p2_dyn_pairs;
++
++/* The bits of next->set a copy would change in a destination that holds exactly what the copy of `prev` left
++ * (nothing written since): bits prev did not have; bits whose member ranges depend on counts that differ; and
++ * bits whose values differ in the range copied. Found with the copy itself, into a scratch holding prev's
++ * values.
++ */
++static void
++p2_dyn_pair_diff(const struct vk_dynamic_graphics_state *prev,
++                 const struct vk_dynamic_graphics_state *next,
++                 BITSET_WORD *diff)
++{
++   struct vk_dynamic_graphics_state scratch = *prev;
++   struct vk_vertex_input_state vi;
++   struct vk_sample_locations_state sl;
++   if (prev->vi) { vi = *prev->vi; scratch.vi = &vi; }
++   else { memset(&vi, 0, sizeof(vi)); scratch.vi = &vi; }
++   if (prev->ms.sample_locations) { sl = *prev->ms.sample_locations; scratch.ms.sample_locations = &sl; }
++   else { memset(&sl, 0, sizeof(sl)); scratch.ms.sample_locations = &sl; }
++   BITSET_ZERO(scratch.dirty);
++   vk_dynamic_graphics_state_copy_masked(&scratch, next, next->set);
++   for (uint32_t w = 0; w < P2_DYN_WORDS; w++)
++      diff[w] = scratch.dirty[w] | (next->set[w] & ~prev->set[w]);
++
++#define P2_RANGE_DIFF(STATE, cond) \
++   if (BITSET_TEST(next->set, MESA_VK_DYNAMIC_##STATE) && (cond)) BITSET_SET(diff, MESA_VK_DYNAMIC_##STATE)
++   const bool vi_range = (prev->vi == NULL) != (next->vi == NULL) ||
++      (prev->vi && next->vi && (prev->vi->bindings_valid != next->vi->bindings_valid ||
++                                prev->vi->attributes_valid != next->vi->attributes_valid));
++   P2_RANGE_DIFF(VI, vi_range);
++   P2_RANGE_DIFF(VI_BINDING_STRIDES, prev->vi_bindings_valid != next->vi_bindings_valid);
++   P2_RANGE_DIFF(VP_VIEWPORTS, prev->vp.viewport_count != next->vp.viewport_count);
++   P2_RANGE_DIFF(VP_SCISSORS, prev->vp.scissor_count != next->vp.scissor_count);
++   P2_RANGE_DIFF(DR_RECTANGLES, prev->dr.rectangle_count != next->dr.rectangle_count);
++   const bool sl_range = (prev->ms.sample_locations == NULL) != (next->ms.sample_locations == NULL) ||
++      (prev->ms.sample_locations && next->ms.sample_locations &&
++       (prev->ms.sample_locations->per_pixel != next->ms.sample_locations->per_pixel ||
++        prev->ms.sample_locations->grid_size.width != next->ms.sample_locations->grid_size.width ||
++        prev->ms.sample_locations->grid_size.height != next->ms.sample_locations->grid_size.height));
++   P2_RANGE_DIFF(MS_SAMPLE_LOCATIONS, sl_range);
++   const bool cb_range = prev->cb.attachment_count != next->cb.attachment_count;
++   P2_RANGE_DIFF(CB_BLEND_ENABLES, cb_range);
++   P2_RANGE_DIFF(CB_BLEND_EQUATIONS, cb_range);
++   P2_RANGE_DIFF(CB_WRITE_MASKS, cb_range);
++   P2_RANGE_DIFF(CB_BLEND_ADVANCED, cb_range);
++#undef P2_RANGE_DIFF
++}
++#endif
++
+ void
+ vk_cmd_set_dynamic_graphics_state(struct vk_command_buffer *cmd,
+                                   const struct vk_dynamic_graphics_state *state)
+ {
++#ifdef P2_NVK_DYN_PAIR_CACHE
++   struct vk_dynamic_graphics_state *dst = &cmd->dynamic_graphics_state;
++   if (!p2_nvk_dyn_pair_cache) {
++      vk_dynamic_graphics_state_copy(dst, state);
++      p2_nvk_dyn_pair_stats[3]++;
++      return;
++   }
++   const uint32_t epoch = __atomic_load_n(&p2_nvk_dyn_pipeline_epoch, __ATOMIC_ACQUIRE);
++   const struct vk_dynamic_graphics_state *prev = dst->p2_last_src;
++   bool clean = prev != NULL && dst->p2_last_epoch == epoch;
++   for (uint32_t w = 0; clean && w < P2_DYN_WORDS; w++)
++      clean = (dst->p2_touched[w] & (prev->set[w] | state->set[w])) == 0;
++   if (clean && !p2_dyn_pairs)
++      p2_dyn_pairs = calloc(P2_DYN_PAIRS, sizeof(*p2_dyn_pairs));
++   if (clean && p2_dyn_pairs) {
++      const uintptr_t h = ((uintptr_t)prev >> 4) * 0x9E3779B1u ^ ((uintptr_t)state >> 4);
++      struct p2_dyn_pair *e = &p2_dyn_pairs[(h ^ (h >> 13)) & (P2_DYN_PAIRS - 1)];
++      if (e->prev == prev && e->next == state && e->epoch == epoch) {
++         p2_nvk_dyn_pair_stats[0]++;
++      } else {
++         e->prev = prev;
++         e->next = state;
++         e->epoch = epoch;
++         p2_dyn_pair_diff(prev, state, e->diff);
++         p2_nvk_dyn_pair_stats[1]++;
++      }
++      vk_dynamic_graphics_state_copy_masked(dst, state, e->diff);
++   } else {
++      vk_dynamic_graphics_state_copy(dst, state);
++      p2_nvk_dyn_pair_stats[2]++;
++   }
++   dst->p2_last_src = state;
++   dst->p2_last_epoch = epoch;
++   BITSET_ZERO(dst->p2_touched);
++#else
+    vk_dynamic_graphics_state_copy(&cmd->dynamic_graphics_state, state);
++#endif
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+diff --git a/src/vulkan/runtime/vk_graphics_state.h b/src/vulkan/runtime/vk_graphics_state.h
+index 1db6dd539d5..385de94c425 100644
+--- a/src/vulkan/runtime/vk_graphics_state.h
++++ b/src/vulkan/runtime/vk_graphics_state.h
+@@ -987,8 +987,26 @@ struct vk_dynamic_graphics_state {
+ 
+    /** For command buffers, which bits of dynamic state have changed */
+    BITSET_DECLARE(dirty, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
++
++#ifdef P2_NVK_DYN_PAIR_CACHE
++   /* Prototype2-NX [SHARED]: pipeline-bind pair cache (vk_cmd_set_dynamic_graphics_state). The pipeline state
++    * last copied in by a pipeline bind, the pipeline-destroy epoch then, and the state bits written by
++    * anything since (vkCmdSet*, which go through SET_DYN_*).
++    */
++   const struct vk_dynamic_graphics_state *p2_last_src;
++   uint32_t p2_last_epoch;
++   BITSET_DECLARE(p2_touched, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
++#endif
+ };
+ 
++#ifdef P2_NVK_DYN_PAIR_CACHE
++/* Non-zero: the pair cache is used (set by the application before recording). */
++extern int p2_nvk_dyn_pair_cache;
++/* Bumped by every graphics pipeline destroy: cached pairs of older states are dropped. */
++extern uint32_t p2_nvk_dyn_pipeline_epoch;
++extern uint64_t p2_nvk_dyn_pair_stats[4];
++#endif
++
+ /***/
+ struct vk_graphics_pipeline_all_state {
+    struct vk_vertex_input_state vi;
 diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
-index 00523fb4987..56ebefb05c2 100644
+index 00523fb4987..0dd6409f45e 100644
 --- a/src/vulkan/runtime/vk_pipeline.c
 +++ b/src/vulkan/runtime/vk_pipeline.c
 @@ -1145,6 +1145,53 @@ struct vk_graphics_pipeline {
@@ -2867,7 +3062,19 @@ index 00523fb4987..56ebefb05c2 100644
  static void
  vk_graphics_pipeline_destroy(struct vk_device *device,
                               struct vk_pipeline *pipeline,
-@@ -1212,6 +1259,11 @@ vk_graphics_pipeline_cmd_bind(struct vk_command_buffer *cmd_buffer,
+@@ -1153,6 +1200,11 @@ vk_graphics_pipeline_destroy(struct vk_device *device,
+    struct vk_graphics_pipeline *gfx_pipeline =
+       container_of(pipeline, struct vk_graphics_pipeline, base);
+ 
++#ifdef P2_NVK_DYN_PAIR_CACHE
++   /* Its dynamic state may be someone's cached pair or last source: those are dropped. */
++   __atomic_add_fetch(&p2_nvk_dyn_pipeline_epoch, 1, __ATOMIC_RELEASE);
++#endif
++
+    for (uint32_t i = 0; i < gfx_pipeline->stage_count; i++)
+       vk_pipeline_stage_finish(device, &gfx_pipeline->stages[i]);
+ 
+@@ -1212,6 +1264,11 @@ vk_graphics_pipeline_cmd_bind(struct vk_command_buffer *cmd_buffer,
        assert(pipeline->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS);
        assert(!(pipeline->flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR));
        gfx_pipeline = container_of(pipeline, struct vk_graphics_pipeline, base);

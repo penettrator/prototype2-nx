@@ -3,7 +3,7 @@
 # separate host step (tools/codegen.ps1) because a cross-built rexglue cannot run here.
 # Scheme follows Mercenaries2-NX app/CMakeLists.txt (see X360_TO_SWITCH_PORTING_GUIDE.md stage 4).
 cmake_minimum_required(VERSION 3.25)
-project(prototype2 VERSION 0.5.0 LANGUAGES C CXX)
+project(prototype2 VERSION 1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(P2_PROJECT "${CMAKE_CURRENT_SOURCE_DIR}/../project")
@@ -49,6 +49,55 @@ set(P2_APP_SOURCES
     "${P2_PROJECT}/src/switch_screenshot.cpp")
 file(GLOB P2_SWITCH_EXTRA CONFIGURE_DEPENDS "${P2_PROJECT}/src/switch_*.cpp" "${P2_PROJECT}/src/native/*.cpp")
 option(P2_LAZY_PAIR_TRACE "Construct collision-pair trace records only for sampled calls" ON)
+option(P2_COLLISION_FILTER_LOCALS "Keep terminal collision-filter registers local (experimental)" OFF)
+if(P2_COLLISION_FILTER_LOCALS)
+    set(_p2_collision_source "${P2_PROJECT}/generated/default/prototype2_recomp.109.cpp")
+    file(STRINGS "${_p2_collision_source}" _p2_collision_marker
+         REGEX "^#if defined[(]P2_COLLISION_FILTER_LOCALS[)] // terminal pair filter$")
+    if(NOT _p2_collision_marker)
+        message(FATAL_ERROR "Run tools/prepare_collision_filter_locals.py before enabling P2_COLLISION_FILTER_LOCALS")
+    endif()
+    set_property(SOURCE "${_p2_collision_source}" APPEND PROPERTY
+                 COMPILE_DEFINITIONS P2_COLLISION_FILTER_LOCALS=1)
+endif()
+# PERF pass 77: register-local copy of sub_8275E060 (tools/prepare_ribbon_locals.py); runtime flag p2_ribbon_locals.
+option(P2_RIBBON_LOCALS "Build the register-local copy of sub_8275E060 (selected at run time, default off)" ON)
+if(P2_RIBBON_LOCALS)
+    set(_p2_ribbon_func "${P2_PROJECT}/generated/default/prototype2_recomp.26.cpp")
+    set(_p2_ribbon_call "${P2_PROJECT}/generated/default/prototype2_recomp.181.cpp")
+    file(STRINGS "${_p2_ribbon_func}" _p2_ribbon_marker REGEX "^#if defined[(]P2_RIBBON_LOCALS[)] // ribbon register locals")
+    file(STRINGS "${_p2_ribbon_call}" _p2_ribbon_call_marker REGEX "^#if defined[(]P2_RIBBON_LOCALS[)] // ribbon register locals")
+    if(NOT _p2_ribbon_marker OR NOT _p2_ribbon_call_marker)
+        message(FATAL_ERROR "Run tools/prepare_ribbon_locals.py before enabling P2_RIBBON_LOCALS")
+    endif()
+    set_property(SOURCE "${_p2_ribbon_func}" "${_p2_ribbon_call}" "${P2_PROJECT}/src/switch_ribbon_dispatch.cpp"
+                 APPEND PROPERTY COMPILE_DEFINITIONS P2_RIBBON_LOCALS=1)
+endif()
+# PERF pass 79: register-local copies of the collision pair subtree of job 829AC940 (tools/prepare_pair_locals.py);
+# runtime flag p2_pair_locals.
+option(P2_PAIR_LOCALS "Build the register-local copies of the 829AC940 pair subtree (selected at run time, default off)" ON)
+if(P2_PAIR_LOCALS)
+    set(_p2_pair_sources "")
+    foreach(_n 0 53 71 84 101 152)
+        set(_p2_pair_file "${P2_PROJECT}/generated/default/prototype2_recomp.${_n}.cpp")
+        file(STRINGS "${_p2_pair_file}" _p2_pair_marker REGEX "^#if defined[(]P2_PAIR_LOCALS[)] // pair register locals")
+        if(NOT _p2_pair_marker)
+            message(FATAL_ERROR "Run tools/prepare_pair_locals.py before enabling P2_PAIR_LOCALS (${_p2_pair_file})")
+        endif()
+        list(APPEND _p2_pair_sources "${_p2_pair_file}")
+    endforeach()
+    set_property(SOURCE ${_p2_pair_sources} "${P2_PROJECT}/src/switch_pair_dispatch.cpp"
+                 APPEND PROPERTY COMPILE_DEFINITIONS P2_PAIR_LOCALS=1)
+endif()
+option(P2_JOB_CHILD_TIMING "Diagnostic timing of calls inside job829AC940" OFF)
+if(P2_JOB_CHILD_TIMING)
+    if(P2_RELEASE_DIAGNOSTICS_OFF)
+        message(FATAL_ERROR "P2_JOB_CHILD_TIMING requires the diagnostic configuration")
+    endif()
+    set_property(SOURCE "${P2_PROJECT}/generated/default/prototype2_recomp.143.cpp"
+                        "${P2_PROJECT}/src/switch_job_child_probe.cpp" APPEND PROPERTY
+                 COMPILE_DEFINITIONS P2_JOB_CHILD_TIMING=1)
+endif()
 if(P2_LAZY_PAIR_TRACE)
     set_property(SOURCE "${P2_PROJECT}/src/switch_collision_probe.cpp" APPEND PROPERTY
                  COMPILE_DEFINITIONS P2_LAZY_PAIR_TRACE=1)
@@ -56,6 +105,20 @@ endif()
 list(APPEND P2_APP_SOURCES ${P2_SWITCH_EXTRA})
 list(REMOVE_DUPLICATES P2_APP_SOURCES)
 add_executable(prototype2 ${P2_APP_SOURCES})
+# Invalidate saved SPIR-V if any translator implementation or interface changes.
+file(GLOB P2_SHADER_CACHE_INPUTS CONFIGURE_DEPENDS
+    "${REXSDK_DIR}/src/graphics/pipeline/shader/*.cpp"
+    "${REXSDK_DIR}/include/rex/graphics/pipeline/shader/*.h")
+list(APPEND P2_SHADER_CACHE_INPUTS "${REXSDK_DIR}/include/rex/graphics/xenos.h")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${P2_SHADER_CACHE_INPUTS})
+set(P2_SHADER_CACHE_DIGEST "")
+foreach(input IN LISTS P2_SHADER_CACHE_INPUTS)
+    file(SHA256 "${input}" digest)
+    string(APPEND P2_SHADER_CACHE_DIGEST "${digest}")
+endforeach()
+string(SHA256 P2_SHADER_CACHE_DIGEST "${P2_SHADER_CACHE_DIGEST}")
+set_property(SOURCE "${P2_PROJECT}/src/native/native_renderer.cpp" APPEND PROPERTY
+    COMPILE_DEFINITIONS "P2_SHADER_CACHE_DIGEST=\"${P2_SHADER_CACHE_DIGEST}\"")
 target_include_directories(prototype2 PRIVATE "${P2_PROJECT}" "${P2_PROJECT}/src" "${P2_PROJECT}/generated/default" "${CMAKE_CURRENT_SOURCE_DIR}/../build/switch-hot"
     "${REXSDK_DIR}/src/core" "${REXSDK_DIR}/src/graphics" "${REXSDK_DIR}/thirdparty/glslang")
 target_link_libraries(prototype2 PRIVATE prototype2_recomp rex::runtime)
@@ -95,7 +158,7 @@ foreach(t prototype2 prototype2_recomp)
 endforeach()
 if(P2_DIRECT_CALLS)
     set_property(SOURCE "${P2_PROJECT}/generated/default/prototype2_recomp.0.cpp" APPEND PROPERTY
-      COMPILE_OPTIONS "-fopt-info-inline-optimized=${CMAKE_BINARY_DIR}/direct-call-inlining.0.log")
+      COMPILE_OPTIONS "-fopt-info-inline-optimized=/work/build/direct-call-inlining.0.log")
 endif()
 
 # First LTO stage is limited to guest code. Native renderer/xxHash/SDK keep their

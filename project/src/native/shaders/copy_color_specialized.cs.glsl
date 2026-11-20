@@ -8,9 +8,10 @@
 // ring thread. This needs no objects of its own (shaderStorageImageWrite-
 // WithoutFormat covers every destination format with one pipeline).
 //
-// Rebuild copy_color_cs.h after editing:
-//   glslangValidator -S comp -V --target-env vulkan1.1
-//     --vn kCopyColorCs -o copy_color_cs.h copy_color.cs.glsl
+// Rebuild the full-group variant with:
+//   glslangValidator -S comp -V --target-env vulkan1.1 -DP2_COPY_FULL_GROUPS=1
+//     --vn kCopyColorFullGroupsCs -o copy_color_full_groups_cs.h copy_color_specialized.cs.glsl
+// For the guarded variant, omit -D and use kCopyColorSpecializedCs / copy_color_specialized_cs.h.
 #extension GL_EXT_samplerless_texture_functions : require
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform texture2D source;
@@ -32,9 +33,11 @@ const ivec2 fixed_sample_scale = ivec2(1, 1);
 layout(constant_id = 0) const uint fixed_clamp_mode = 0u;
 void main() {
   uvec2 p = gl_GlobalInvocationID.xy;
+#ifndef P2_COPY_FULL_GROUPS
   if (p.x >= size.x || p.y >= size.y) {
     return;
   }
+#endif
   ivec2 base = (source_origin + ivec2(p)) * fixed_sample_scale;
   vec4 color = vec4(0.0);
   for (int y = 0; y < fixed_sample_scale.y; ++y) {

@@ -38,10 +38,16 @@ public:
  // Initial cursor is for testing rollover; production starts at zero.
  explicit BlockingRecordQueue(uint32_t initial=0):head_(initial),tail_(initial){}
  template<class U=T> bool Push(const U& value) {
+  return PushWith([&](T& slot){slot=value;});
+ }
+ // The writer touches only the producer's unpublished slot; publication and
+ // completion retain exactly the same ordering as ordinary Push. It must not
+ // throw or retain the slot reference after returning.
+ template<class Writer> bool PushWith(Writer&& writer) {
   if(closed_.load(std::memory_order_seq_cst))return false;
   const uint32_t head=head_.load(std::memory_order_relaxed);
   if(head-tail_.load(std::memory_order_acquire)>=Capacity && !WaitUntil(head-Capacity+1,true))return false;
-  storage_[head&(Capacity-1)]=value;
+  writer(storage_[head&(Capacity-1)]);
   head_.store(head+1,std::memory_order_seq_cst);
   if(head+1-tail_.load(std::memory_order_relaxed)>=Batch)WakeConsumer();
   return true;

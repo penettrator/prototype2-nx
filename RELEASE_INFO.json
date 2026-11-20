@@ -1,5 +1,5 @@
 {
-  "version": "0.5.0",
+  "version": "1.0",
   "kind": "source-and-binary-distribution",
   "platform": "Nintendo Switch",
   "technology": [
@@ -21,5 +21,7 @@
   ],
   "upscaling": "FSR 1",
   "optimization": "PGO USE",
-  "achievement_notifications": false
+  "achievement_notifications": false,
+  "video_capture": "off (NACP)",
+  "pgo_profiles": 378
 }

@@ -9,6 +9,9 @@
 #include "p2_skinning_kernel.inc"
 #include "src/skinning_input_guard.h"
 #include "src/p2_skinning_fast.h"
+#include "src/native/skin_gpu_normals.h"
+#include "src/native/skin_gpu_jobs.h"
+#include <bit>
 static void put32(std::vector<uint8_t>& m, size_t a, uint32_t v) {
   v = __builtin_bswap32(v); std::memcpy(m.data()+a, &v, 4);
 }
@@ -47,7 +50,7 @@ struct Split {
 int main() {
   std::mt19937 random(415608);
   constexpr size_t memory_size = 0x100000;
-  uint64_t original_ns = 0, local_ns = 0, fast_ns = 0, approx_ns = 0;
+  uint64_t original_ns = 0, local_ns = 0, fast_ns = 0, approx_ns = 0, positions_ns = 0, gpu_exact = 0, gpu_close = 0, jobs_covering = 0, jobs_emulated = 0, jobs_partial = 0, jobs_unaligned = 0, jobs_lazy = 0, jobs_lazy_stale = 0;
   const uint32_t sizes[] = {2, 3, 4, 7, 16, 31, 32, 129, 256, 1024};
   for (unsigned test = 0; test < 2000; ++test) {
     std::vector<uint8_t> a(memory_size, 0xA5);
@@ -75,7 +78,7 @@ int main() {
       }
     }
     if (!P2SkinningFinitePositions(a.data()+ca.r4.u32,n)) return 2;
-    auto b=a; auto c=a; auto sp=a; auto ap=a; auto mp=a; ca.fpscr.InitHost(); PPCContext cb=ca; PPCContext cc=ca; PPCContext cs=ca; PPCContext capx=ca; PPCContext cm=ca;
+    auto b=a; auto c=a; auto sp=a; auto ap=a; auto mp=a; auto po=a; auto ps=a; auto pz=a; ca.fpscr.InitHost(); PPCContext cb=ca; PPCContext cc=ca; PPCContext cs=ca; PPCContext capx=ca; PPCContext cm=ca;
     const uint32_t host_start = ca.fpscr.getcsr();
     
     auto t0=std::chrono::steady_clock::now();
@@ -128,6 +131,129 @@ int main() {
       for(size_t j=bb;j<bb+32;++j) mask[j]=1;
       for(size_t j=0;j<ap.size();++j) if(!mask[j]&&ap[j]!=a[j]){std::cerr<<"APPROX OTHER BYTE FAIL case="<<test<<" offset="<<std::hex<<j<<std::dec<<"\n";return 11;}
     }
+    {
+      // PERF pass 81 jobs: positions-only call, Publish, then Prepare over a covering range (job returned, filled
+      // as the GPU would) or a partly covering one (filled into guest memory by Prepare): the full approx bytes.
+      auto pj = pz;  // memory before any skinning
+      bool skip_compare = false;
+      PPCContext cx=capx; cx.fpscr.setcsr(host_start); cx.fpscr.enableFlushMode();
+      p2skin::Skin(pj.data(), cx.r3.u32, cx.r4.u32, n, cx.r6.u32, cx.r7.u32, cx.r1.u32, uint32_t(cx.lr), UINT32_MAX, p2skin::Sequential{}, true, true);
+      uint32_t mx = 0;
+      for (uint32_t k = 0; k < n; ++k) for (int q = 0; q < 4; ++q) mx = std::max<uint32_t>(mx, p2skin::Load16BE(pj.data() + cx.r4.u32 + 32 * k + 12 + 2 * q));
+      // PERF pass 85: cases 2,3 mod 4 publish lazy jobs (input read from "guest memory" at Prepare/patch time).
+      const bool lazy = test % 4 >= 2;
+      p2::skingpu::g_lazy_input.store(lazy);
+      if (lazy) ++jobs_lazy;
+      p2::skingpu::Publish(pj.data(), cx.r3.u32, cx.r4.u32, n, cx.r6.u32, mx, test);
+      auto tr = [&](uint32_t phys) { return pj.data() + phys; };
+      auto trv = [&](uint32_t in) -> const uint8_t* { return pj.data() + in; };
+
+      std::vector<p2::skingpu::JobPtr> inside;
+      const bool covering = test % 2 == 0;
+      if (covering) {
+        ++jobs_covering;
+        p2::skingpu::Prepare(cx.r3.u32 & ~15u, 24 * n + 32, tr, trv, inside);
+        if (inside.size() != 1) { std::cerr << "JOBS INSIDE FAIL case=" << test << " got " << inside.size() << "\n"; return 16; }
+        // As PatchSkinned + skin_normals.cs.glsl: the range copied into a word stream, the job's input words and
+        // rows memcpy'd after it, then the shader's reads (host-order input, host floats) and swapped writes.
+        const auto& job = *inside[0];
+        const uint32_t range = cx.r3.u32 & ~15u, range_bytes = 24 * n + 32;
+        const size_t in_words = size_t(n - 1) * 8;
+        if (job.lazy != lazy || (lazy && !job.input.empty())) { std::cerr << "JOBS LAZY FLAG FAIL case=" << test << "\n"; return 21; }
+        std::vector<uint32_t> w((range_bytes + in_words * 4 + job.rows.size() * 4) / 4 + 4);
+        std::memcpy(w.data(), pj.data() + range, range_bytes);
+        const uint32_t in_word = (range_bytes + 15) / 16 * 4, rows_word = in_word + uint32_t(in_words);
+        p2::skingpu::InputHost(job, pj.data() + job.in, &w[in_word]);
+        std::memcpy(&w[rows_word], job.rows.data(), job.rows.size() * 4);
+        if ((job.phys - range) % 4) { skip_compare = true; ++jobs_unaligned; }  // not Eligible: never GPU-patched
+        else {
+          ++jobs_emulated;
+          const uint32_t dst_word = (job.phys - range) / 4, bones = uint32_t(job.rows.size() / 16);
+          for (uint32_t k = 0; k + 1 < n; ++k) {
+            const uint32_t base_w = in_word + k * 8;
+            uint32_t q0[4] = {0, 0, 0, w[base_w + 3]}, q1[4];
+            for (int q = 0; q < 4; ++q) q1[q] = w[base_w + 4 + q];
+            for (uint32_t m4 : {q0[3] >> 16, q0[3] & 0xFFFFu, q1[0] >> 16, q1[0] & 0xFFFFu})
+              if (m4 >= bones) { std::cerr << "JOBS BONE RANGE case=" << test << "\n"; return 19; }
+            uint32_t words[2];
+            p2skin_gpu::NormalWords(q0, q1, reinterpret_cast<const float*>(&w[rows_word]), words);
+            w[dst_word + 6 * k + 4] = __builtin_bswap32(words[0]);
+            w[dst_word + 6 * k + 5] = __builtin_bswap32(words[1]);
+          }
+          std::memcpy(pj.data() + range, w.data(), range_bytes);  // compare the patched copy below
+        }
+      } else {
+        p2::skingpu::Prepare(cx.r3.u32 + 24, 24 * n, tr, trv, inside);  // starts inside the job's vertex 1
+        ++jobs_partial;
+        if (!inside.empty()) { std::cerr << "JOBS PARTIAL FAIL case=" << test << "\n"; return 17; }
+      }
+      if (!skip_compare && pj != ap) { std::cerr << "JOBS FILL FAIL case=" << test << " covering=" << covering << " n=" << n << " out=" << std::hex << cx.r3.u32; for (size_t j = 0; j < pj.size(); ++j) if (pj[j] != ap[j]) { std::cerr << " first=" << j << " pj=" << int(pj[j]) << " ap=" << int(ap[j]); break; } std::cerr << std::dec << "\n"; return 18; }
+      if (lazy && test % 8 == 6) {
+        // A lazy job whose sampled input changed after Publish is stale: no patch, no CPU fill. Control: the same
+        // job over unchanged memory is returned.
+        { std::lock_guard<std::mutex> lock(p2::skingpu::g_table.mutex); p2::skingpu::g_table.jobs.clear(); }
+        p2::skingpu::Publish(pj.data(), cx.r3.u32, cx.r4.u32, n, cx.r6.u32, mx, test);
+        auto changed = pj;
+        changed[cx.r4.u32 + 32 * ((n - 2) / 2) + 13] ^= 0x40;
+        std::vector<p2::skingpu::JobPtr> got;
+        auto trc = [&](uint32_t phys) { return changed.data() + phys; };
+        auto trvc = [&](uint32_t in) -> const uint8_t* { return changed.data() + in; };
+        p2::skingpu::Prepare(cx.r3.u32 & ~15u, 24 * n + 32, trc, trvc, got);
+        if (!got.empty()) { std::cerr << "JOBS LAZY STALE FAIL case=" << test << "\n"; return 20; }
+        p2::skingpu::Publish(pj.data(), cx.r3.u32, cx.r4.u32, n, cx.r6.u32, mx, test);
+        p2::skingpu::Prepare(cx.r3.u32 & ~15u, 24 * n + 32, tr, trv, got);
+        if (got.size() != 1) { std::cerr << "JOBS LAZY CONTROL FAIL case=" << test << "\n"; return 22; }
+        ++jobs_lazy_stale;
+      }
+      { std::lock_guard<std::mutex> lock(p2::skingpu::g_table.mutex); p2::skingpu::g_table.jobs.clear(); }
+      p2::skingpu::g_lazy_input.store(false);
+    }
+    {
+      // PERF pass 81: positions only (+ the call's last vertex in full), then the normal words of every other
+      // vertex from ApproxNormalWords: byte-identical to the full approx call, sequential and split.
+      for (int shape = 0; shape < 2; ++shape) {
+        auto& m = shape ? ps : po;
+        PPCContext cx=capx; cx.fpscr.setcsr(host_start); cx.fpscr.enableFlushMode();
+        if (shape) p2skin::Skin(m.data(), cx.r3.u32, cx.r4.u32, n, cx.r6.u32, cx.r7.u32, cx.r1.u32, uint32_t(cx.lr), UINT32_MAX, Split{}, true, true);
+        else { const auto tp=std::chrono::steady_clock::now();
+          p2skin::Skin(m.data(), cx.r3.u32, cx.r4.u32, n, cx.r6.u32, cx.r7.u32, cx.r1.u32, uint32_t(cx.lr), UINT32_MAX, p2skin::Sequential{}, true, true);
+          positions_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-tp).count(); }
+        uint32_t mx = 0;
+        for (uint32_t k = 0; k < n; ++k) for (int q = 0; q < 4; ++q) mx = std::max<uint32_t>(mx, p2skin::Load16BE(m.data() + cx.r4.u32 + 32 * k + 12 + 2 * q));
+        std::vector<simde__m128> rows; p2skin::BuildRows(m.data(), cx.r6.u32, mx, rows);
+        const p2skin::Consts cst = p2skin::MakeConsts();
+        for (uint32_t k = 0; k + 1 < n; ++k) p2skin::ApproxNormalWords(m.data(), cx.r4.u32, k, rows.data(), cst, m.data() + cx.r3.u32 + 24 * k + 16);
+        {
+          // Scalar GPU reference (skin_gpu_normals.h) against ApproxNormalWords: fields within 2 codes.
+          uint32_t q0[4], q1[4]; float rowsf[256 * 16];
+          for (uint32_t b2 = 0; b2 <= mx; ++b2) for (int q = 0; q < 16; ++q) {
+            const uint8_t* p = m.data() + cx.r6.u32 + b2 * 64 + q * 4;
+            const uint32_t v = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+            rowsf[b2 * 16 + q] = std::bit_cast<float>(v);
+          }
+          for (uint32_t k = 0; k + 1 < n; ++k) {
+            const uint8_t* v = m.data() + cx.r4.u32 + 32 * k;
+            auto be = [](const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; };
+            for (int q = 0; q < 4; ++q) { q0[q] = be(v + 4 * q); q1[q] = be(v + 16 + 4 * q); }
+            uint32_t g[2]; p2skin_gpu::NormalWords(q0, q1, rowsf, g);
+            const uint8_t* o = m.data() + cx.r3.u32 + 24 * k + 16;
+            for (int wv = 0; wv < 2; ++wv) {
+              const uint32_t x = g[wv], y = be(o + 4 * wv);
+              if (x == y) { ++gpu_exact; continue; }
+              ++gpu_close;
+              for (int sh = 0; sh < 30; sh += 10) { const int dx = int((x >> sh) & 1023), dy = int((y >> sh) & 1023);
+                if (std::abs(dx - dy) > 2 && std::abs(dx - dy) < 1022) { std::cerr << "GPU REF FAIL case=" << test << " k=" << k << std::hex << " " << x << " vs " << y << std::dec << "\n"; return 14; } }
+              if ((x >> 30) != (y >> 30)) { std::cerr << "GPU REF TOP BITS FAIL case=" << test << "\n"; return 15; }
+            }
+          }
+        }
+        if (m != ap) {
+          std::cerr<<"POSITIONS+NORMALS FAIL case="<<test<<" shape="<<shape<<" vertices="<<n;
+          for(size_t j=0;j<m.size();++j) if(m[j]!=ap[j]) { std::cerr<<" offset="<<std::hex<<j<<" out="<<cx.r3.u32<<std::dec; break; }
+          std::cerr<<"\n"; return 13;
+        }
+      }
+    }
     if (a!=c) {
       std::cerr<<"FAST FAIL case="<<test<<" vertices="<<n<<" alignment="<<test%16<<"\n";
       for(size_t j=0;j<a.size();++j) if(a[j]!=c[j]) { std::cerr<<"memory offset="<<std::hex<<j<<" ref="<<int(a[j])<<" fast="<<int(c[j])<<std::dec<<"\n"; break; }
@@ -150,6 +276,8 @@ int main() {
       if(P2SkinningFinitePositions(input.data(),2)) return 4;
     }
   }
+  std::cout<<"PASS positions-only + ApproxNormalWords identical to approx (sequential and split); approx_ms="<<approx_ns/1e6<<" positions_only_ms="<<positions_ns/1e6<<" ratio="<<double(positions_ns)/approx_ns<<"; scalar GPU reference words exact "<<gpu_exact<<", within 2 codes "<<gpu_close<<"\n";
+  std::cout<<"PASS jobs: covering "<<jobs_covering<<" (shader layout emulated "<<jobs_emulated<<", unaligned skipped "<<jobs_unaligned<<"), partial "<<jobs_partial<<", lazy "<<jobs_lazy<<" (input-change stale "<<jobs_lazy_stale<<")\n";
   std::cout<<"PASS non-finite and one-vertex input rejection\n";
   std::cout<<"PASS fast rewrite memory identical in all 2000 cases (also split into reverse chunks and per-chunk multi-helper folds); approx within tolerance, approx_ms="<<approx_ns/1e6<<"\n";
   std::cout<<"PASS 2000 differential cases: vertex counts 2..1024, all 16 output alignments, randomized matrices, packed inputs and register state\n";

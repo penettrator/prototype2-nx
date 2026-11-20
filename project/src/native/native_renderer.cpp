@@ -14,11 +14,20 @@
 #include <rex/ui/gpu_wait_diagnostics.h>
 #include "native_renderer.h"
 #include "skin_write_log.h"
+#include "skin_gpu_jobs.h"
 #include "native_vk_extra.h"
 #include "native_shader_stats.h"
 #include "native_resolve_probe.h"
 #include "texture_binding_reuse.h"
 #include "blocking_record_queue.h"
+#include "range_lookup_memo.h"
+#include "submission_stream_guard.h"
+#include "shader_role_cache.h"
+#include "lookup_front_cache.h"
+#include "ring_ab.h"
+#include "float_constant_runs.h"
+#include "system_constants_refresh.h"
+#include "prewarm_spirv_cache.h"
 #include "occlusion_tracker.h"
 #include "occlusion_batch.h"
 #include <rex/thread.h>
@@ -30,6 +39,7 @@ extern "C" void RexSwitchPerfSceneFrame(uint32_t draws);
 #include <algorithm>
 #include <cmath>
 #include <array>
+#include <optional>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -123,10 +133,35 @@ REXCVAR_DEFINE_BOOL(p2_native_shader_stats, false, "Prototype2",
 REXCVAR_DEFINE_BOOL(p2_native_copy_specialization, false, "Prototype2",
                     "Specialize exact 1x color copies by clamp, universal fallback (restart required)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_copy_full_groups, false, "Prototype2",
+                    "Skip shader bounds checks for aligned 1x color copies (restart required)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_merge_stencil_faces, false, "Prototype2",
+                    "Set identical front and back stencil values in one Vulkan call (restart required)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(p2_native_depth_words_direct, false, "Prototype2",
                     "Resolve depth the game also reads as color words in one compute pass from the "
                     "depth and stencil aspects, not through a buffer (restart required)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// PERF pass 81: skinning writes positions only; the normal/tangent words of its output are computed on the GPU
+// into the renderer's copies (skin_gpu_jobs.h, shaders/skin_normals.cs.glsl). Off = the CPU writes everything.
+REXCVAR_DEFINE_BOOL(p2_skin_gpu_normals, false, "Prototype2",
+                    "Skinned normal/tangent words computed on the GPU into the vertex copies (restart required)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(p2_skin_gpu_normals_verify, 64, "Prototype2",
+                      "First N GPU patches read back and compared with the CPU reference (2 codes); a mismatch "
+                      "turns the GPU path off")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// PERF pass 85: lazy GPU-normal jobs (skin_gpu_jobs.h) - the input is read from guest memory at patch time.
+REXCVAR_DEFINE_BOOL(p2_skin_gpu_lazy_input, false, "Prototype2",
+                    "With p2_skin_gpu_normals: jobs keep the input's address instead of a copy (restart required)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(p2_skin_gpu_lazy_ab_period_s, 0, "Prototype2",
+                      "Measurement: with p2_skin_gpu_lazy_input, odd periods of this many seconds of the system clock "
+                      "publish copying jobs (A/B in one run); 0 = always lazy");
+REXCVAR_DEFINE_UINT32(p2_skin_gpu_ab_period_s, 0, "Prototype2",
+                      "Measurement: with p2_skin_gpu_normals, odd periods of this many seconds of the system clock skin "
+                      "fully on the CPU (A/B in one run); 0 = always GPU");
 REXCVAR_DEFINE_INT32(p2_native_post_trace_seconds, 0, "Prototype2",
                      "Diagnostic (HANDOFF B:106): from the first shadow cascade resolve on (level), every this many "
                      "seconds log one frame's draws that sample a resolve or draw into a small target, "
@@ -171,6 +206,14 @@ REXCVAR_DEFINE_BOOL(p2_native_shadow_atlas_fragment, false, "Prototype2",
                     "compute dispatch: on this GPU every switch between drawing and compute waits for "
                     "the GPU to go idle (HANDOFF B:111; restart required)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_depth_fragment_resolve, false, "Prototype2",
+                    "Resolve eligible single-sample depth to R32 float through graphics, with the "
+                    "original compute fallback (restart required)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_depth_max_attachment_only, false, "Prototype2",
+                    "Allow persistent ZCULL for new depth images already at the 2048-row cap; "
+                    "no speculative height reservation or transfer writes (restart required)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(p2_native_shadow_depth_clamp, false, "Prototype2",
                     "Shadow cascade draws clamp depth to the cascade's range instead of being clipped by "
                     "it (\"pancaking\"): casters nearer the sun than the cascade still cast shadows "
@@ -195,6 +238,9 @@ REXCVAR_DEFINE_BOOL(p2_native_shadow_atlas_direct, false, "Prototype2",
                     "four shadow cascades, sampled as one 1024x4096 map) are written straight into "
                     "it at their row, not into their own image with only the first copied (HANDOFF "
                     "B:105; restart required)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_prewarm_spirv_cache, false, "Prototype2",
+                    "Reuse serialized SPIR-V and resource bindings from a previous prewarm")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(p2_native_pipeline_prewarm, false, "Prototype2",
                     "Record the pipelines the renderer creates (keys and shader microcode, next to "
@@ -293,9 +339,77 @@ REXCVAR_DEFINE_BOOL(p2_native_resolve_cpu_writeback, false, "Prototype2",
                     "memory in the console's tiled layout once the GPU is done. Off: the CPU reads stale "
                     "memory and the exposure runs away in bright scenes. Restart required")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// PERF pass 51: the pair cache switch and counters of the patched Mesa (vk_graphics_state.c); weak, so a
+// build against an unpatched libvulkan.a links and reports the cache as missing.
+extern "C" {
+extern int p2_nvk_dyn_pair_cache __attribute__((weak));
+extern uint64_t p2_nvk_dyn_pair_stats[4] __attribute__((weak));
+}
+REXCVAR_DEFINE_BOOL(p2_nvk_dyn_pair_cache, false, "Prototype2",
+                    "PERF pass 51 [SHARED]: NVK pipeline binds copy only the fixed state that differs from the "
+                    "previous pipeline's (cached per pipeline pair; same driver state). Needs the patched Mesa. "
+                    "Restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_tb_key_gen, false, "Prototype2",
+                    "PERF pass 53 (R-2): reuse the previous draw's texture-binding key while no fetch slot it reads "
+                    "was written and the shaders/layout are the same (no copy and hash of the fetch words). "
+                    "Restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(p2_native_tb_key_verify, 0, "Prototype2",
+                      "PERF pass 53: the first N reuses of p2_native_tb_key_gen also compute the key and compare "
+                      "(mismatches are logged as warnings)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(p2_native_merge_set_binds, false, "Prototype2",
                     "PERF pass 46: descriptor sets 0-3 changed by one draw are bound with one call per contiguous "
                     "run instead of one call per set (same Vulkan state; fewer driver calls). Restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// PERF pass 75: direct-mapped front (lookup_front_cache.h) for the ring thread's setup_cache and shaders_by_location
+// lookups; answers are pointers to the maps' own values, the first p2_native_lookup_front_verify are compared
+// with map.find() and any difference turns it off.
+REXCVAR_DEFINE_BOOL(p2_native_lookup_front, false, "Prototype2",
+    "PERF75: cache setup/shader-location map lookups by key in a direct-mapped front; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(p2_native_ring_ab_period_s, 0, "Prototype2",
+    "PERF86 measurement: odd periods of this many seconds of the system clock run the original paths instead of "
+    "p2_native_fast_constant_writes / p2_native_lookup_front (A/B in one run); 0 = off");
+REXCVAR_DEFINE_UINT32(p2_native_set87_ab_period_s, 0, "Prototype2",
+    "PERF87 measurement: odd periods of this many seconds run the original paths instead of "
+    "p2_native_merge_stencil_faces / p2_skin_scan_neon (A/B in one run); 0 = off");
+REXCVAR_DEFINE_UINT32(p2_native_lookup_front_verify, 20000, "Prototype2",
+    "PERF75: with p2_native_lookup_front, compare this many front answers with the map")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_setup_pointer_cache, false, "Prototype2",
+    "PERF56: select stable cached DrawSetup nodes instead of copying; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_stream_guard_cache, false, "Prototype2",
+    "PERF62: conservative submission-keyed stream scan guard; original waits retained; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(p2_native_stream_guard_verify, 0, "Prototype2",
+    "PERF62: check first N skipped stream scans against all live slots; mismatch disables cache")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_shader_role_cache, false, "Prototype2",
+    "PERF62: classify fixed shader roles once in DrawSetup; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_float_constant_runs, false, "Prototype2",
+    "PERF62: upload adjacent float constants as exact contiguous byte spans; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_system_cpu_cache, false, "Prototype2",
+    "PERF63: retain CPU system constants across submissions with identical input generations/FPCR; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(p2_native_system_cpu_verify, 0, "Prototype2",
+    "PERF63: first N proposed CPU-cache reuses recompute/compare bytes; mismatch disables cache")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_range_lookup_memo, false, "Prototype2",
+    "PERF55: memoize full-key range table lookups after content validation; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(p2_native_range_lookup_verify, 0, "Prototype2",
+    "PERF55: compare the first N range memo hits with the original table")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(p2_native_sparse_record_copy, false, "Prototype2",
+    "PERF55: copy only draw fields selected by flags into the recorder FIFO; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_UINT32(p2_native_sparse_record_verify, 0, "Prototype2",
+    "PERF55: compare the first N sparse copies with every field used by the recorder")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(p2_native_skin_unique, true, "Prototype2",
                     "Vertex ranges on pages the skinning routine wrote in the last 3 frames get a new identity "
@@ -372,8 +486,10 @@ namespace shaders {
 #include "shaders/copy_color_fs.h"
 #include "shaders/fullscreen_vs.h"
 #include "shaders/depth_words_cs.h"
+#include "shaders/skin_normals_cs.h"
 #include "shaders/copy_color_cs.h"
 #include "shaders/copy_color_specialized_cs.h"
+#include "shaders/copy_color_full_groups_cs.h"
 }  // namespace shaders
 
 namespace {
@@ -625,6 +741,48 @@ struct Renderer::Impl {
     uint64_t head;  // of the first 16 words
   };
   std::unordered_map<uint64_t, KnownShader> shaders_by_location;
+  // PERF pass 75 (p2_native_lookup_front): entries are only inserted or overwritten in place, never erased.
+  LookupFrontCache<KnownShader> shader_location_front;
+  bool lookup_front = false;
+  uint32_t lookup_front_verify_left = 0;
+  uint64_t lookup_front_hits = 0, lookup_front_failed = 0;
+  void LookupFrontMismatch(const char* map) {
+    ++lookup_front_failed;
+    lookup_front = false;
+    REXLOG_WARN("[native] PERF75 lookup front mismatch in {}; map lookups restored", map);
+  }
+  KnownShader* FindKnownShader(uint64_t location) {
+    if (lookup_front && !p2::ringab::Off()) {
+      if (KnownShader* f = shader_location_front.Find(location)) {
+        if (lookup_front_verify_left) {
+          --lookup_front_verify_left;
+          auto it = shaders_by_location.find(location);
+          KnownShader* o = it == shaders_by_location.end() ? nullptr : &it->second;
+          if (o != f) {
+            LookupFrontMismatch("shaders_by_location");
+            return o;
+          }
+        }
+        ++lookup_front_hits;
+        return f;
+      }
+    }
+    auto it = shaders_by_location.find(location);
+    if (it == shaders_by_location.end()) return nullptr;
+    if (lookup_front && !p2::ringab::Off()) shader_location_front.Store(location, &it->second);
+    return &it->second;
+  }
+  // PERF pass 50: the last location loaded per shader type this frame with its first words, so a reload of
+  // the same shader skips the head hash and the map search. Its map entry cannot have changed since (only
+  // loads of the same location write it, and they refresh this), so the answer is the map's.
+  struct LastShaderLoad {
+    uint64_t location = 0;
+    uint64_t frame = UINT64_MAX;
+    uint32_t words = 0;
+    uint32_t head[16];
+    VulkanShader* shader = nullptr;
+  };
+  LastShaderLoad last_shader_load[2];
   VulkanShader* active_vs = nullptr;
   VulkanShader* active_ps = nullptr;
   bool specialize_signs = false;
@@ -729,6 +887,25 @@ struct Renderer::Impl {
   float timestamp_period = 1.0f;
   Submission submissions[kSubmissionSlots];
   uint64_t submission_number = 0;  // the one being recorded, if recording
+  SubmissionStreamGuard stream_guard_cache;
+  bool stream_guard_enabled = false;
+  uint32_t stream_guard_verify_remaining = 0;
+  uint64_t stream_guard_skips = 0, stream_guard_scans = 0, stream_guard_verified = 0;
+  bool shader_role_cache_enabled = false;
+  bool float_constant_runs_enabled = false;
+  bool system_cpu_cache_enabled = false, system_cpu_valid = false;
+  uint32_t system_cpu_verify_remaining = 0;
+  uint64_t system_cpu_fpcr = 0, system_cpu_verified = 0, system_cpu_updates_avoided = 0;
+  std::array<uint8_t, sizeof(SpirvShaderTranslator::SystemConstants)> system_cpu_verify_bytes;
+  static uint64_t SystemCpuControlTag() {
+#if defined(__aarch64__)
+    uint64_t control;
+    asm volatile("mrs %0, fpcr" : "=r"(control));
+    return control;
+#else
+    return 0;  // This optimization is disabled on non-ARM64 builds below.
+#endif
+  }
   bool recording = false;
   uint64_t frame = 1;
   uint64_t completed_frame = 0;
@@ -764,11 +941,34 @@ struct Renderer::Impl {
   VkDescriptorSetLayout depth_words_set_layout = VK_NULL_HANDLE;
   VkPipelineLayout depth_words_layout = VK_NULL_HANDLE;
   VkPipeline depth_words_pipeline = VK_NULL_HANDLE;
+  // PERF pass 81 (p2_skin_gpu_normals): normal words of positions-only skinning, patched into vertex copies.
+  bool skin_gpu = false;
+  VkDescriptorSetLayout skin_normals_set_layout = VK_NULL_HANDLE;
+  VkPipelineLayout skin_normals_layout = VK_NULL_HANDLE;
+  VkPipeline skin_normals_pipeline = VK_NULL_HANDLE;
+  VkDescriptorPool skin_normals_pool = VK_NULL_HANDLE;
+  VkDescriptorSet skin_normals_set = VK_NULL_HANDLE;
+  struct SkinPatch {
+    uint32_t in_word, rows_word, dst_word, count, bones;
+  };
+  std::vector<SkinPatch> skin_patches;  // this submission's, recorded into its setup buffer by Submit
+  std::vector<p2::skingpu::JobPtr> skin_inside;
+  struct SkinVerify {
+    uint64_t submission;
+    uint64_t dst_byte;
+    std::vector<uint32_t> expected;
+  };
+  std::vector<SkinVerify> skin_verify;
+  uint32_t skin_verify_left = 0;
+  uint64_t skin_verify_host_barrier = 0;  // submission whose setup needs the host-read barrier
+  uint64_t skin_stats_frame = 0;
   // Color resolves by compute (copy_color.cs.glsl), same set layout.
   VkPipelineLayout copy_color_layout = VK_NULL_HANDLE;
   VkPipeline copy_color_pipeline = VK_NULL_HANDLE;
   std::array<VkPipeline, 3> copy_color_specialized{};
+  std::array<VkPipeline, 3> copy_color_full_groups{};
   bool specialize_copy = false;
+  bool merge_stencil_faces = false;
   bool ComputeColorCopy(VkCommandBuffer c, VkImageView source, VkImageView dest, int32_t sx,
                         int32_t sy, int32_t dx, int32_t dy, uint32_t width, uint32_t height,
                         uint32_t sample_x = 1, uint32_t sample_y = 1, float scale = 1.0f,
@@ -802,10 +1002,13 @@ struct Renderer::Impl {
   VkDescriptorSetLayout atlas_fragment_set_layout = VK_NULL_HANDLE;
   VkPipelineLayout atlas_fragment_layout = VK_NULL_HANDLE;
   VkPipeline atlas_fragment_pipeline = VK_NULL_HANDLE;
+  bool depth_fragment_resolve = false;
+  bool depth_max_attachment_only = false;
   bool CreateAtlasFragmentPipeline();
   bool AtlasFragmentPass(VkCommandBuffer c, const RenderTarget& source,
-                         ResolveDestination::Sized& atlas, int32_t x0, int32_t y0, uint32_t width,
-                         uint32_t height, uint32_t row);
+                         VkImageView destination, uint32_t dest_width, uint32_t dest_height,
+                         int32_t x0, int32_t y0, uint32_t width,
+                         uint32_t height, uint32_t row, bool empty_lit);
   // After commands recorded outside the draw path, which binds by differences.
   void ForgetBoundGraphicsState() {
     bound_pipeline = VK_NULL_HANDLE;
@@ -869,6 +1072,12 @@ struct Renderer::Impl {
   static constexpr uint64_t kMotionBlurPs = UINT64_C(0xC45C07BB16BF2E70);
   uint64_t work_atlas_direct = 0;
   bool CreateDepthConversion();
+  bool CreateSkinNormals();
+  void PrepareSkinned(uint32_t address, uint32_t bytes);
+  void PatchSkinned(uint32_t address, uint8_t* copy, VkDeviceSize range_offset);
+  void RecordSkinPatches(VkCommandBuffer c);
+  void CheckSkinVerify(uint64_t submission);
+  void DisableSkinGpu(const char* why);
   // HANDOFF B:91 (p2_native_depth_words_direct): false leaves the resolve to the buffer route.
   bool DepthWordsDirect(VkCommandBuffer c, const RenderTarget& source, ResolveDestination& dest,
                         uint32_t dest_base, uint32_t dest_width, uint32_t dest_height, int32_t x0,
@@ -1048,6 +1257,10 @@ struct Renderer::Impl {
     uint64_t position = 0;
   };
   FlatMap64<RangeCopy> vertex_ranges;
+  RangeLookupMemo range_memo;
+  bool range_memo_enabled = false;
+  uint32_t range_memo_verify = 0;
+  uint64_t range_memo_hits = 0, range_memo_misses = 0, range_memo_checked = 0, range_memo_failed = 0;
   static uint64_t RangeSlot(const VertexRangeKey& k) {
     uint64_t h = k.hash ^ ((uint64_t(k.address) << 32) | k.size);
     if (k.frame_local) h ^= k.epoch * 0xD1B54A32D192ED03ull ^ 0x94D049BB133111EBull;
@@ -1057,11 +1270,36 @@ struct Renderer::Impl {
   }
   // The stream position of a copy of this range, or UINT64_MAX.
   uint64_t FindRange(const VertexRangeKey& k) {
-    RangeCopy* c = vertex_ranges.find(RangeSlot(k));
-    return c && c->key == k ? c->position : UINT64_MAX;
+    const uint64_t slot = RangeSlot(k);
+    uint64_t position;
+    if (range_memo_enabled && range_memo.Find(slot, k, frame, submission_number,
+                                             stream_head, kStreamSize, position)) {
+      ++range_memo_hits;
+      if (range_memo_checked < range_memo_verify) {
+        ++range_memo_checked;
+        RangeCopy* c = vertex_ranges.find(slot);
+        const uint64_t original = c && c->key == k ? c->position : UINT64_MAX;
+        if (original != position) {
+          ++range_memo_failed;
+          range_memo_enabled = false;
+          REXLOG_WARN("[native] range lookup memo mismatch; original path restored");
+          return original;
+        }
+      }
+      return position;
+    }
+    RangeCopy* c = vertex_ranges.find(slot);
+    position = c && c->key == k ? c->position : UINT64_MAX;
+    if (range_memo_enabled) {
+      ++range_memo_misses;
+      range_memo.Store(slot, k, frame, submission_number, position);
+    }
+    return position;
   }
   void AddRange(const VertexRangeKey& k, uint64_t position) {
-    vertex_ranges[RangeSlot(k)] = {k, position};
+    const uint64_t slot = RangeSlot(k);
+    vertex_ranges[slot] = {k, position};
+    if (range_memo_enabled) range_memo.Store(slot, k, frame, submission_number, position);
   }
 
   TextureCache textures;
@@ -1106,6 +1344,9 @@ struct Renderer::Impl {
   // checked for real every 16 frames to notice it settling.
   uint64_t RangeHash(VertexHash& known, const uint8_t* data, uint32_t bytes, uint32_t address,
                      bool index = false) {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+    TextureTimer hash_timer(range_hash_ns[index ? 0 : known.detector.changes() ? 2 : 1]);
+#endif
     // Written by the skinning routine within the last frames: a new identity per write, no hashing.
     if (skin_write_log) {
       uint32_t sequence;
@@ -1201,6 +1442,9 @@ struct Renderer::Impl {
     return content;
   }
   uint64_t vertex_hash_bytes = 0;
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  uint64_t range_hash_ns[3] = {};  // index, unchanged vertex, previously changed vertex
+#endif
   uint64_t hash_class_bytes[4] = {}, hash_class_ranges[4] = {};
   uint64_t dynamic_hash_bytes_skipped = 0, dynamic_ranges = 0;
   uint64_t hash_bytes_reported = 0, skip_bytes_reported = 0, ranges_reported = 0;
@@ -1237,6 +1481,9 @@ struct Renderer::Impl {
 
   struct DrawSetup {
     bool valid = false;
+    // Uses the existing padding before state_generation; no shader/pipeline key changes.
+    uint8_t active_ps_roles = 0;
+    bool effective_composite = false;
     uint64_t state_generation = 0;
     uint64_t fetch_generation = 0;
     uint64_t rt_generation = 0;
@@ -1254,17 +1501,61 @@ struct Renderer::Impl {
     PassTargets targets;
     const PipelineLayout* layout = nullptr;
     uint32_t counts[4] = {};
+    // PERF pass 52 (R-1): the fetch slots the two shaders read and the first half of the texture-binding
+    // key, both fixed by (layout, vs, ps) - computed once here instead of on every draw.
+    uint32_t slot_mask = 0;
+    uint64_t tb_seed = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkViewport vp = {};
     float bias_constant = 0.0f, bias_slope = 0.0f;
     float blend_constants[4] = {};
     uint32_t stencil[6] = {};
   };
+  static_assert(offsetof(DrawSetup, state_generation) == 8,
+                "shader role fields must fit the original DrawSetup alignment gap");
   DrawSetup setup;
   std::unordered_map<uint64_t, DrawSetup> setup_cache;
+  // unordered_map rehash keeps references valid; every clear resets selection.
+  DrawSetup* selected_setup = &setup;
+  bool setup_pointer_cache = false;
+  uint64_t setup_copies_avoided = 0;
+  DrawSetup& CurrentSetup() { return *selected_setup; }
+  const DrawSetup& CurrentSetup() const { return *selected_setup; }
+  void ClearSetupCache() { selected_setup = &setup; setup_cache.clear(); setup_front.Clear(); }
+  // PERF pass 75: setup_cache is only cleared here (front cleared with it), never erased from.
+  LookupFrontCache<DrawSetup> setup_front;
+  DrawSetup* FindSetup(uint64_t key) {
+    if (lookup_front && !p2::ringab::Off()) {
+      if (DrawSetup* f = setup_front.Find(key)) {
+        if (lookup_front_verify_left) {
+          --lookup_front_verify_left;
+          auto it = setup_cache.find(key);
+          DrawSetup* o = it == setup_cache.end() ? nullptr : &it->second;
+          if (o != f) {
+            LookupFrontMismatch("setup_cache");
+            return o;
+          }
+        }
+        ++lookup_front_hits;
+        return f;
+      }
+    }
+    auto it = setup_cache.find(key);
+    if (it == setup_cache.end()) return nullptr;
+    if (lookup_front && !p2::ringab::Off()) setup_front.Store(key, &it->second);
+    return &it->second;
+  }
+  void UseCachedSetup(DrawSetup& cached, uint64_t state_generation, uint64_t fetch_generation) {
+    if (setup_pointer_cache) { selected_setup = &cached; ++setup_copies_avoided; }
+    else { selected_setup = &setup; setup = cached; }
+    CurrentSetup().state_generation = state_generation;
+    CurrentSetup().fetch_generation = fetch_generation;
+  }
+
   uint64_t setup_cache_rt_generation = 0;
   // Counts setup rebuilds, so derived caches can tell a setup apart.
   uint64_t setup_generation = 0;
+  uint64_t setup_cache_hits = 0, setup_cache_copy_bytes = 0;
   struct SystemInputs {
     uint64_t setup_generation = ~0ull;
     uint64_t fetch_generation = 0;
@@ -1442,6 +1733,14 @@ struct Renderer::Impl {
   uint32_t tbm_mask = 0, tbm_count = 0;
   uint32_t tbm_words[6 * 32];
   uint64_t tbm_key = 0, tbm_hits = 0, tbm_misses = 0;
+  // PERF pass 53 (R-2): key of the previous draw's texture bindings, reused while the setup's seed and slot
+  // mask are the same and no slot of the mask was written (owner->tb_key_dirty_).
+  bool tb_key_gen = false;
+  uint32_t tb_key_verify = 0;
+  bool tbk_valid = false;
+  uint64_t tbk_seed = 0, tbk_key = 0;
+  uint32_t tbk_mask = 0;
+  uint64_t tbk_hits = 0, tbk_misses = 0, tbk_verified = 0, tbk_mismatches = 0;
   static bool RingHashMemoOn() {
     const uint32_t mode = REXCVAR_GET(p2_ring_hash_memo);
     if (mode == 2) {
@@ -1553,6 +1852,52 @@ struct Renderer::Impl {
     kDrawIndexed = 1u << 13,
     kDrawOcclusion = 1u << 14,
   };
+  static void CopyDrawFields(DrawCommand& out, const DrawCommand& in) {
+    out.commands = in.commands; out.flags = in.flags; out.layout = in.layout; out.count = in.count;
+    const uint32_t f = in.flags;
+    if (f & kDrawPipeline) out.pipeline = in.pipeline;
+    if (f & kDrawSharedSet) out.set_shared = in.set_shared;
+    if (f & kDrawConstants) {
+      out.set_constants = in.set_constants;
+      std::memcpy(out.offsets, in.offsets, sizeof(out.offsets));
+    }
+    if (f & kDrawTexturesVertex) out.texture_sets[0] = in.texture_sets[0];
+    if (f & kDrawTexturesPixel) out.texture_sets[1] = in.texture_sets[1];
+    if (f & kDrawViewport) out.viewport = in.viewport;
+    if (f & kDrawScissor) out.scissor = in.scissor;
+    if (f & kDrawDepthBias) { out.bias_constant = in.bias_constant; out.bias_slope = in.bias_slope; }
+    if (f & kDrawBlend) std::memcpy(out.blend, in.blend, sizeof(out.blend));
+    if (f & kDrawStencilCompare) { out.stencil[0] = in.stencil[0]; out.stencil[1] = in.stencil[1]; }
+    if (f & kDrawStencilWrite) { out.stencil[2] = in.stencil[2]; out.stencil[3] = in.stencil[3]; }
+    if (f & kDrawStencilReference) { out.stencil[4] = in.stencil[4]; out.stencil[5] = in.stencil[5]; }
+    if (f & kDrawIndexBuffer) {
+      out.index_buffer = in.index_buffer; out.index_offset = in.index_offset; out.index_type = in.index_type;
+    }
+    if (f & kDrawOcclusion) out.occlusion_index = in.occlusion_index;
+  }
+  // Compare only values actually consumed by ExecuteDrawCommand, bitwise for
+  // floating-point state (including NaNs and signed zero); no padding reads.
+  static bool SameDrawFields(const DrawCommand& a, const DrawCommand& b) {
+    auto same = [](const auto& x, const auto& y) { return std::memcmp(&x, &y, sizeof(x)) == 0; };
+    if (a.commands != b.commands || a.flags != b.flags || a.layout != b.layout || a.count != b.count)
+      return false;
+    const uint32_t f = a.flags;
+    return (!(f & kDrawPipeline) || a.pipeline == b.pipeline) &&
+      (!(f & kDrawSharedSet) || a.set_shared == b.set_shared) &&
+      (!(f & kDrawConstants) || (a.set_constants == b.set_constants && same(a.offsets,b.offsets))) &&
+      (!(f & kDrawTexturesVertex) || a.texture_sets[0] == b.texture_sets[0]) &&
+      (!(f & kDrawTexturesPixel) || a.texture_sets[1] == b.texture_sets[1]) &&
+      (!(f & kDrawViewport) || same(a.viewport,b.viewport)) &&
+      (!(f & kDrawScissor) || same(a.scissor,b.scissor)) &&
+      (!(f & kDrawDepthBias) || (same(a.bias_constant,b.bias_constant) && same(a.bias_slope,b.bias_slope))) &&
+      (!(f & kDrawBlend) || same(a.blend,b.blend)) &&
+      (!(f & kDrawStencilCompare) || (a.stencil[0]==b.stencil[0] && a.stencil[1]==b.stencil[1])) &&
+      (!(f & kDrawStencilWrite) || (a.stencil[2]==b.stencil[2] && a.stencil[3]==b.stencil[3])) &&
+      (!(f & kDrawStencilReference) || (a.stencil[4]==b.stencil[4] && a.stencil[5]==b.stencil[5])) &&
+      (!(f & kDrawIndexBuffer) || (a.index_buffer==b.index_buffer && a.index_offset==b.index_offset &&
+                                 a.index_type==b.index_type)) &&
+      (!(f & kDrawOcclusion) || a.occlusion_index==b.occlusion_index);
+  }
   void ExecuteDrawCommand(const DrawCommand& d) {
     VkCommandBuffer c = d.commands;
     const auto& f = device->functions();
@@ -1614,17 +1959,23 @@ struct Renderer::Impl {
     if (d.flags & kDrawScissor) f.vkCmdSetScissor(c, 0, 1, &d.scissor);
     if (d.flags & kDrawDepthBias) f.vkCmdSetDepthBias(c, d.bias_constant, 0.0f, d.bias_slope);
     if (d.flags & kDrawBlend) f.vkCmdSetBlendConstants(c, d.blend);
+    // Both bits update the same two dynamic states as the original pair of calls.
+    const auto set_stencil = [&](auto command, uint32_t front, uint32_t back) {
+      if (merge_stencil_faces && front == back && !p2::ringab::Off87()) {
+        command(c, VK_STENCIL_FACE_FRONT_AND_BACK, front);
+      } else {
+        command(c, VK_STENCIL_FACE_FRONT_BIT, front);
+        command(c, VK_STENCIL_FACE_BACK_BIT, back);
+      }
+    };
     if (d.flags & kDrawStencilCompare) {
-      f.vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, d.stencil[0]);
-      f.vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, d.stencil[1]);
+      set_stencil(f.vkCmdSetStencilCompareMask, d.stencil[0], d.stencil[1]);
     }
     if (d.flags & kDrawStencilWrite) {
-      f.vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, d.stencil[2]);
-      f.vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, d.stencil[3]);
+      set_stencil(f.vkCmdSetStencilWriteMask, d.stencil[2], d.stencil[3]);
     }
     if (d.flags & kDrawStencilReference) {
-      f.vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, d.stencil[4]);
-      f.vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, d.stencil[5]);
+      set_stencil(f.vkCmdSetStencilReference, d.stencil[4], d.stencil[5]);
     }
     if (d.flags & kDrawIndexBuffer) {
       f.vkCmdBindIndexBuffer(c, d.index_buffer, d.index_offset, d.index_type);
@@ -1720,6 +2071,9 @@ struct Renderer::Impl {
   BlockingRecordQueue<RecordCommand,kRecordQueueSize,32>::WaitStats record_reported{};
   std::thread record_thread;
   bool record_threaded = false;
+  bool sparse_record_copy = false;
+  uint32_t sparse_record_verify = 0;
+  uint64_t sparse_record_copies = 0, sparse_record_checked = 0, sparse_record_failed = 0;
 
   void WakeRecorder() { record_work.WakeConsumer(); }
   void RecordThread() {
@@ -1764,7 +2118,25 @@ struct Renderer::Impl {
   }
   void SubmitDraw(const DrawCommand& d) {
     if (!record_threaded) { ExecuteDrawCommand(d); return; }
-    if (!record_work.Push(d)) REX_FATAL("Native draw recorder closed before submission");
+    if (!sparse_record_copy) {
+      if (!record_work.Push(d)) REX_FATAL("Native draw recorder closed before submission");
+      return;
+    }
+    if (!record_work.PushWith([&](RecordCommand& slot) {
+      auto* out = std::get_if<DrawCommand>(&slot);
+      if (!out) out = &slot.emplace<DrawCommand>();
+      CopyDrawFields(*out, d);
+      ++sparse_record_copies;
+      if (sparse_record_checked < sparse_record_verify) {
+        ++sparse_record_checked;
+        if (!SameDrawFields(*out, d)) {
+          *out = d;
+          ++sparse_record_failed;
+          sparse_record_copy = false;
+          REXLOG_WARN("[native] sparse record copy mismatch; original path restored");
+        }
+      }
+    })) REX_FATAL("Native draw recorder closed before submission");
   }
   void KickRecorder() {
     if (record_threaded && record_work.Pending()) WakeRecorder();
@@ -1803,6 +2175,7 @@ struct Renderer::Impl {
 
   void Completed(Submission& s) {
     s.pending = false;
+    if (!skin_verify.empty()) CheckSkinVerify(s.number);
     UpdateCompletedFrame();
     CollectOcclusion(s);
     ProfileCollect(uint32_t(&s - submissions));
@@ -2208,6 +2581,7 @@ struct Renderer::Impl {
       Extra(device).vkCmdWriteTimestamp(s.main, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps,
                                 uint32_t(submission_number % kSubmissionSlots) * 2 + 1);
     }
+    if (!skin_patches.empty()) RecordSkinPatches(s.setup);
     dfn().vkEndCommandBuffer(s.setup);
     dfn().vkEndCommandBuffer(s.main);
     VkCommandBuffer buffers[] = {s.setup, s.main};
@@ -2265,9 +2639,43 @@ struct Renderer::Impl {
       }
       end = start + size;
     }
-    for (Submission& s : submissions) {
-      if (&s != &current() && s.pending && end - s.stream_oldest > kStreamSize) {
-        WaitSubmission(s);
+    // Other pending slots are immutable for a recording key except for completion. A cached
+    // min/max bound proves every old wait predicate false; current() is checked above ALWAYS.
+    bool skip_scan = stream_guard_enabled &&
+                     stream_guard_cache.CanSkip(submission_number, end, kStreamSize);
+    if (skip_scan && stream_guard_verify_remaining) {
+      --stream_guard_verify_remaining;
+      ++stream_guard_verified;
+      for (Submission& s : submissions) {
+        if (&s != &current() && s.pending && end - s.stream_oldest > kStreamSize) {
+          stream_guard_enabled = false;
+          skip_scan = false;
+          REXLOG_WARN("[native] PERF62 stream guard mismatch; original scan/waits restored");
+          break;
+        }
+      }
+      if (!stream_guard_verify_remaining) {
+        REXLOG_WARN("[native] PERF62 stream guard verified={} enabled={} skips={} scans={}",
+                    stream_guard_verified, stream_guard_enabled, stream_guard_skips, stream_guard_scans);
+      }
+    }
+    if (skip_scan) {
+      ++stream_guard_skips;
+    } else if (stream_guard_enabled) {
+      ++stream_guard_scans;
+      stream_guard_cache.Reset(submission_number);
+      for (Submission& s : submissions) {
+        if (&s != &current() && s.pending) {
+          if (end - s.stream_oldest > kStreamSize) WaitSubmission(s);
+          if (s.pending) stream_guard_cache.Observe(s.stream_oldest);
+        }
+      }
+    } else {
+      // Original path, including wait order and unsigned arithmetic.
+      for (Submission& s : submissions) {
+        if (&s != &current() && s.pending && end - s.stream_oldest > kStreamSize) {
+          WaitSubmission(s);
+        }
       }
     }
     frame_stream_wait_ns += frame_fence_wait_ns - fence_before;
@@ -2472,6 +2880,7 @@ struct Renderer::Impl {
   void RecordCpuWriteback(VkCommandBuffer c, VkImage image, uint32_t address, uint32_t width,
                           uint32_t height, uint32_t pitch, uint32_t endian);
   void FinishCpuWritebacks();
+  bool nvk_pair_stats_logged = false;
   static uint32_t DumpTexelBytes(VkFormat format);
   // Records a copy of mip 0 / layer 0 (width x height from 0,0) into the current submission.
   bool RecordImageDump(VkImage image, VkFormat format, uint32_t width, uint32_t height,
@@ -2520,7 +2929,8 @@ struct Renderer::Impl {
   void RecordWaterDumps();
   void FinishWaterDumps(bool wait);
   void LoadPrewarm(const std::filesystem::path& directory, uint32_t title_id);
-  void PrewarmThread(std::vector<PrewarmShader> list_shaders, std::vector<PipelineKey> keys);
+  void PrewarmThread(std::vector<PrewarmShader> list_shaders, std::vector<PipelineKey> keys,
+                     uint64_t prewarm_signature);
   void DrainPrewarmed();
   void RecordPrewarm(const PipelineKey& key);
   void SavePrewarm();
@@ -2535,7 +2945,7 @@ struct Renderer::Impl {
   native_probe::Histogram<> resolve_probe;
   uint64_t resolve_probe_last_ns = 0, resolve_probe_frames = 0;
   uint64_t probe_compute_ok = 0, probe_compute_unavailable = 0, probe_compute_descriptor_failed = 0;
-  uint64_t probe_copy_specialized = 0, probe_copy_universal = 0;
+  uint64_t probe_copy_specialized = 0, probe_copy_universal = 0, probe_copy_full_groups = 0;
   TextureCacheStats probe_texture_previous{};
   void ReportResolveProbe() {
     if (!resolve_probe_enabled) return;
@@ -2547,14 +2957,14 @@ struct Renderer::Impl {
     REXLOG_INFO("[native] RESOLVE_PROBE frames={} buckets={} overflow={} overflow_pixels={} "
                 "compute_ok={} compute_unavailable={} compute_descriptor_failed={} "
                 "texture_uploads={} texture_pending={} texture_replaced={} resolved_hits={} "
-                "texture_unsupported={} copy_specialized={} copy_universal={}",
+                "texture_unsupported={} copy_specialized={} copy_universal={} copy_full_groups={}",
                 resolve_probe_frames, resolve_probe.used, resolve_probe.overflow_count,
                 resolve_probe.overflow_pixels, probe_compute_ok, probe_compute_unavailable,
                 probe_compute_descriptor_failed, t.uploads - probe_texture_previous.uploads,
                 t.pending - probe_texture_previous.pending, t.replaced - probe_texture_previous.replaced,
                 t.resolved_hits - probe_texture_previous.resolved_hits,
                 t.unsupported - probe_texture_previous.unsupported,
-                probe_copy_specialized, probe_copy_universal);
+                probe_copy_specialized, probe_copy_universal, probe_copy_full_groups);
     for (size_t i = 0; i < resolve_probe.used; ++i) {
       const auto& b = resolve_probe.buckets[i]; const auto& k = b.key;
       REXLOG_INFO("[native] RESOLVE_PATH path={} width={} height={} src_fmt={} dst_fmt={} "
@@ -2564,7 +2974,7 @@ struct Renderer::Impl {
     }
     resolve_probe.Reset(); resolve_probe_frames = 0; resolve_probe_last_ns = now;
     probe_compute_ok = probe_compute_unavailable = probe_compute_descriptor_failed = 0;
-    probe_copy_specialized = probe_copy_universal = 0;
+    probe_copy_specialized = probe_copy_universal = probe_copy_full_groups = 0;
     probe_texture_previous = t;
   }
   bool work_stats_enabled = false;
@@ -2678,9 +3088,48 @@ bool Renderer::Impl::Initialize() {
   settled_min_bytes = REXCVAR_GET(p2_native_settled_min_bytes);
   skin_unique = REXCVAR_GET(p2_native_skin_unique);
   merge_set_binds = REXCVAR_GET(p2_native_merge_set_binds);
+  merge_stencil_faces = REXCVAR_GET(p2_native_merge_stencil_faces);
+  setup_pointer_cache = REXCVAR_GET(p2_native_setup_pointer_cache);
+  lookup_front = REXCVAR_GET(p2_native_lookup_front);
+  lookup_front_verify_left = REXCVAR_GET(p2_native_lookup_front_verify);
+  REXLOG_WARN("[native] PERF75 lookup front={} verify={}", lookup_front, lookup_front_verify_left);
+  REXLOG_WARN("[native] PERF86 ring A/B period={} s", REXCVAR_GET(p2_native_ring_ab_period_s));
+  REXLOG_WARN("[native] PERF87 merge stencil faces={} set87 A/B period={} s", merge_stencil_faces,
+              REXCVAR_GET(p2_native_set87_ab_period_s));
+  stream_guard_enabled = REXCVAR_GET(p2_native_stream_guard_cache);
+  stream_guard_verify_remaining = REXCVAR_GET(p2_native_stream_guard_verify);
+  shader_role_cache_enabled = REXCVAR_GET(p2_native_shader_role_cache);
+  float_constant_runs_enabled = REXCVAR_GET(p2_native_float_constant_runs);
+  system_cpu_cache_enabled = REXCVAR_GET(p2_native_system_cpu_cache);
+  system_cpu_valid = false;
+  system_cpu_verified = system_cpu_updates_avoided = 0;
+#if !defined(__aarch64__)
+  system_cpu_cache_enabled = false;
+#endif
+  system_cpu_verify_remaining = REXCVAR_GET(p2_native_system_cpu_verify);
+  REXLOG_WARN("[native] PERF62 stream guard={} verify={} shader roles={}", stream_guard_enabled,
+              stream_guard_verify_remaining, shader_role_cache_enabled);
+  REXLOG_WARN("[native] PERF62 float constant runs={}", float_constant_runs_enabled);
+  REXLOG_WARN("[native] PERF63 CPU system cache={} verify={}", system_cpu_cache_enabled,
+              system_cpu_verify_remaining);
+  range_memo_enabled = REXCVAR_GET(p2_native_range_lookup_memo);
+  range_memo_verify = REXCVAR_GET(p2_native_range_lookup_verify);
+  sparse_record_copy = REXCVAR_GET(p2_native_sparse_record_copy);
+  sparse_record_verify = REXCVAR_GET(p2_native_sparse_record_verify);
+  REXLOG_WARN("[native] range memo={} verify={}, sparse record={} verify={}",
+              range_memo_enabled, range_memo_verify, sparse_record_copy, sparse_record_verify);
+  tb_key_gen = REXCVAR_GET(p2_native_tb_key_gen);
+  tb_key_verify = REXCVAR_GET(p2_native_tb_key_verify);
+  REXLOG_WARN("[native] texture-binding key reuse={} (verify {})", tb_key_gen, tb_key_verify);
   resolve_cpu_writeback = REXCVAR_GET(p2_native_resolve_cpu_writeback);
   REXLOG_WARN("[native] resolve CPU writeback={}", resolve_cpu_writeback);
   REXLOG_WARN("[native] merged descriptor set binds={}", merge_set_binds);
+  if (&p2_nvk_dyn_pair_cache) {
+    p2_nvk_dyn_pair_cache = REXCVAR_GET(p2_nvk_dyn_pair_cache) ? 1 : 0;
+    REXLOG_WARN("[native] NVK pipeline-state pair cache={}", p2_nvk_dyn_pair_cache);
+  } else {
+    REXLOG_WARN("[native] NVK pipeline-state pair cache: not in this Mesa build");
+  }
   REXLOG_INFO("[native] dynamic buffer fresh uploads={}", dynamic_buffer_upload);
   work_stats_enabled = REXCVAR_GET(p2_native_work_stats);
   resolve_probe_enabled = REXCVAR_GET(p2_native_resolve_probe);
@@ -2933,6 +3382,17 @@ bool Renderer::Impl::Initialize() {
     depth_scratch = VK_NULL_HANDLE;
     REXLOG_WARN("[native] No scratch buffer for depth resolves");
   }
+  if (REXCVAR_GET(p2_skin_gpu_normals)) {
+    skin_gpu = CreateSkinNormals();
+    skin_verify_left = REXCVAR_GET(p2_skin_gpu_normals_verify);
+    p2::skingpu::g_ab_period.store(REXCVAR_GET(p2_skin_gpu_ab_period_s), std::memory_order_relaxed);
+    p2::skingpu::g_lazy_input.store(REXCVAR_GET(p2_skin_gpu_lazy_input), std::memory_order_relaxed);
+    p2::skingpu::g_lazy_ab_period.store(REXCVAR_GET(p2_skin_gpu_lazy_ab_period_s), std::memory_order_relaxed);
+    REXLOG_WARN("[p2-skin-gpu] PERF85 lazy input={} ab period={} s", REXCVAR_GET(p2_skin_gpu_lazy_input),
+                REXCVAR_GET(p2_skin_gpu_lazy_ab_period_s));
+    p2::skingpu::g_ready.store(skin_gpu, std::memory_order_release);
+    REXLOG_WARN("[p2-skin-gpu] PERF81 GPU normal words={} verify={}", skin_gpu, skin_verify_left);
+  }
   if (depth_scratch && !CreateDepthConversion()) {
     REXLOG_WARN("[native] No depth resolve pipeline; depth resolves are not done");
     if (depth_convert_pipeline) dfn().vkDestroyPipeline(vk, depth_convert_pipeline, nullptr);
@@ -2978,6 +3438,186 @@ bool Renderer::Impl::Initialize() {
   REXLOG_INFO("[native] Renderer ready: {} MB stream, {} shared memory binding(s)",
               kStreamSize >> 20, shared_binding_count);
   return true;
+}
+
+// PERF pass 81 (p2_skin_gpu_normals): the stream as one storage buffer, a push-constant patch per job.
+bool Renderer::Impl::CreateSkinNormals() {
+  VkPhysicalDeviceProperties props = {};
+  device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(device->physical_device(), &props);
+  if (props.limits.maxStorageBufferRange < kStreamSize + kStreamSlack) {
+    REXLOG_WARN("[p2-skin-gpu] maxStorageBufferRange {} below the stream", props.limits.maxStorageBufferRange);
+    return false;
+  }
+  VkDescriptorSetLayoutBinding binding = {};
+  binding.binding = 0;
+  binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  binding.descriptorCount = 1;
+  binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  VkDescriptorSetLayoutCreateInfo layout_info = {};
+  layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  layout_info.bindingCount = 1;
+  layout_info.pBindings = &binding;
+  if (dfn().vkCreateDescriptorSetLayout(vk, &layout_info, nullptr, &skin_normals_set_layout) != VK_SUCCESS)
+    return false;
+  VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SkinPatch)};
+  VkPipelineLayoutCreateInfo pipeline_layout = {};
+  pipeline_layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout.setLayoutCount = 1;
+  pipeline_layout.pSetLayouts = &skin_normals_set_layout;
+  pipeline_layout.pushConstantRangeCount = 1;
+  pipeline_layout.pPushConstantRanges = &push;
+  if (dfn().vkCreatePipelineLayout(vk, &pipeline_layout, nullptr, &skin_normals_layout) != VK_SUCCESS)
+    return false;
+  skin_normals_pipeline = rex::ui::vulkan::util::CreateComputePipeline(
+      device, skin_normals_layout, shaders::kSkinNormalsCs, sizeof(shaders::kSkinNormalsCs));
+  if (!skin_normals_pipeline) return false;
+  VkDescriptorPoolSize size = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = 1;
+  pool_info.poolSizeCount = 1;
+  pool_info.pPoolSizes = &size;
+  if (dfn().vkCreateDescriptorPool(vk, &pool_info, nullptr, &skin_normals_pool) != VK_SUCCESS) return false;
+  VkDescriptorSetAllocateInfo allocate = {};
+  allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  allocate.descriptorPool = skin_normals_pool;
+  allocate.descriptorSetCount = 1;
+  allocate.pSetLayouts = &skin_normals_set_layout;
+  if (dfn().vkAllocateDescriptorSets(vk, &allocate, &skin_normals_set) != VK_SUCCESS) return false;
+  VkDescriptorBufferInfo buffer = {stream_buffer, 0, kStreamSize + kStreamSlack};
+  VkWriteDescriptorSet write = {};
+  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write.dstSet = skin_normals_set;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  write.pBufferInfo = &buffer;
+  dfn().vkUpdateDescriptorSets(vk, 1, &write, 0, nullptr);
+  return true;
+}
+
+void Renderer::Impl::DisableSkinGpu(const char* why) {
+  REXLOG_ERROR("[p2-skin-gpu] {}: GPU normal words off, skinning writes everything again", why);
+  p2::skingpu::g_ready.store(false, std::memory_order_release);
+  skin_gpu = false;
+  p2::skingpu::FlushAllCpu([&](uint32_t phys) { return memory->TranslatePhysical<uint8_t*>(phys); },
+                           [&](uint32_t in) -> const uint8_t* { return memory->virtual_membase() + in; });
+}
+
+// Before a vertex range is copied: partly covered jobs into guest memory, the covered ones for PatchSkinned.
+void Renderer::Impl::PrepareSkinned(uint32_t address, uint32_t bytes) {
+  p2::skingpu::Prepare(address, bytes, [&](uint32_t phys) { return memory->TranslatePhysical<uint8_t*>(phys); },
+                       [&](uint32_t in) -> const uint8_t* { return memory->virtual_membase() + in; },
+                       skin_inside);
+  if (frame - skin_stats_frame >= 600) {
+    skin_stats_frame = frame;
+    size_t table = 0;
+    {
+      std::lock_guard<std::mutex> lock(p2::skingpu::g_table.mutex);
+      table = p2::skingpu::g_table.jobs.size();
+    }
+    REXLOG_WARN("[p2-skin-gpu] published {} patched {} cpu-filled {} stale {} pruned {} table {} verified {}",
+                p2::skingpu::g_published.load(), p2::skingpu::g_patched.load(), p2::skingpu::g_cpu_filled.load(),
+                p2::skingpu::g_stale.load(), p2::skingpu::g_pruned.load(), table, p2::skingpu::g_verified.load());
+  }
+}
+
+// After the copy of a vertex range at `copy` (stream offset range_offset): a GPU patch per covered job.
+void Renderer::Impl::PatchSkinned(uint32_t address, uint8_t* copy, VkDeviceSize range_offset) {
+  for (const auto& job_ptr : skin_inside) {
+    const p2::skingpu::Job& job = *job_ptr;
+    const uint32_t delta = job.phys - address;
+    const uint8_t* in_guest = job.lazy ? memory->virtual_membase() + job.in : nullptr;
+    const VkDeviceSize in_bytes = VkDeviceSize(job.n - 1) * 32;
+    const VkDeviceSize rows_bytes = VkDeviceSize(job.rows.size()) * 4;
+    VkDeviceSize data_offset;
+    uint8_t* data = Allocate(in_bytes + rows_bytes, 16, data_offset);
+    if (!data) {
+      p2::skingpu::FillCpu(job, copy + delta, in_guest);  // into the copy itself
+      p2::skingpu::g_cpu_filled.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    p2::skingpu::InputHost(job, in_guest, reinterpret_cast<uint32_t*>(data));
+    std::memcpy(data + in_bytes, job.rows.data(), size_t(rows_bytes));
+    const VkDeviceSize dst_byte = range_offset + delta;
+    skin_patches.push_back({uint32_t(data_offset / 4), uint32_t((data_offset + in_bytes) / 4),
+                            uint32_t(dst_byte / 4), job.n - 1, uint32_t(job.rows.size() / 16)});
+    p2::skingpu::g_patched.fetch_add(1, std::memory_order_relaxed);
+    if (skin_verify_left) {
+      --skin_verify_left;
+      SkinVerify v{submission_number, dst_byte, std::vector<uint32_t>(size_t(job.n - 1) * 2)};
+      const uint32_t* input = reinterpret_cast<const uint32_t*>(data);  // the words the shader reads
+      for (uint32_t k = 0; k + 1 < job.n; ++k)
+        p2skin_gpu::NormalWords(&input[k * 8], &input[k * 8 + 4], job.rows.data(), &v.expected[k * 2]);
+      skin_verify.push_back(std::move(v));
+      skin_verify_host_barrier = submission_number;
+    }
+  }
+  skin_inside.clear();
+}
+
+void Renderer::Impl::RecordSkinPatches(VkCommandBuffer c) {
+  dfn().vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, skin_normals_pipeline);
+  dfn().vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, skin_normals_layout, 0, 1, &skin_normals_set,
+                                0, nullptr);
+  for (const SkinPatch& p : skin_patches) {
+    dfn().vkCmdPushConstants(c, skin_normals_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SkinPatch), &p);
+    dfn().vkCmdDispatch(c, (p.count + 63) / 64, 1, 1);
+  }
+  skin_patches.clear();
+  // The draws of this submission (main buffer, after this one) read the patched words.
+  VkMemoryBarrier barrier = {};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+  VkPipelineStageFlags dst_stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  if (skin_verify_host_barrier == submission_number) {
+    barrier.dstAccessMask |= VK_ACCESS_HOST_READ_BIT;
+    dst_stages |= VK_PIPELINE_STAGE_HOST_BIT;
+  }
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, dst_stages, 0, 1, &barrier, 0, nullptr, 0,
+                             nullptr);
+}
+
+// A finished submission: its verified patches against the CPU reference.
+void Renderer::Impl::CheckSkinVerify(uint64_t submission) {
+  for (auto it = skin_verify.begin(); it != skin_verify.end();) {
+    if (it->submission != submission) {
+      ++it;
+      continue;
+    }
+    bool ok = true;
+    uint32_t bad_k = 0, got_word = 0, want_word = 0;
+    for (size_t k = 0; ok && k < it->expected.size() / 2; ++k) {
+      for (int i = 0; i < 2; ++i) {
+        const uint32_t got = p2::skingpu::BE32(stream_mapping + it->dst_byte + 24 * k + 16 + 4 * i);
+        const uint32_t want = it->expected[k * 2 + i];
+        if (got == want) continue;
+        bool close = (got >> 30) == (want >> 30);
+        for (int sh = 0; close && sh < 30; sh += 10) {
+          const int d = std::abs(int((got >> sh) & 1023) - int((want >> sh) & 1023));
+          close = d <= 2 || d >= 1022;
+        }
+        if (!close) {
+          ok = false;
+          bad_k = uint32_t(k);
+          got_word = got;
+          want_word = want;
+          break;
+        }
+      }
+    }
+    if (ok) {
+      const uint64_t done = p2::skingpu::g_verified.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (done <= 2 || skin_verify_left == 0)
+        REXLOG_WARN("[p2-skin-gpu] verify {} OK ({} vertices)", done, it->expected.size() / 2);
+    } else {
+      REXLOG_ERROR("[p2-skin-gpu] verify MISMATCH vertex {}: GPU {:08X} CPU {:08X}", bad_k, got_word, want_word);
+      skin_verify.clear();
+      DisableSkinGpu("verification mismatch");
+      return;
+    }
+    it = skin_verify.erase(it);
+  }
 }
 
 bool Renderer::Impl::CreateDepthConversion() {
@@ -3070,7 +3710,10 @@ bool Renderer::Impl::CreateDepthConversion() {
   shadow_empty_lit = shadow_atlas_direct && REXCVAR_GET(p2_native_shadow_empty_lit);
   shadow_depth_clamp = shadow_atlas_direct && REXCVAR_GET(p2_native_shadow_depth_clamp);
   REXLOG_INFO("[native] shadow cascades depth clamp {}", shadow_depth_clamp);
-  if (shadow_atlas_direct && REXCVAR_GET(p2_native_shadow_atlas_fragment)) {
+  depth_fragment_resolve = REXCVAR_GET(p2_native_depth_fragment_resolve);
+  depth_max_attachment_only = REXCVAR_GET(p2_native_depth_max_attachment_only);
+  if (depth_fragment_resolve ||
+      (shadow_atlas_direct && REXCVAR_GET(p2_native_shadow_atlas_fragment))) {
     CreateAtlasFragmentPipeline();
   }
   fragment_copies = (REXCVAR_GET(p2_native_fragment_copies) || REXCVAR_GET(p2_native_copy_ab)) && EnsureFragmentSetLayout();
@@ -3090,6 +3733,9 @@ bool Renderer::Impl::CreateDepthConversion() {
   if (REXCVAR_GET(p2_native_copy_ab)) fragment_copies = false;
   REXLOG_INFO("[native] colour resolves by fragment pass {}", fragment_copies);
   REXLOG_INFO("[native] shadow atlas by fragment pass {}", atlas_fragment_pipeline != VK_NULL_HANDLE);
+  REXLOG_WARN("[native] GPU59 depth fragments={} max-height attachment-only={}",
+              depth_fragment_resolve && atlas_fragment_pipeline != VK_NULL_HANDLE,
+              depth_max_attachment_only);
   REXLOG_INFO("[native] empty shadow map texels lit {}", shadow_empty_lit);
   REXLOG_INFO("[native] far shadow cascades on alternate frames {}", shadow_stagger);
   motion_blur_off = !REXCVAR_GET(p2_native_motion_blur);
@@ -3114,6 +3760,20 @@ bool Renderer::Impl::CreateDepthConversion() {
     }
   }
   g_float7e3_as_r11g11b10 = REXCVAR_GET(p2_native_scene_r11g11b10);
+  if (g_float7e3_as_r11g11b10) {
+    VkFormatProperties properties = {};
+    device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        device->physical_device(), VK_FORMAT_B10G11R11_UFLOAT_PACK32, &properties);
+    const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    if ((properties.optimalTilingFeatures & required) != required) {
+      g_float7e3_as_r11g11b10 = false;
+      REXLOG_WARN("[native] HDR32 unsupported for sampling/blending/transfers; retaining RGBA16F");
+    } else {
+      REXLOG_WARN("[native] GPU59 HDR32 active: RGB precision differs, alpha reads as one; visual test required");
+    }
+  }
   REXLOG_INFO("[native] HDR scene target {}",
               g_float7e3_as_r11g11b10 ? "R11G11B10 float (32 bpp)" : "RGBA16 float (64 bpp)");
   capture_combo = REXCVAR_GET(p2_native_capture_combo);
@@ -3160,11 +3820,17 @@ bool Renderer::Impl::CreateDepthConversion() {
           device, copy_color_layout, shaders::kCopyColorCs, sizeof(shaders::kCopyColorCs));
       if (copy_color_pipeline && specialize_copy) {
         const VkSpecializationMapEntry entry = {0, 0, sizeof(uint32_t)};
+        const bool full_groups = REXCVAR_GET(p2_native_copy_full_groups);
         for (uint32_t clamp = 0; clamp < copy_color_specialized.size(); ++clamp) {
           const VkSpecializationInfo info = {1, &entry, sizeof(clamp), &clamp};
           copy_color_specialized[clamp] = rex::ui::vulkan::util::CreateComputePipeline(
               device, copy_color_layout, shaders::kCopyColorSpecializedCs,
               sizeof(shaders::kCopyColorSpecializedCs), &info);
+          if (full_groups && copy_color_specialized[clamp]) {
+            copy_color_full_groups[clamp] = rex::ui::vulkan::util::CreateComputePipeline(
+                device, copy_color_layout, shaders::kCopyColorFullGroupsCs,
+                sizeof(shaders::kCopyColorFullGroupsCs), &info);
+          }
         }
       }
     }
@@ -3285,6 +3951,12 @@ bool Renderer::Impl::ComputeColorCopy(VkCommandBuffer c, VkImageView source, VkI
   if (specialize_copy && sample_x == 1 && sample_y == 1 &&
       clamp_mode < copy_color_specialized.size() && copy_color_specialized[clamp_mode]) {
     copy_pipeline = copy_color_specialized[clamp_mode];
+    // Execute dispatches ceil(width/8) by ceil(height/8), with shaders using 8x8 groups.
+    // Only the rectangle's dimensions matter; origins don't affect the invocation range.
+    if (copy_color_full_groups[clamp_mode] && ((width | height) & 7u) == 0) {
+      copy_pipeline = copy_color_full_groups[clamp_mode];
+      if (resolve_probe_enabled) ++probe_copy_full_groups;
+    }
   }
   if (resolve_probe_enabled) {
     if (copy_pipeline == copy_color_pipeline) ++probe_copy_universal;
@@ -3384,8 +4056,9 @@ void Renderer::Impl::ProfileReport() {
         what = fmt::format("pass c={} d={}", target((key >> 24) & 0xFFFFFF), target(key & 0xFFFFFF));
         break;
       case kProfileResolve:
-        what = fmt::format("resolve{} p{} {}x{}", ((key >> 56) & 1) ? " depth" : "",
-                           (key >> 32) & 0x7FF, (key >> 16) & 0xFFFF, key & 0xFFFF);
+        what = fmt::format("resolve{} p{} {}x{} path{} src{} stencil{}", ((key >> 56) & 1) ? " depth" : "",
+                           (key >> 32) & 0x7FF, (key >> 16) & 0xFFFF, key & 0xFFFF,
+                           (key >> 43) & 15, (key >> 47) & 255, (key >> 55) & 1);
         break;
       case kProfileDraw:
         if ((key >> 59) & 1) {
@@ -3600,6 +4273,9 @@ void Renderer::Impl::Shutdown() {
   for (VkPipeline pipeline : copy_color_specialized) {
     if (pipeline) dfn().vkDestroyPipeline(vk, pipeline, nullptr);
   }
+  for (VkPipeline pipeline : copy_color_full_groups) {
+    if (pipeline) dfn().vkDestroyPipeline(vk, pipeline, nullptr);
+  }
   if (copy_color_pipeline) dfn().vkDestroyPipeline(vk, copy_color_pipeline, nullptr);
   if (copy_color_layout) dfn().vkDestroyPipelineLayout(vk, copy_color_layout, nullptr);
   if (depth_copy_layout) dfn().vkDestroyPipelineLayout(vk, depth_copy_layout, nullptr);
@@ -3607,6 +4283,10 @@ void Renderer::Impl::Shutdown() {
     dfn().vkDestroyDescriptorSetLayout(vk, depth_copy_set_layout, nullptr);
   }
   if (depth_convert_pool) dfn().vkDestroyDescriptorPool(vk, depth_convert_pool, nullptr);
+  if (skin_normals_pipeline) dfn().vkDestroyPipeline(vk, skin_normals_pipeline, nullptr);
+  if (skin_normals_layout) dfn().vkDestroyPipelineLayout(vk, skin_normals_layout, nullptr);
+  if (skin_normals_pool) dfn().vkDestroyDescriptorPool(vk, skin_normals_pool, nullptr);
+  if (skin_normals_set_layout) dfn().vkDestroyDescriptorSetLayout(vk, skin_normals_set_layout, nullptr);
   if (depth_convert_set_layout) {
     dfn().vkDestroyDescriptorSetLayout(vk, depth_convert_set_layout, nullptr);
   }
@@ -4247,9 +4927,18 @@ bool Renderer::Impl::FragmentColorCopy(VkCommandBuffer c, VkImageView source, Vk
 }
 
 bool Renderer::Impl::AtlasFragmentPass(VkCommandBuffer c, const RenderTarget& source,
-                                       ResolveDestination::Sized& atlas, int32_t x0, int32_t y0,
-                                       uint32_t width, uint32_t height, uint32_t row) {
-  if (!atlas.storage_view || row + height > atlas.height || width > atlas.width) return false;
+                                       VkImageView destination, uint32_t dest_width,
+                                       uint32_t dest_height, int32_t x0, int32_t y0,
+                                       uint32_t width, uint32_t height, uint32_t row,
+                                       bool empty_lit) {
+  // Match depth_to_float.cs.glsl: source = origin + p, destination = source + (0,row).
+  // Reject before recording any commands; the caller retains the original compute fallback.
+  if (!destination || !source.sample_view || x0 < 0 || y0 < 0 || !width || !height) return false;
+  const uint32_t x = uint32_t(x0), y = uint32_t(y0);
+  if (x > source.width || width > source.width - x ||
+      y > source.height || height > source.height - y ||
+      x > dest_width || width > dest_width - x || row > dest_height ||
+      y > dest_height - row || height > dest_height - row - y) return false;
   VkDescriptorSet set = AllocateSet(atlas_fragment_set_layout);
   if (!set) return false;
   VkDescriptorImageInfo image = {VK_NULL_HANDLE, source.sample_view, VK_IMAGE_LAYOUT_GENERAL};
@@ -4275,13 +4964,13 @@ bool Renderer::Impl::AtlasFragmentPass(VkCommandBuffer c, const RenderTarget& so
       &before, 0, nullptr, 0, nullptr);
   VkRenderingAttachmentInfo color = {};
   color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-  color.imageView = atlas.storage_view;
+  color.imageView = destination;
   color.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
   color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   VkRenderingInfo info = {};
   info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-  info.renderArea = {{0, int32_t(row)}, {width, height}};
+  info.renderArea = {{x0, int32_t(row + y)}, {width, height}};
   info.layerCount = 1;
   info.colorAttachmentCount = 1;
   info.pColorAttachments = &color;
@@ -4289,10 +4978,10 @@ bool Renderer::Impl::AtlasFragmentPass(VkCommandBuffer c, const RenderTarget& so
   dfn().vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, atlas_fragment_pipeline);
   dfn().vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, atlas_fragment_layout, 0, 1,
                                 &set, 0, nullptr);
-  const int32_t params[5] = {x0, y0, 0, int32_t(row), shadow_empty_lit ? 1 : 0};
+  const int32_t params[5] = {x0, y0, x0, int32_t(row + y), empty_lit ? 1 : 0};
   dfn().vkCmdPushConstants(c, atlas_fragment_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(params), params);
-  VkViewport viewport = {0.0f, float(row), float(width), float(height), 0.0f, 1.0f};
+  VkViewport viewport = {float(x0), float(row + y), float(width), float(height), 0.0f, 1.0f};
   dfn().vkCmdSetViewport(c, 0, 1, &viewport);
   dfn().vkCmdSetScissor(c, 0, 1, &info.renderArea);
   dfn().vkCmdDraw(c, 3, 1, 0, 0);
@@ -4372,7 +5061,7 @@ void Renderer::Impl::ArmPostTrace() {
 }
 
 void Renderer::Impl::TraceSimDraw(uint32_t draw_count) {
-  const DrawSetup& st = setup;
+  const DrawSetup& st = CurrentSetup();
   bool small = false;
   for (const RenderTarget* rt : st.targets.color) {
     if (rt && rt->width <= 320) small = true;
@@ -4502,8 +5191,8 @@ void Renderer::Impl::TraceSimDraw(uint32_t draw_count) {
 // rectangle, with the depth/stencil word read back as that colour format.
 void Renderer::Impl::AliasDepthClearToColor(xenos::MsaaSamples msaa_samples) {
   const RegisterFile& r = *regs;
-  const RenderTarget* depth_rt = setup.targets.depth;
-  if (!setup.active_vs || setup.active_vs->vertex_bindings().empty()) return;
+  const RenderTarget* depth_rt = CurrentSetup().targets.depth;
+  if (!CurrentSetup().active_vs || CurrentSetup().active_vs->vertex_bindings().empty()) return;
   // Screen-space rectangle (VTE: no viewport scale/offset, xy and z not divided).
   if ((r[rex::graphics::XE_GPU_REG_PA_CL_VTE_CNTL] & 0x33F) != 0x300) return;
   auto depth_control = draw_util::GetNormalizedDepthControl(r);
@@ -4520,7 +5209,7 @@ void Renderer::Impl::AliasDepthClearToColor(xenos::MsaaSamples msaa_samples) {
   }
   if (color_rts.empty()) return;
   // The rectangle and depth from the clear's three vertices (position = first three words).
-  const auto& binding = setup.active_vs->vertex_bindings()[0];
+  const auto& binding = CurrentSetup().active_vs->vertex_bindings()[0];
   const auto vf = r.GetVertexFetch(binding.fetch_constant);
   const uint32_t address = (uint32_t(vf.address) << 2) & 0x1FFFFFFF;
   const uint32_t stride = binding.stride_words;
@@ -4622,13 +5311,13 @@ void Renderer::Impl::AliasDepthClearToColor(xenos::MsaaSamples msaa_samples) {
 }
 
 void Renderer::Impl::WaterSequenceDump(uint32_t draw_count) {
-  const RenderTarget* rt = setup.targets.color[0];
+  const RenderTarget* rt = CurrentSetup().targets.color[0];
   if (!rt || rt->width != 160 || rt->height < 128) return;
   const RegisterFile& r = *regs;
   const uint32_t n = water_seq_count++;
   std::string vertices;
-  if (setup.active_vs && !setup.active_vs->vertex_bindings().empty()) {
-    const auto& binding = setup.active_vs->vertex_bindings()[0];
+  if (CurrentSetup().active_vs && !CurrentSetup().active_vs->vertex_bindings().empty()) {
+    const auto& binding = CurrentSetup().active_vs->vertex_bindings()[0];
     const auto vf = r.GetVertexFetch(binding.fetch_constant);
     const uint32_t address = (uint32_t(vf.address) << 2) & 0x1FFFFFFF;
     const uint32_t words = std::min<uint32_t>(uint32_t(vf.size), 21);
@@ -4649,12 +5338,12 @@ void Renderer::Impl::WaterSequenceDump(uint32_t draw_count) {
   REXLOG_INFO("[native] WATERSEQ {} VS {:016X} PS {:016X} prim {} count {} | msaa {} pitch {} | "
               "C0 fmt{}@{} C1 {} | blend0 {:08X} colorcontrol {:08X} mask {:08X} modecontrol {:08X} "
               "| clip {:08X} vte {:08X} | depth {:08X} |{}",
-              n, setup.active_vs ? setup.active_vs->ucode_data_hash() : 0,
-              setup.active_ps ? setup.active_ps->ucode_data_hash() : 0,
+              n, CurrentSetup().active_vs ? CurrentSetup().active_vs->ucode_data_hash() : 0,
+              CurrentSetup().active_ps ? CurrentSetup().active_ps->ucode_data_hash() : 0,
               uint32_t(initiator.prim_type), draw_count, uint32_t(surface.msaa_samples),
               uint32_t(surface.surface_pitch), rt->key.format, rt->key.base_tiles,
-              setup.targets.color[1] ? fmt::format("fmt{}@{}", setup.targets.color[1]->key.format,
-                                                   setup.targets.color[1]->key.base_tiles)
+              CurrentSetup().targets.color[1] ? fmt::format("fmt{}@{}", CurrentSetup().targets.color[1]->key.format,
+                                                   CurrentSetup().targets.color[1]->key.base_tiles)
                                      : std::string("-"),
               r[rex::graphics::XE_GPU_REG_RB_BLENDCONTROL0],
               r[rex::graphics::XE_GPU_REG_RB_COLORCONTROL], r[rex::graphics::XE_GPU_REG_RB_COLOR_MASK],
@@ -4705,8 +5394,8 @@ void Renderer::Impl::DumpWaterSimInputs() {
                 r[rex::graphics::XE_GPU_REG_VGT_MAX_VTX_INDX],
                 r[rex::graphics::XE_GPU_REG_VGT_INDX_OFFSET],
                 r[rex::graphics::XE_GPU_REG_VGT_MULTI_PRIM_IB_RESET_INDX]);
-    if (setup.active_vs) {
-      for (const auto& binding : setup.active_vs->vertex_bindings()) {
+    if (CurrentSetup().active_vs) {
+      for (const auto& binding : CurrentSetup().active_vs->vertex_bindings()) {
         const auto vf = r.GetVertexFetch(binding.fetch_constant);
         const uint32_t bytes = std::min<uint32_t>(uint32_t(vf.size) * 4, 4096);
         const uint32_t address = (uint32_t(vf.address) << 2) & 0x1FFFFFFF;
@@ -4728,7 +5417,7 @@ void Renderer::Impl::DumpWaterSimInputs() {
       }
     }
   }
-  if (const RenderTarget* rt = setup.targets.color[0]) {
+  if (const RenderTarget* rt = CurrentSetup().targets.color[0]) {
     RecordImageDump(rt->image, rt->format, std::min(rt->width, 160u), std::min(rt->height, 128u),
                     fmt::format("water_rt0_fmt{}_{}", rt->key.format, rt->key.base_tiles));
   }
@@ -5064,7 +5753,8 @@ void Renderer::Impl::RecordPrewarm(const PipelineKey& key) {
 }
 
 void Renderer::Impl::PrewarmThread(std::vector<PrewarmShader> list_shaders,
-                                   std::vector<PipelineKey> keys) {
+                                   std::vector<PipelineKey> keys,
+                                   [[maybe_unused]] uint64_t prewarm_signature) {
   rex::thread::set_current_thread_name("GPU prewarm");
 #if defined(__SWITCH__)
   // As the pipeline worker: below the game's threads and the ring.
@@ -5079,17 +5769,80 @@ void Renderer::Impl::PrewarmThread(std::vector<PrewarmShader> list_shaders,
   }
   // Translators of its own, with the ring's options (TranslatorFor).
   rex::string::StringBuffer own_disasm;
-  auto base = std::make_unique<SpirvShaderTranslator>(SpirvShaderTranslator::Features(device),
-                                                      true, true, false);
+  const SpirvShaderTranslator::Features features(device);
+  std::optional<PrewarmSpirvCache> spirv_cache;
+  std::filesystem::path spirv_path, spirv_tmp;
+  bool cache_loaded = false;
+#if defined(P2_SHADER_CACHE_DIGEST)
+  if (REXCVAR_GET(p2_native_prewarm_spirv_cache)) {
+    VkPhysicalDeviceProperties properties{};
+    device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
+        device->physical_device(), &properties);
+    const uint32_t capabilities[] = {
+        features.spirv_version, features.max_storage_buffer_range, features.full_draw_index_uint32,
+        features.vertex_pipeline_stores_and_atomics, features.fragment_stores_and_atomics,
+        features.clip_distance, features.cull_distance, features.image_view_format_swizzle,
+        features.signed_zero_inf_nan_preserve_float32, features.denorm_flush_to_zero_float32,
+        features.rounding_mode_rte_float32, features.fragment_shader_sample_interlock,
+        features.demote_to_helper_invocation, features.sample_rate_shading,
+        specialize_signs, structured_jumps, properties.vendorID, properties.deviceID,
+        properties.driverVersion};
+    constexpr char translator_digest[] = P2_SHADER_CACHE_DIGEST;
+    spirv_cache.emplace(PrewarmSpirvCache::Identity{
+        0x315650534E3250ull, prewarm_signature,
+        XXH3_64bits(translator_digest, sizeof(translator_digest)),
+        XXH3_64bits_withSeed(capabilities, sizeof(capabilities),
+                             XXH3_64bits(properties.pipelineCacheUUID, VK_UUID_SIZE))});
+    spirv_path = prewarm_path;
+    spirv_path.replace_extension(".spv-cache");
+    spirv_tmp = spirv_path;
+    spirv_tmp += ".tmp";
+    for (const auto* path : {&spirv_path, &spirv_tmp}) {
+      if (FILE* file = rex::filesystem::OpenFile(*path, "rb")) {
+        cache_loaded = spirv_cache->Load(file);
+        fclose(file);
+        if (cache_loaded) break;
+      }
+    }
+  }
+#endif
+  auto base = std::make_unique<SpirvShaderTranslator>(features, true, true, false);
   base->SetTextureSignSpecializationEnabled(specialize_signs);
   base->SetStructuredForwardJumpsEnabled(structured_jumps);
   std::unique_ptr<SpirvShaderTranslator> scaled[2][2];
-  uint32_t translated = 0, translate_failed = 0;
+  uint32_t translated = 0, translate_failed = 0, restored = 0;
   auto translate = [&](VulkanShader* shader, uint64_t modification) -> VkShaderModule {
     if (!shader->is_ucode_analyzed()) shader->AnalyzeUcode(own_disasm);
     auto* translation =
         static_cast<VulkanShader::VulkanTranslation*>(shader->GetOrCreateTranslation(modification));
     if (!translation->is_translated()) {
+      PrewarmSpirvCache::Record cached;
+      const uint64_t hash = shader->ucode_data_hash();
+      if (spirv_cache && spirv_cache->Find(hash, modification, cached) &&
+          translation->RestoreCachedModule({cached.binary.begin(), cached.binary.end()})) {
+        std::vector<SpirvShader::TextureBinding> textures(cached.textures.size() / 4);
+        std::vector<SpirvShader::SamplerBinding> samplers(cached.samplers.size() / 4);
+        for (size_t i = 0; i < textures.size(); ++i) {
+          const uint32_t word = PrewarmSpirvCache::Word(cached.textures, i);
+          auto& entry = textures[i];
+          std::memset(&entry, 0, sizeof(entry));  // Matches PostTranslation's stable layout hash.
+          entry.fetch_constant = word & 31;
+          entry.dimension = xenos::FetchOpDimension((word >> 5) & 3);
+          entry.is_signed = (word >> 7) & 1;
+        }
+        for (size_t i = 0; i < samplers.size(); ++i) {
+          const uint32_t word = PrewarmSpirvCache::Word(cached.samplers, i);
+          auto& entry = samplers[i];
+          entry.fetch_constant = word & 31;
+          entry.mag_filter = xenos::TextureFilter((word >> 5) & 3);
+          entry.min_filter = xenos::TextureFilter((word >> 7) & 3);
+          entry.mip_filter = xenos::TextureFilter((word >> 9) & 3);
+          entry.aniso_filter = xenos::AnisoFilter((word >> 11) & 7);
+        }
+        shader->RestoreCachedBindings(std::move(textures), std::move(samplers));
+        ++restored;
+        return translation->shader_module();
+      }
       SpirvShaderTranslator* translator = base.get();
       const uint32_t x2 = (modification & kVposScaleXBit) ? 1 : 0;
       const uint32_t y2 = (modification & kVposScaleYBit) ? 1 : 0;
@@ -5105,8 +5858,21 @@ void Renderer::Impl::PrewarmThread(std::vector<PrewarmShader> list_shaders,
         translator = slot.get();
       }
       if (translator->TranslateAnalyzedShader(*translation)) {
-        translation->GetOrCreateShaderModule();
+        const auto module = translation->GetOrCreateShaderModule();
         ++translated;
+        if (module && spirv_cache && !cache_loaded) {
+          std::vector<uint32_t> textures, samplers;
+          for (const auto& entry : shader->GetTextureBindingsAfterTranslation()) {
+            textures.push_back(entry.fetch_constant | (uint32_t(entry.dimension) << 5) |
+                               (entry.is_signed << 7));
+          }
+          for (const auto& entry : shader->GetSamplerBindingsAfterTranslation()) {
+            samplers.push_back(entry.fetch_constant | (uint32_t(entry.mag_filter) << 5) |
+                               (uint32_t(entry.min_filter) << 7) | (uint32_t(entry.mip_filter) << 9) |
+                               (uint32_t(entry.aniso_filter) << 11));
+          }
+          spirv_cache->Add(hash, modification, translation->translated_binary(), textures, samplers);
+        }
       } else {
         ++translate_failed;
       }
@@ -5131,6 +5897,7 @@ void Renderer::Impl::PrewarmThread(std::vector<PrewarmShader> list_shaders,
     modules[i] = {vertex, pixel};
   }
   const uint64_t translated_at = NowNs();
+  if (cache_loaded) spirv_cache.reset();
   {
     std::lock_guard<std::mutex> lock(prewarm_mutex);
     for (auto& [hash, shader] : own) {
@@ -5240,6 +6007,20 @@ void Renderer::Impl::PrewarmThread(std::vector<PrewarmShader> list_shaders,
               (translated_at - start) / 1000000, created, keys.size(), skipped,
               (end - translated_at) / 1000000,
               prewarm_stop.load(std::memory_order_relaxed) ? " (stopped)" : "");
+  if (cache_loaded || spirv_cache) {
+    REXLOG_WARN("[native] SPIR-V prewarm cache: loaded={} restored={} translated={} in {} ms",
+                cache_loaded, restored, translated, (translated_at - start) / 1000000);
+  }
+  if (spirv_cache && spirv_cache->NeedsSave() && !prewarm_stop.load(std::memory_order_relaxed)) {
+    if (FILE* file = rex::filesystem::OpenFile(spirv_tmp, "wb")) {
+      const bool saved = spirv_cache->Save(file);
+      if (fclose(file) == 0 && saved) {
+        // Horizon may not replace the old file. A complete .tmp is also loadable.
+        std::error_code error;
+        std::filesystem::rename(spirv_tmp, spirv_path, error);
+      }
+    }
+  }
 }
 
 void Renderer::Impl::PipelineThread() {
@@ -5466,6 +6247,11 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   rt->format = key.is_depth ? DepthFormatFor(key.format)
                             : ColorFormatToVk(xenos::ColorRenderTargetFormat(key.format));
   rt->last_used_frame = frame;
+  // Only newly created images at the existing hard cap can never grow. Smaller targets and
+  // replacements retain transfer clear/copy, so depth AND stencil contents survive growth.
+  // Unlike the archived prototype, this policy never reserves additional image rows.
+  bool attachment_only = depth_max_attachment_only && key.is_depth && !old &&
+                               rt->height == 2048;
   VkImageCreateInfo info = {};
   info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   info.imageType = VK_IMAGE_TYPE_2D;
@@ -5479,10 +6265,20 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
                                    VK_IMAGE_USAGE_SAMPLED_BIT
                              : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) |
                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  if (attachment_only) info.usage &= ~VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (!rex::ui::vulkan::util::CreateDedicatedAllocationImage(
+  bool image_created = rex::ui::vulkan::util::CreateDedicatedAllocationImage(
           device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal, rt->image,
-          rt->memory)) {
+          rt->memory);
+  if (!image_created && attachment_only) {
+    // Optional persistent ZCULL metadata must not introduce a new allocation failure.
+    attachment_only = false;
+    info.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    REXLOG_WARN("[native] GPU59 attachment-only allocation failed; retrying original depth usage");
+    image_created = rex::ui::vulkan::util::CreateDedicatedAllocationImage(
+        device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal, rt->image, rt->memory);
+  }
+  if (!image_created) {
     REXLOG_ERROR("[native] Could not create a {}x{} render target", rt->width, rt->height);
     return old;
   }
@@ -5516,19 +6312,47 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   VkImageMemoryBarrier barrier = {};
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   barrier.srcAccessMask = 0;
-  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  const VkAccessFlags init_access = attachment_only
+      ? VkAccessFlags(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+      : VkAccessFlags(VK_ACCESS_TRANSFER_WRITE_BIT);
+  const VkPipelineStageFlags init_stage = attachment_only
+      ? VkPipelineStageFlags(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)
+      : VkPipelineStageFlags(VK_PIPELINE_STAGE_TRANSFER_BIT);
+  barrier.dstAccessMask = init_access;
   barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
   barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.image = rt->image;
   barrier.subresourceRange = view.subresourceRange;
-  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, init_stage,
                              0, 0, nullptr, 0, nullptr, 1, &barrier);
   if (key.is_depth) {
     VkClearDepthStencilValue clear = {1.0f, 0};
+    if (attachment_only) {
+      VkRenderingAttachmentInfo depth = {};
+      depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+      depth.imageView = rt->view;
+      depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      depth.clearValue.depthStencil = clear;
+      VkRenderingInfo rendering = {};
+      rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+      rendering.renderArea = {{0, 0}, {rt->width, rt->height}};
+      rendering.layerCount = 1;
+      rendering.pDepthAttachment = &depth;
+      rendering.pStencilAttachment = HasStencil(rt->format) ? &depth : nullptr;
+      dfn().vkCmdBeginRendering(c, &rendering);
+      dfn().vkCmdEndRendering(c);
+      ForgetBoundGraphicsState();
+      REXLOG_WARN("[native] GPU59 ZCULL-eligible depth {}x{}: attachment clear, no reserved rows",
+                  rt->width, rt->height);
+    } else {
     vkCmdClearDepthStencilImage(c, rt->image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                                       &view.subresourceRange);
+    }
   } else {
     VkClearColorValue clear = {};
     dfn().vkCmdClearColorImage(c, rt->image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
@@ -5555,12 +6379,12 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
         {frame, old->image, old->view, old->sample_view, old->stencil_view, old->memory});
   }
   VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                           VK_ACCESS_TRANSFER_WRITE_BIT,
+                           init_access,
                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
-  dfn().vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+  dfn().vkCmdPipelineBarrier(cmd(), init_stage,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
@@ -5807,7 +6631,7 @@ void Renderer::Impl::TraceSetup(uint32_t reason) {
   }
   bool signed_target = false;
   for (uint32_t i = 0; i < 4; ++i) {
-    const RenderTarget* rt = setup.targets.color[i];
+    const RenderTarget* rt = CurrentSetup().targets.color[i];
     if (rt && !rt->key.is_depth &&
         (rt->key.format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16) ||
          rt->key.format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16_16_16))) {
@@ -5840,7 +6664,7 @@ void Renderer::Impl::TraceSetup(uint32_t reason) {
                   uint32_t(initiator.source_select), rr[rex::graphics::XE_GPU_REG_RB_COLOR_MASK],
                   uint32_t(draw_util::GetNormalizedDepthControl(rr).z_enable),
                   uint32_t(draw_util::GetNormalizedDepthControl(rr).stencil_enable),
-                  setup.targets.color[0] ? "C0 " : "", setup.targets.depth ? "D" : "");
+                  CurrentSetup().targets.color[0] ? "C0 " : "", CurrentSetup().targets.depth ? "D" : "");
     }
   }
   if (!water && !(signed_target && reason == UINT32_MAX)) return;
@@ -5848,7 +6672,7 @@ void Renderer::Impl::TraceSetup(uint32_t reason) {
   if (water ? lines >= 40 : signed_lines >= 60) return;
   ++(water ? lines : signed_lines);
   const RegisterFile& r = *regs;
-  const DrawSetup& st = setup;
+  const DrawSetup& st = CurrentSetup();
   auto surface = r.Get<reg::RB_SURFACE_INFO>();
   auto depth = draw_util::GetNormalizedDepthControl(r);
   std::string targets;
@@ -5980,6 +6804,7 @@ void Renderer::Impl::CountNoTargetSkip() {
 }
 
 bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
+  selected_setup = &setup;
   DrawSetup& st = setup;
   st = DrawSetup();
   st.valid = true;
@@ -5988,6 +6813,10 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
   st.rt_generation = rt_generation;
   st.active_vs = active_vs;
   st.active_ps = active_ps;
+  if (shader_role_cache_enabled) {
+    st.active_ps_roles = ClassifyPixelShaderRoles(active_ps != nullptr,
+                                                 active_ps ? active_ps->ucode_data_hash() : 0, 0);
+  }
   st.initiator_state = initiator_value & 0xFFFF;
   last_initiator_value = initiator_value;
   st.skip_reason = UINT32_MAX;
@@ -6255,6 +7084,9 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
   // Layout.
   st.vs = vs;
   st.ps = ps;
+  if (shader_role_cache_enabled) {
+    st.effective_composite = ps && ps->ucode_data_hash() == kMotionBlurPs;
+  }
   const VulkanShader* stage_shaders[2] = {vs, ps};
   for (uint32_t stage = 0; stage < 2; ++stage) {
     const VulkanShader* shader = stage_shaders[stage];
@@ -6264,6 +7096,18 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
   }
   st.layout = GetPipelineLayout(st.counts[0], st.counts[1], st.counts[2], st.counts[3]);
   if (!st.layout) return fail(10);
+  st.slot_mask = 0;
+  for (const VulkanShader* shader : stage_shaders) {
+    if (!shader) continue;
+    for (const auto& b : shader->GetTextureBindingsAfterTranslation()) st.slot_mask |= 1u << b.fetch_constant;
+    for (const auto& b : shader->GetSamplerBindingsAfterTranslation()) st.slot_mask |= 1u << b.fetch_constant;
+  }
+  {
+    const PipelineLayout* layout_ptr = st.layout;
+    st.tb_seed = XXH3_64bits_withSeed(&layout_ptr, sizeof(layout_ptr),
+                                      uint64_t(reinterpret_cast<uintptr_t>(vs)) ^
+                                          (uint64_t(reinterpret_cast<uintptr_t>(ps)) << 1));
+  }
 
   // Pipeline.
   PipelineKey key = {};
@@ -6465,14 +7309,14 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   // The render state: the same as the previous draw (nothing changed), or
   // one seen before (looked up by the hash of the state registers, the
   // shaders and the primitive setup), or built now.
-  if (!(setup.valid && setup.state_generation == owner->state_generation_ &&
-        setup.active_vs == active_vs && setup.active_ps == active_ps &&
-        setup.initiator_state == (initiator.value & 0xFFFF) &&
-        setup.rt_generation == rt_generation &&
-        (!specialize_signs || setup.fetch_generation == owner->fetch_generation_))) {
+  if (!(CurrentSetup().valid && CurrentSetup().state_generation == owner->state_generation_ &&
+        CurrentSetup().active_vs == active_vs && CurrentSetup().active_ps == active_ps &&
+        CurrentSetup().initiator_state == (initiator.value & 0xFFFF) &&
+        CurrentSetup().rt_generation == rt_generation &&
+        (!specialize_signs || CurrentSetup().fetch_generation == owner->fetch_generation_))) {
     if (setup_cache_rt_generation != rt_generation) {
       // Setups hold render target pointers.
-      setup_cache.clear();
+      ClearSetupCache();
       setup_cache_rt_generation = rt_generation;
     }
     uint64_t key = owner->state_hash_ ^
@@ -6499,25 +7343,25 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
                                          r.GetTextureFetch(fetch)));
       }
     }
-    auto found = setup_cache.find(key);
-    if (found != setup_cache.end() && found->second.active_vs == active_vs &&
-        found->second.active_ps == active_ps &&
-        found->second.initiator_state == (initiator.value & 0xFFFF)) {
-      setup = found->second;
-      setup.state_generation = owner->state_generation_;
-      setup.fetch_generation = owner->fetch_generation_;
+    DrawSetup* found = FindSetup(key);
+    if (found && found->active_vs == active_vs &&
+        found->active_ps == active_ps &&
+        found->initiator_state == (initiator.value & 0xFFFF)) {
+      UseCachedSetup(*found, owner->state_generation_, owner->fetch_generation_);
       ++setup_generation;
+      ++setup_cache_hits;
+      if (!setup_pointer_cache) setup_cache_copy_bytes += sizeof(DrawSetup);
     } else {
       ++stats().setups_built;
       ++setup_generation;
       BuildDrawSetup(initiator.value);
-      if (setup.valid) {
-        if (setup_cache.size() >= 4096) setup_cache.clear();
+      if (CurrentSetup().valid) {
+        if (setup_cache.size() >= 4096) ClearSetupCache();
         setup_cache[key] = setup;
       }
     }
   }
-  DrawSetup& st = setup;
+  DrawSetup& st = CurrentSetup();
   if (st.skip_reason != UINT32_MAX) {
     return skip(st.skip_reason);
   }
@@ -6537,7 +7381,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     return;
   }
   if (reflection_half_rate) {
-    if (st.active_ps && st.active_ps->ucode_data_hash() == UINT64_C(0x9AD799B034BB706F)) {
+    if (shader_role_cache_enabled ? (st.active_ps_roles & kReflectionRole) != 0
+                                 : st.active_ps && st.active_ps->ucode_data_hash() == UINT64_C(0x9AD799B034BB706F)) {
       reflection_texture = ((*regs).GetTextureFetch(0).base_address << 12) & 0x1FFFFFFF;
     }
     if (reflection_color_known && st.targets.color[0] &&
@@ -6567,7 +7412,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       return;
     }
   }
-  if (edge_blur_off && st.active_ps && st.active_ps->ucode_data_hash() == kEdgeBlurPs) {
+  if (edge_blur_off && (shader_role_cache_enabled ? (st.active_ps_roles & kEdgeBlurRole) != 0
+                                                 : st.active_ps && st.active_ps->ucode_data_hash() == kEdgeBlurPs)) {
     // Its target already holds the composite it would blur (resolved from it just before).
     return;
   }
@@ -6627,8 +7473,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       water_ps_idx_parsed = true;
       water_ps_idx = std::strtoull(REXCVAR_GET(p2_native_trace_ps).c_str(), nullptr, 16);
     }
-    if (water_idx_lines < 12 && water_ps_idx && setup.active_ps &&
-        setup.active_ps->ucode_data_hash() == water_ps_idx) {
+    if (water_idx_lines < 12 && water_ps_idx && CurrentSetup().active_ps &&
+        CurrentSetup().active_ps->ucode_data_hash() == water_ps_idx) {
       ++water_idx_lines;
       uint32_t lo = UINT32_MAX, hi = 0, resets = 0;
       for (uint32_t i = 0; i < guest_count; ++i) {
@@ -6641,7 +7487,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
         hi = std::max(hi, v);
       }
       std::string fetch_sizes;
-      const Shader::ConstantRegisterMap& map = setup.active_vs->constant_register_map();
+      const Shader::ConstantRegisterMap& map = CurrentSetup().active_vs->constant_register_map();
       for (uint32_t w = 0; w < 3; ++w) {
         uint32_t bits = map.vertex_fetch_bitmap[w];
         uint32_t bit;
@@ -6801,11 +7647,13 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
         range_offset = VkDeviceSize(found % kStreamSize);
         current().stream_oldest = std::min(current().stream_oldest, found);
       } else {
+        if (skin_gpu) PrepareSkinned(address, bytes);
         uint8_t* out = Allocate(bytes, 16, range_offset);
         if (!out) continue;
         std::memcpy(out, source, bytes);
         stats().vertex_bytes_copied += bytes;
         AddRange(range_key, stream_head - bytes);
+        if (skin_gpu && !skin_inside.empty()) PatchSkinned(address, out, range_offset);
       }
       dword0 = (guest_dword0 & 0x3) | uint32_t(range_offset);
       if (dword0 != dword0_before) fetch_words_changed = true;
@@ -6813,6 +7661,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
   if (vertex_ranges.size() > 65536) {
     vertex_ranges.clear();
+    range_memo.Clear();
   }
   if (vertex_hashes.size() > 65536) {
     // WORKLOG #97: dropping everything every few seconds (run 347: ~1000 new keys per frame from dynamic
@@ -6844,8 +7693,10 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
 
   uint8_t* last_float_out = nullptr;
-  const bool motion_blur_draw = motion_blur_off && ps && ps->ucode_data_hash() == kMotionBlurPs;
-  const bool dof_draw = dof_off && ps && ps->ucode_data_hash() == kMotionBlurPs;
+  const bool motion_blur_draw = motion_blur_off &&
+      (shader_role_cache_enabled ? st.effective_composite : ps && ps->ucode_data_hash() == kMotionBlurPs);
+  const bool dof_draw = dof_off &&
+      (shader_role_cache_enabled ? st.effective_composite : ps && ps->ucode_data_hash() == kMotionBlurPs);
   PhaseAdd(2);
   auto write_float_constants = [&](const Shader::ConstantRegisterMap& map, uint32_t base_register,
                                    VkDeviceSize& offset) -> bool {
@@ -6857,6 +7708,12 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     uint8_t* out = Allocate(bytes, ubo_alignment, offset);
     if (!out) return false;
     last_float_out = out;
+    if (float_constant_runs_enabled) {
+      // RegisterFile::operator[] is values[reg]; the ring thread owns register writes.
+      // This changes only transfer granularity, preserving ascending source/output bytes.
+      CopyFloatConstantRuns(out, &r[base_register], map.float_bitmap);
+      return true;
+    }
     for (uint32_t i = 0; i < 4; ++i) {
       uint64_t bits = map.float_bitmap[i];
       uint32_t bit;
@@ -6958,18 +7815,14 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   // Keyed by the shaders and the fetch constants of the slots they read,
   // valid for a frame: materials repeat across the draws of a frame, and a hit
   // skips every texture and sampler lookup.
-  uint32_t slot_mask = 0;
-  for (const VulkanShader* shader : stage_shaders) {
-    if (!shader) continue;
-    for (const auto& b : shader->GetTextureBindingsAfterTranslation()) {
-      slot_mask |= 1u << b.fetch_constant;
-    }
-    for (const auto& b : shader->GetSamplerBindingsAfterTranslation()) {
-      slot_mask |= 1u << b.fetch_constant;
-    }
-  }
+  const uint32_t slot_mask = st.slot_mask;  // PERF pass 52 (R-1): from the setup
   uint64_t tb_key;
-  {
+  const bool tbk_reuse = tb_key_gen && tbk_valid && tbk_seed == st.tb_seed && tbk_mask == slot_mask &&
+                         (owner->tb_key_dirty_ & slot_mask) == 0;
+  if (tbk_reuse && !(tb_key_verify && tbk_verified < tb_key_verify)) {
+    tb_key = tbk_key;
+    ++tbk_hits;
+  } else {
     uint32_t words[6 * 32];
     uint32_t count = 0;
     uint32_t remaining = slot_mask;
@@ -6987,10 +7840,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       tb_key = tbm_key;
       ++tbm_hits;
     } else {
-      tb_key = XXH3_64bits_withSeed(&layout, sizeof(layout),
-                                    uint64_t(reinterpret_cast<uintptr_t>(vs)) ^
-                                        (uint64_t(reinterpret_cast<uintptr_t>(ps)) << 1));
-      tb_key = XXH3_64bits_withSeed(words, count * sizeof(uint32_t), tb_key ^ slot_mask);
+      tb_key = XXH3_64bits_withSeed(words, count * sizeof(uint32_t), st.tb_seed ^ slot_mask);
       if (memo) {
         tbm_valid = true;
         tbm_layout = layout;
@@ -7002,6 +7852,22 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
         tbm_key = tb_key;
         ++tbm_misses;
       }
+    }
+    if (tb_key_gen) {
+      if (tbk_reuse) {
+        ++tbk_verified;
+        if (tb_key != tbk_key && tbk_mismatches++ < 8) {
+          REXLOG_WARN("[native] texture-binding key reuse mismatch: mask {:08X} kept {:016X} computed {:016X}",
+                      slot_mask, tbk_key, tb_key);
+        }
+      } else {
+        ++tbk_misses;
+      }
+      tbk_valid = true;
+      tbk_seed = st.tb_seed;
+      tbk_mask = slot_mask;
+      tbk_key = tb_key;
+      owner->tb_key_dirty_ &= ~slot_mask;
     }
   }
   if (tb_cache_frame != frame) {
@@ -7190,13 +8056,40 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   PhaseAdd(4);
   // System constants come from the render state, the texture fetch
   // constants and the vertex index registers.
-  bool system_same = last_system.submission == submission_number &&
-                     system_inputs.setup_generation == setup_generation &&
+  const bool system_same_submission = last_system.submission == submission_number;
+  const bool system_same_inputs = system_inputs.setup_generation == setup_generation &&
                      system_inputs.fetch_generation == owner->fetch_generation_ &&
                      system_inputs.index_generation == owner->index_generation_ &&
                      system_inputs.used_mask == tb.used_mask;
+  bool system_same = system_same_submission && system_same_inputs;
   if (!system_same) {
-    UpdateSystemConstants(st.primitive_polygonal, st.viewport, tb.used_mask, 0, vs, ps);
+    const uint64_t control = system_cpu_cache_enabled ? SystemCpuControlTag() : 0;
+    const bool refresh_cpu = RefreshSystemConstants(
+        system_cpu_cache_enabled, system_cpu_valid && system_cpu_fpcr == control,
+        system_same_submission, system_same_inputs);
+    if (refresh_cpu) {
+      UpdateSystemConstants(st.primitive_polygonal, st.viewport, tb.used_mask, 0, vs, ps);
+      system_cpu_valid = true;
+      system_cpu_fpcr = control;
+    } else if (system_cpu_verify_remaining) {
+      std::memcpy(system_cpu_verify_bytes.data(), &system_constants, sizeof(system_constants));
+      UpdateSystemConstants(st.primitive_polygonal, st.viewport, tb.used_mask, 0, vs, ps);
+      --system_cpu_verify_remaining;
+      ++system_cpu_verified;
+      if (std::memcmp(system_cpu_verify_bytes.data(), &system_constants, sizeof(system_constants))) {
+        // Recomputed bytes are already the original result for this draw.
+        system_cpu_cache_enabled = false;
+        REXLOG_WARN("[native] PERF63 system CPU cache mismatch; original refresh restored");
+      }
+      if (!system_cpu_verify_remaining) {
+        REXLOG_WARN("[native] PERF63 system CPU cache verified={} enabled={}",
+                    system_cpu_verified, system_cpu_cache_enabled);
+      }
+    } else {
+      if (++system_cpu_updates_avoided == 1) {
+        REXLOG_WARN("[native] PERF63 first verified CPU system update avoided; GPU upload preserved");
+      }
+    }
     system_inputs = {setup_generation, owner->fetch_generation_, owner->index_generation_,
                      tb.used_mask};
     system_same = last_system.submission == submission_number &&
@@ -7312,35 +8205,35 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       bound_index_valid = true;
     }
   }
-  if (water_dump_enabled && setup.active_vs &&
-      setup.active_vs->ucode_data_hash() == UINT64_C(0xFB0614F28843002E)) {
+  if (water_dump_enabled && CurrentSetup().active_vs &&
+      CurrentSetup().active_vs->ucode_data_hash() == UINT64_C(0xFB0614F28843002E)) {
     RequestWaterDump();
   }
 
-  if (edram_depth_alias_clear && setup.targets.depth && !setup.targets.color[0] &&
-      setup.targets.color[1] == nullptr) {
+  if (edram_depth_alias_clear && CurrentSetup().targets.depth && !CurrentSetup().targets.color[0] &&
+      CurrentSetup().targets.color[1] == nullptr) {
     auto draw_initiator = r.Get<reg::VGT_DRAW_INITIATOR>();
     if (draw_initiator.prim_type == xenos::PrimitiveType::kRectangleList) {
       AliasDepthClearToColor(r.Get<reg::RB_SURFACE_INFO>().msaa_samples);
     }
   }
   if (WaterSimTracing()) {
-    if (((post_trace_seconds && post_trace_count == 2) || capture_all) && setup.active_ps) {
-      PostDump(setup.active_ps->ucode_data_hash());
+    if (((post_trace_seconds && post_trace_count == 2) || capture_all) && CurrentSetup().active_ps) {
+      PostDump(CurrentSetup().active_ps->ucode_data_hash());
     }
     TraceSimDraw(d.count);
   }
   if (water_seq_frame && frame == water_seq_frame && water_seq_count < 24) {
     WaterSequenceDump(d.count);
   }
-  if (water_raw_pending && setup.active_ps &&
-      setup.active_ps->ucode_data_hash() == UINT64_C(0xA8A487FAF6E47E59)) {
+  if (water_raw_pending && CurrentSetup().active_ps &&
+      CurrentSetup().active_ps->ucode_data_hash() == UINT64_C(0xA8A487FAF6E47E59)) {
     DumpWaterSimInputs();
   }
   if (profile_draws && profile_frame) {
     // Its own segment: the time to the next mark is charged to this shader pair.
-    const uint64_t vs_hash = setup.active_vs ? setup.active_vs->ucode_data_hash() : 0;
-    const uint64_t ps_hash = setup.active_ps ? setup.active_ps->ucode_data_hash() : 0;
+    const uint64_t vs_hash = CurrentSetup().active_vs ? CurrentSetup().active_vs->ucode_data_hash() : 0;
+    const uint64_t ps_hash = CurrentSetup().active_ps ? CurrentSetup().active_ps->ucode_data_hash() : 0;
     if (profile_draw_kinds) {
       // B:122: by what the draw changed (bit 59 marks the kind key) and whether it is indexed.
       ProfileMark((kProfileDraw << 60) | (uint64_t(1) << 59) | (d.flags & 0x201F));
@@ -7365,8 +8258,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
                   uint32_t(fdc.z_enable), uint32_t(fdc.zfunc), uint32_t(fdc.z_write_enable),
                   uint32_t(fdc.stencil_enable), (unsigned long long)OqTargetId(targets.depth),
                   (unsigned long long)OqTargetId(targets.color[0]), (unsigned long long)OqTargetId(targets.color[1]),
-                  (unsigned long long)(setup.active_vs ? setup.active_vs->ucode_data_hash() : 0),
-                  (unsigned long long)(setup.active_ps ? setup.active_ps->ucode_data_hash() : 0), d.count,
+                  (unsigned long long)(CurrentSetup().active_vs ? CurrentSetup().active_vs->ucode_data_hash() : 0),
+                  (unsigned long long)(CurrentSetup().active_ps ? CurrentSetup().active_ps->ucode_data_hash() : 0), d.count,
                   st.viewport.z_min, st.viewport.z_max, st.viewport.ndc_scale[2], st.viewport.ndc_offset[2], gzs, gzo,
                   r[rex::graphics::XE_GPU_REG_PA_CL_VTE_CNTL], r[rex::graphics::XE_GPU_REG_PA_CL_CLIP_CNTL]);
     FdLine(line);
@@ -7376,8 +8269,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     const reg::RB_DEPTHCONTROL dc = draw_util::GetNormalizedDepthControl(r);
     if (oq_draw_logged < 96) {
       const uint32_t inner = occlusion.open_begin(occlusion.open_count() - 1);
-      const uint64_t vsh = setup.active_vs ? setup.active_vs->ucode_data_hash() : 0;
-      const uint64_t psh = setup.active_ps ? setup.active_ps->ucode_data_hash() : 0;
+      const uint64_t vsh = CurrentSetup().active_vs ? CurrentSetup().active_vs->ucode_data_hash() : 0;
+      const uint64_t psh = CurrentSetup().active_ps ? CurrentSetup().active_ps->ucode_data_hash() : 0;
       const RenderTarget* dt = targets.depth;
       const RenderTarget* ct = targets.color[0];
       const uint64_t sig = XXH3_64bits_withSeed(&vsh, 8, psh ^ (uint64_t(inner) << 32) ^ OqTargetId(dt) ^
@@ -7467,6 +8360,10 @@ void Renderer::Impl::Resolve() {
 
   BeginRecording();
   EndPass(PassEnd::Resolve);
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  const uint64_t resolve_profile_submission = submission_number;
+  const size_t resolve_profile_index = profile_segments[submission_number % kSubmissionSlots].size();
+#endif
   ProfileMark((kProfileResolve << 60) | (uint64_t(is_depth) << 56) |
               (uint64_t(surface_info.surface_pitch & 0x7FF) << 32) |
               (uint64_t(uint32_t(x1 - x0) & 0xFFFF) << 16) | uint32_t(y1 - y0));
@@ -7706,7 +8603,15 @@ void Renderer::Impl::Resolve() {
     // A cache hit only updates metadata. Every path that may record resource
     // creation, composite/sized copies or fragment draws takes the buffer first.
     ResolveDestination* dest = nullptr;
-    if (record_passes && !is_depth && !msaa && !fragment_copies &&
+    // B-009 + pass 52: a resolve the CPU reads back (small k_16_16_16_16 luminance) is never queued - the
+    // write-back below records it on the ring's command buffer. Queued, it skipped the write-back and the
+    // game's auto exposure saw stale values again (sky over-exposed with p2_native_record_passes = 1).
+    const bool cpu_readback_resolve =
+        resolve_cpu_writeback && !is_depth && dest_format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+        dest_info.copy_dest_format == xenos::ColorFormat::k_16_16_16_16 &&
+        dest_info.copy_dest_number == xenos::SurfaceNumberFormat::kUnsignedInteger &&
+        uint64_t(uint32_t(x0) + width) * (uint32_t(y0) + height) <= kCpuWritebackMaxTexels;
+    if (record_passes && !is_depth && !msaa && !fragment_copies && !cpu_readback_resolve &&
         textures.StorageCapable(dest_format)) {
       dest = textures.ReuseForQueuedCopy(dest_base & 0x1FFFFFFF, dest_width, dest_height,
                                          dest_format, host_swizzle);
@@ -7759,8 +8664,8 @@ void Renderer::Impl::Resolve() {
                           cascade, shadow_cascade);
             }
             if (!shadow_rt_known && shadow_depth_clamp) {
-              setup_cache.clear();
-              setup.valid = false;
+              ClearSetupCache();
+              CurrentSetup().valid = false;
             }
             shadow_rt_known = true;
             shadow_rt_base = source->key.base_tiles;
@@ -7790,11 +8695,18 @@ void Renderer::Impl::Resolve() {
           };
           if (cascade_skipped) {
             // Nothing to convert.
-          } else if (atlas && atlas_fragment_pipeline && atlas->color_target && sample_x == 1 &&
-                     sample_y == 1 &&
-                     AtlasFragmentPass(c, *source, *atlas, x0, y0, width, height, atlas_row)) {
+          } else if (atlas_fragment_pipeline && (atlas || depth_fragment_resolve) &&
+                     (atlas ? atlas->color_target
+                            : (dest->format == VK_FORMAT_R32_SFLOAT &&
+                               textures.ColorAttachmentCapable(dest->format))) &&
+                     sample_x == 1 && sample_y == 1 &&
+                     AtlasFragmentPass(c, *source, atlas ? atlas->storage_view : dest->view,
+                                       atlas ? atlas->width : dest->width,
+                                       atlas ? atlas->height : dest->height,
+                                       x0, y0, width, height, atlas_row,
+                                       atlas && shadow_empty_lit)) {
             probe_path = 10;
-            atlas_written_now();
+            if (atlas) atlas_written_now();
           } else {
           VkMemoryBarrier to_compute = {
               VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -7995,6 +8907,18 @@ void Renderer::Impl::Resolve() {
                                     dest_base & 0x1FFFFFFF));
       }
     }
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+    // Retag the existing asynchronous timestamp interval. No extra timestamp,
+    // query wait or GPU command. Never retag a different/full/new submission.
+    if (profile_frame && is_depth && submission_number == resolve_profile_submission) {
+      auto& segments = profile_segments[submission_number % kSubmissionSlots];
+      if (segments.size() == resolve_profile_index + 1) {
+        segments.back().key |= (uint64_t(probe_path & 15) << 43) |
+          (uint64_t(uint32_t(source->format) & 255) << 47) |
+          (uint64_t(HasStencil(source->format)) << 55);
+      }
+    }
+#endif
     if (resolve_probe_enabled) {
       uint32_t scale_bits = 0;
       std::memcpy(&scale_bits, &resolve_scale, sizeof(scale_bits));
@@ -8171,6 +9095,8 @@ void Renderer::Impl::FlushResolveBarrier() {
 void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, uint32_t width,
                           uint32_t height) {
   p2::gpuwait::Scope gpu_wait_scope(p2::gpuwait::NativeSwap);
+  p2::ringab::Update(REXCVAR_GET(p2_native_ring_ab_period_s));  // PERF pass 86
+  p2::ringab::Update87(REXCVAR_GET(p2_native_set87_ab_period_s));  // PERF pass 87
   // Water debug cycle: advance once a frame after the water appeared (cached setups do not
   // come back to BuildDrawSetup on their own).
   if (water_debug_next != std::chrono::steady_clock::time_point{}) UpdateWaterDebug();
@@ -8179,6 +9105,13 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
     RecordWaterDumps();
   }
   if (resolve_cpu_writeback) FinishCpuWritebacks();
+  if (&p2_nvk_dyn_pair_cache && p2_nvk_dyn_pair_cache && !nvk_pair_stats_logged &&
+      p2_nvk_dyn_pair_stats[0] + p2_nvk_dyn_pair_stats[1] + p2_nvk_dyn_pair_stats[2] > 200000) {
+    nvk_pair_stats_logged = true;
+    REXLOG_WARN("[native] NVK pair cache after {} pipeline binds: fast {}, computed {}, full copies {}",
+                p2_nvk_dyn_pair_stats[0] + p2_nvk_dyn_pair_stats[1] + p2_nvk_dyn_pair_stats[2],
+                p2_nvk_dyn_pair_stats[0], p2_nvk_dyn_pair_stats[1], p2_nvk_dyn_pair_stats[2]);
+  }
   if (capture_all && frame > water_sim_trace_frame) {
     capture_all = false;
     REXLOG_INFO("[native] CAPTURE {} done ({} lines)", capture_count, water_sim_trace_lines);
@@ -8501,6 +9434,16 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
   ++frame;
   p2::skinlog::g_frame.store(uint32_t(frame), std::memory_order_relaxed);
   if (frame % 600 == 0) {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+    REXLOG_INFO("[native] range hash CPU ns: indices={} static={} changed={}",
+                range_hash_ns[0], range_hash_ns[1], range_hash_ns[2]);
+    for (auto& ns : range_hash_ns) ns = 0;
+#endif
+    REXLOG_INFO("[native] setup pointer cache={} copies avoided={}", setup_pointer_cache, setup_copies_avoided);
+    REXLOG_INFO("[native] PERF75 lookup front={} hits={} verify left={} failed={}", lookup_front, lookup_front_hits, lookup_front_verify_left, lookup_front_failed);
+    REXLOG_INFO("[native] PERF55: range memo hits={} misses={} checked={} failed={}; sparse copies={} checked={} failed={}; setup copies={} bytes={}",
+      range_memo_hits, range_memo_misses, range_memo_checked, range_memo_failed,
+      sparse_record_copies, sparse_record_checked, sparse_record_failed, setup_cache_hits, setup_cache_copy_bytes);
     REXLOG_INFO("[native-occlusion] matching: address ends {}, overlapping begins {}, repeated begins {}, unmatched ends {}, demand submissions {}",
       occlusion_address_ends,occlusion_overlaps,occlusion_abandoned,occlusion_unmatched_ends,occlusion_demand_submits);
     REXLOG_INFO("[native-occlusion] batches {}, draws sharing a batch {}",occlusion_batches,occlusion_batched_draws);
@@ -8514,6 +9457,11 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
     REXLOG_INFO("[native] pass 23 binding-key memo: {} reused, {} hashed (mode {})", tbm_hits, tbm_misses,
                 REXCVAR_GET(p2_ring_hash_memo));
     tbm_hits = tbm_misses = 0;
+    if (tb_key_gen) {
+      REXLOG_INFO("[native] texture-binding key: {} reused, {} computed, {} verified, {} mismatches", tbk_hits,
+                  tbk_misses, tbk_verified, tbk_mismatches);
+      tbk_hits = tbk_misses = 0;
+    }
     if (pipeline_hash_memo) {
       REXLOG_INFO("[native] pipeline-key hash memo: {} reused, {} hashed", pipeline_hash_memo_hits,
                   pipeline_hash_memo_misses);
@@ -8745,14 +9693,21 @@ void Renderer::Impl::LoadPrewarm(const std::filesystem::path& directory, uint32_
               valid ? "" : ", damaged or other version: starting a new list",
               prewarm_path.string());
   if (!prewarm_keys.empty() && !prewarm_thread.joinable()) {
+    const uint64_t signature = REXCVAR_GET(p2_native_prewarm_spirv_cache)
+                                   ? XXH3_64bits_withSeed(payload.data(), payload.size(),
+                                                          (uint64_t(shader_count) << 32) | key_count)
+                                   : 0;
     prewarm_thread = std::thread(
-        [this, list_shaders = prewarm_shader_list, keys = prewarm_keys]() mutable {
-          PrewarmThread(std::move(list_shaders), std::move(keys));
+        [this, list_shaders = prewarm_shader_list, keys = prewarm_keys, signature]() mutable {
+          PrewarmThread(std::move(list_shaders), std::move(keys), signature);
         });
   }
 }
 
 void Renderer::Impl::SavePrewarm() {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  const uint64_t prepare_start = NowNs();
+#endif
   prewarm_saved_keys = prewarm_keys.size();
   auto data = std::make_shared<std::vector<uint8_t>>();
   std::vector<uint8_t>& out = *data;
@@ -8777,10 +9732,18 @@ void Renderer::Impl::SavePrewarm() {
   std::memcpy(out.data(), &magic, 8);
   std::memcpy(out.data() + 8, fields, 16);
   std::memcpy(out.data() + 24, &payload_hash, 8);
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  const uint64_t encoded_ns = NowNs() - prepare_start;
+  const uint64_t join_start = NowNs();
+#endif
   prewarm_writing = true;
   if (prewarm_writer.joinable()) {
     prewarm_writer.join();
   }
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  REXLOG_INFO("[native] prewarm prepare: bytes={} shaders={} keys={} encode_ns={} join_ns={}",
+              out.size(), prewarm_shader_list.size(), prewarm_keys.size(), encoded_ns, NowNs() - join_start);
+#endif
   std::filesystem::path path = prewarm_path;
   const size_t key_count = prewarm_keys.size();
   prewarm_writer = std::thread([this, data, path, key_count]() {
@@ -8804,6 +9767,9 @@ void Renderer::Impl::SavePrewarm() {
 }
 
 void Renderer::Impl::SaveDriverCache() {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  const uint64_t query_start = NowNs();
+#endif
   pipelines_at_last_save = stats().pipelines_created;
   size_t size = 0;
   if (Extra(device).vkGetPipelineCacheData(vk, driver_cache, &size, nullptr) != VK_SUCCESS ||
@@ -8811,17 +9777,29 @@ void Renderer::Impl::SaveDriverCache() {
     return;
   }
   auto data = std::make_shared<std::vector<uint8_t>>(size);
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  const uint64_t query_allocate_ns = NowNs() - query_start;
+  const uint64_t snapshot_start = NowNs();
+#endif
   if (Extra(device).vkGetPipelineCacheData(vk, driver_cache, &size, data->data()) != VK_SUCCESS) {
     return;
   }
   data->resize(size);
   driver_cache_saved_size = size;
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  const uint64_t snapshot_ns = NowNs() - snapshot_start;
+  const uint64_t join_start = NowNs();
+#endif
   driver_cache_writing = true;
   std::filesystem::path path = driver_cache_path;
   // Joined, never detached: detaching throws on Horizon, which ended the game.
   if (driver_cache_writer.joinable()) {
     driver_cache_writer.join();
   }
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  REXLOG_INFO("[native] driver cache prepare: bytes={} query_allocate_ns={} snapshot_ns={} join_ns={}",
+              size, query_allocate_ns, snapshot_ns, NowNs() - join_start);
+#endif
   driver_cache_writer = std::thread([this, data, path]() {
     rex::thread::set_current_thread_name("GPU cache save");
     auto temporary = path;
@@ -8892,28 +9870,47 @@ void Renderer::LoadShader(xenos::ShaderType type, const uint32_t* ucode, uint32_
   uint64_t location = 0;
   uint64_t sample = 0;
   uint64_t head = 0;
+  const uint32_t head_words = std::min(dword_count, 16u);
+  auto& last = impl_->last_shader_load[type == xenos::ShaderType::kVertex ? 0 : 1];
+  auto remember = [&](VulkanShader* shader) {
+    last.location = location;
+    last.frame = impl_->frame;
+    last.words = head_words;
+    std::memcpy(last.head, ucode, head_words * sizeof(uint32_t));
+    last.shader = shader;
+  };
   if (guest_address) {
     location = (uint64_t(guest_address) << 20) | (uint64_t(dword_count) << 2) | uint64_t(type);
-    auto known = impl_->shaders_by_location.find(location);
-    head = XXH3_64bits(ucode, std::min(dword_count, 16u) * sizeof(uint32_t));
-    if (known != impl_->shaders_by_location.end() &&
-        known->second.verified_frame == impl_->frame && known->second.head == head) {
+    if (last.location == location && last.frame == impl_->frame && last.words == head_words &&
+        std::memcmp(last.head, ucode, head_words * sizeof(uint32_t)) == 0) {
       if (type == xenos::ShaderType::kVertex) {
-        impl_->active_vs = known->second.shader;
+        impl_->active_vs = last.shader;
       } else {
-        impl_->active_ps = known->second.shader;
+        impl_->active_ps = last.shader;
       }
       return;
     }
-    sample = XXH3_64bits(ucode, dword_count * sizeof(uint32_t));
-    if (known != impl_->shaders_by_location.end() && known->second.sample == sample) {
-      known->second.verified_frame = impl_->frame;
-      known->second.head = head;
+    auto* known = impl_->FindKnownShader(location);
+    head = XXH3_64bits(ucode, std::min(dword_count, 16u) * sizeof(uint32_t));
+    if (known && known->verified_frame == impl_->frame && known->head == head) {
       if (type == xenos::ShaderType::kVertex) {
-        impl_->active_vs = known->second.shader;
+        impl_->active_vs = known->shader;
       } else {
-        impl_->active_ps = known->second.shader;
+        impl_->active_ps = known->shader;
       }
+      remember(known->shader);
+      return;
+    }
+    sample = XXH3_64bits(ucode, dword_count * sizeof(uint32_t));
+    if (known && known->sample == sample) {
+      known->verified_frame = impl_->frame;
+      known->head = head;
+      if (type == xenos::ShaderType::kVertex) {
+        impl_->active_vs = known->shader;
+      } else {
+        impl_->active_ps = known->shader;
+      }
+      remember(known->shader);
       return;
     }
   }
@@ -8949,6 +9946,7 @@ void Renderer::LoadShader(xenos::ShaderType type, const uint32_t* ucode, uint32_
   }
   if (location) {
     impl_->shaders_by_location[location] = {shader, sample, impl_->frame, head};
+    remember(shader);
   }
 }
 

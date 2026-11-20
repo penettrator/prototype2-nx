@@ -85,8 +85,11 @@ cross_setup=()
 # after compiler changes. Key it on the compiler/driver sources instead.
 NVK_BUILD_ID="$(find src/nouveau/compiler src/nouveau/vulkan src/nouveau/nil     src/compiler/nir src/compiler/spirv -type f     \( -name '*.c' -o -name '*.h' -o -name '*.rs' -o -name '*.py' \)     -print0 | LC_ALL=C sort -z | xargs -0 cat | sha1sum | cut -c1-40)"
 echo "NVK build id (shader cache key): $NVK_BUILD_ID"
+# 1.0: the NVK pipeline-state pair cache (patches/mesa-switch.patch, vk_graphics_state.c) is compiled in.
+sed "s/'-D__SWITCH__',/'-D__SWITCH__','-DP2_NVK_DYN_PAIR_CACHE=1',/g" switch_cross_file.txt > /tmp/p2_switch_cross.txt
+grep -q P2_NVK_DYN_PAIR_CACHE /tmp/p2_switch_cross.txt
 meson setup builddir-switch "${cross_setup[@]}" \
-    --cross-file switch_cross_file.txt \
+    --cross-file /tmp/p2_switch_cross.txt \
     --native-file /work/tools/switch/mesa-native.ini \
     --buildtype=release \
     -Doptimization=2 \

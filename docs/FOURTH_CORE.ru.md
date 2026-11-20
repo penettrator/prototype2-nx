@@ -1,4 +1,4 @@
-# Четвёртое ядро — Prototype 2, 0.5.0
+# Четвёртое ядро — Prototype 2, 1.0
 
 [English](FOURTH_CORE.en.md)
 

@@ -8,6 +8,7 @@
 #include "../project/src/native/staging_reuse_stats.h"
 #include "../project/src/native/frame_pacing_window.h"
 extern "C" bool P2LightFrameReportEnabled(void);
+extern "C" bool P2CpuIdleReportEnabled(void);
 #include <rex/ui/switch_apm.h>
 #include <rex/ui/switch_saltynx.h>
 #include <rex/ui/switch_sysclk.h>
@@ -33,11 +34,55 @@ Thread g_thread;
 p2::native::FramePacingWindow g_pacing;
 std::atomic<u64> g_last_present_tick{0};
 u64 g_report_tick=0,g_report_presents=0;
+// PERF pass 80 (p2_cpu_idle_report, off by default): CPU load per core in the release build. The kernel
+// only reports the idle time of the core the caller runs on (InfoType_IdleTickCount, subtype -1), so this
+// worker visits each core of the process mask once per 10 s window, then restores its own mask. Game
+// threads are not touched.
+u64 g_idle_last[4]={},g_idle_tick=0;
+bool g_idle_have=false;
+void WriteCpuIdle(u64 now,u64 freq){
+  if(!P2CpuIdleReportEnabled())return;
+  u64 process_mask=0;
+  if(R_FAILED(svcGetInfo(&process_mask,InfoType_CoreMask,CUR_PROCESS_HANDLE,0)))return;
+  s32 own_pref=0;u64 own_mask=0;
+  if(R_FAILED(svcGetThreadCoreMask(&own_pref,&own_mask,CUR_THREAD_HANDLE)))return;
+  u64 idle[4]={};bool ok[4]={};
+  for(int c=0;c<4;++c){
+    if(!(process_mask&(1ull<<c)))continue;
+    if(R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE,c,1ull<<c)))continue;
+    __real_svcSleepThread(0);  // reschedule onto core c
+    if(svcGetCurrentProcessorNumber()!=u32(c))continue;
+    ok[c]=R_SUCCEEDED(svcGetInfo(&idle[c],InfoType_IdleTickCount,INVALID_HANDLE,UINT64_MAX));
+  }
+  svcSetThreadCoreMask(CUR_THREAD_HANDLE,own_pref,own_mask);
+  const u64 tick=armGetSystemTick();
+  if(g_idle_have&&tick>g_idle_tick){
+    const double window=double(tick-g_idle_tick);
+    char path[1024];std::snprintf(path,sizeof(path),"%scpu_idle.csv",RexSwitchLogDir());
+    if(FILE* f=std::fopen(path,"a")){
+      if(std::ftell(f)==0)std::fprintf(f,"tick_s,window_s,busy0_pct,busy1_pct,busy2_pct,busy3_pct,busy_total_pct\n");
+      std::fprintf(f,"%.3f,%.3f",double(now)/double(freq),window/double(freq));
+      double total=0;
+      for(int c=0;c<4;++c){
+        if(ok[c]&&g_idle_last[c]&&idle[c]>=g_idle_last[c]){
+          double busy=100.0-double(idle[c]-g_idle_last[c])*100.0/window;
+          if(busy<0)busy=0;
+          total+=busy;std::fprintf(f,",%.1f",busy);
+        }else std::fprintf(f,",-1");
+      }
+      std::fprintf(f,",%.1f\n",total);
+      std::fclose(f);
+    }
+  }
+  for(int c=0;c<4;++c)g_idle_last[c]=ok[c]?idle[c]:0;
+  g_idle_tick=tick;g_idle_have=true;
+}
 void WriteLightReport(u64 now,u64 freq) {
   if(!P2LightFrameReportEnabled()) return;
   const u64 presents=g_counters[0].load(std::memory_order_relaxed);
   if(!g_report_tick){g_pacing.Take();g_report_tick=now;g_report_presents=presents;return;}
   if(now-g_report_tick<10*freq)return;
+  WriteCpuIdle(now,freq);
   const double seconds=double(now-g_report_tick)/double(freq);
   const auto frame=g_pacing.Take();
   const auto& staging=p2::native::staging_reuse_counters;

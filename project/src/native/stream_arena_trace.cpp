@@ -69,11 +69,12 @@ void SaveArenaFailure(uint32_t object,uint32_t kind,const uint32_t* state) {
 #endif
 }
 }
+extern "C" bool P2DevTelemetry();  // switch_quality.cpp
 extern "C" bool P2ArenaTraceEnabled(){
 #ifdef P2_ARENA_TRACE_TEST
     return arena_test_enabled;
 #else
-    return REXCVAR_GET(p2_stream_arena_trace);
+    return REXCVAR_GET(p2_stream_arena_trace) || P2DevTelemetry();
 #endif
 }
 extern "C" void P2ArenaTraceRecord(uint32_t kind,uint32_t object,

@@ -1,4 +1,4 @@
-# Building Prototype 2 — 0.5.0
+# Building Prototype 2 — 1.0
 
 [Русский](BUILD.ru.md)
 
@@ -63,13 +63,13 @@ Default8compile jobs; adjust with `JOBS=4 bash tools/build_switch.sh`. Uses gues
 
 ## 5. Packaging
 
-Place the NRO and `config/prototype2.toml` in `switch/Prototype2/`, add `p2mem.nsp` (`bash tools/build_p2mem.sh` → `out/p2mem/exefs.nsp`, renamed to `p2mem.nsp`), VERSION 0.5.0, licenses and bilingual instructions. Public releases must exclude game_root, prod.keys/title.keys and personal saves/logs. For your installation add your own disc data separately. Title takeover needs no NSP forwarder. Distribute checksums with prepared packages.
+Place the NRO and `config/prototype2.toml` in `switch/Prototype2/`, add `p2mem.nsp` (`bash tools/build_p2mem.sh` → `out/p2mem/exefs.nsp`, renamed to `p2mem.nsp`), VERSION 1.0, licenses and bilingual instructions. Public releases must exclude game_root, prod.keys/title.keys and personal saves/logs. For your installation add your own disc data separately. Title takeover needs no NSP forwarder. Distribute checksums with prepared packages.
 
 ## Source layout
 
-`project/src`: handwritten hooks/native renderer; `switch`: CMake/Horizon; `tools`: code generation/build/checks; `patches`: SDK/Mesa changes; `config`: 0.5.0 settings; `docs`:RU/EN. Building never automatically connects to the Switch or overwrites the SD.
+`project/src`: handwritten hooks/native renderer; `switch`: CMake/Horizon; `tools`: code generation/build/checks; `patches`: SDK/Mesa changes; `config`: 1.0 settings; `docs`:RU/EN. Building never automatically connects to the Switch or overwrites the SD.
 
-## NSP forwarder 0.5.0
+## NSP forwarder 1.0
 
 After building an NRO with an icon/NACP, use Git Bash, Git, Docker and your own prod.keys:
 
@@ -84,6 +84,6 @@ Defaults: `P2_RELEASE_DIAGNOSTICS_OFF=ON`, `P2_TASK_LIFETIME_AUDIT=OFF`, `P2_GUE
 
 ## PGO
 
-`tools/build_switch.sh` defaults to `PGO=USE` with 375 GCC profiles in `config/pgo-data` (game code, native application and the SDK runtime/core/audio libraries). Both generated guest code and the native application are optimized; the resulting NRO contains no gcov training dumper. Use GCC 15.2 and the script's `/work` Docker layout for profile compatibility. The build stops if the image's GCC version differs from the profiles' (`tools/check_pgo_compiler.py`). The release was built with `DEVKITA64_IMAGE=devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282`. Profiles contain compiler counters, not game assets.
+`tools/build_switch.sh` defaults to `PGO=USE` with 378 GCC profiles in `config/pgo-data` (game code, native application and the SDK runtime/core/audio libraries). Both generated guest code and the native application are optimized; the resulting NRO contains no gcov training dumper. Use GCC 15.2 and the script's `/work` Docker layout for profile compatibility. The build stops if the image's GCC version differs from the profiles' (`tools/check_pgo_compiler.py`). The release was built with `DEVKITA64_IMAGE=devkitpro/devkita64@sha256:1fc388c3a0d34bd2045a6dadcb1020e069d5f876a187fd705de14b4440c00282`. Profiles contain compiler counters, not game assets.
 
 Build without PGO: `PGO=OFF bash tools/build_switch.sh`. To train your own profiles, build with `PGO=GEN bash tools/build_switch.sh`, run that NRO and play varied scenes. Profiles are written to `SD:/pgo/` every three minutes. Copy the `.gcda` files into `config/pgo-data/`, then rebuild with `PGO=USE`. GEN/USE require compatible sources, the same compiler and build-directory layout. GEN uses arc counts only (`-fno-profile-values`); USE corrects inconsistent counters. Training dumps can stall the game, so do not benchmark FPS with a GEN build.

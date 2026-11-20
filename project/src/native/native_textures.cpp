@@ -15,6 +15,10 @@
 #include "composite_tile_index.h"
 
 #include <algorithm>
+#include <array>
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+#include <chrono>
+#endif
 #include <cstdio>
 #include <atomic>
 #include <condition_variable>
@@ -356,6 +360,40 @@ struct LevelLayout {
   uint32_t slices;              // array layers, or (3D) depth of this level
 };
 
+// The base address of a 32x32 tile of 16-byte blocks occupies bits above
+// the in-tile swizzle. Reuse the reference offsets for every such tile.
+void UntileBC16Row(uint8_t* out, const uint8_t* src, uint32_t x, uint32_t y,
+                   uint32_t pitch, uint32_t blocks, xenos::Endian endian) {
+  static const auto offsets = [] {
+    std::array<std::array<uint16_t, 32>, 32> table{};
+    for (uint32_t row = 0; row < 32; ++row) {
+      for (uint32_t col = 0; col < 32; ++col) {
+        table[row][col] = uint16_t(texture_util::GetTiledOffset2D(col, row, 32, 4));
+      }
+    }
+    return table;
+  }();
+  const auto& row = offsets[y & 31];
+  const size_t pitch_tiles = (size_t(pitch) + 31) >> 5;
+  size_t tile_base = ((x >> 5) + (y >> 5) * pitch_tiles) << 14;
+  uint32_t column = x & 31;
+  while (blocks) {
+    const uint32_t count = std::min(blocks, 32u - column);
+    for (uint32_t i = 0; i < count; ++i) {
+      texture_conversion::CopySwapBlock(endian, out + size_t(i) * 16,
+                                        src + tile_base + row[column + i], 16);
+    }
+    out += size_t(count) * 16;
+    blocks -= count;
+    tile_base += 1u << 14;
+    column = 0;
+  }
+}
+
+REXCVAR_DEFINE_BOOL(p2_native_untile_bc16_table, false, "Prototype2",
+                    "Use a tile offset table for plain 2D textures with 16-byte BC blocks")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 // Everything the untiling of one texture needs, so it can run on a worker.
 struct UntileJob {
   LevelLayout levels[xenos::kTextureMaxMips];
@@ -381,6 +419,16 @@ void RunUntile(const UntileJob& j) {
     const uint8_t* mip_data = j.mip_data;
     uint8_t* staging = j.staging;
     const bool host_blocks = j.host_blocks;
+    static const bool use_bc16_table = REXCVAR_GET(p2_native_untile_bc16_table);
+    const bool untile_bc16 = use_bc16_table && j.tiled && !j.is_3d && host_blocks &&
+                            j.conversion == Conversion::kCopy &&
+                            j.bpb_log2 == 4 && j.guest_bytes_per_block == 16;
+    if (untile_bc16) {
+      [[maybe_unused]] static const bool logged = [] {
+        REXLOG_WARN("[native] tiled 2D BC16 offset table active");
+        return true;
+      }();
+    }
     const xenos::TextureFormat format = j.format;
     const uint32_t block_width = j.block_width, block_height = j.block_height,
                    guest_bytes_per_block = j.guest_bytes_per_block, bpb_log2 = j.bpb_log2,
@@ -436,6 +484,11 @@ void RunUntile(const UntileJob& j) {
           uint32_t gy = by + offset_y_blocks;
           uint8_t* out_row = out + size_t(by) * (host_blocks ? l.host_row_bytes
                                                              : l.host_row_bytes * block_height);
+          if (untile_bc16) {
+            UntileBC16Row(out_row, src, offset_x_blocks, gy, pitch_blocks, l.blocks_x,
+                          j.endianness);
+            continue;
+          }
           // Linear: the row is contiguous, one copy (and swap) does it. The
           // video planes of the cutscenes (1280x720 and two 640x360, 8-bit,
           // every frame) took 15 ms a frame one texel at a time.
@@ -524,6 +577,14 @@ REXCVAR_DEFINE_BOOL(p2_native_sync_color_lut, true, "Prototype2",
 REXCVAR_DEFINE_BOOL(p2_native_sync_video_planes, false, "Prototype2",
                     "Create the cutscene video planes (linear 8-bit, one mip) immediately instead of streaming "
                     "them: streamed, the first video frame was drawn with empty planes (a green flash)");
+// B-017 (2026-11-20, second console: colours flicker during the first moments of a video): the planes sit unchanged
+// before a video, so the change detector trusts them (checked one frame in 8-16, sampled); when the video starts
+// (often out of black, where the samples see no change) Y, U and V are each picked up on a different frame, and a
+// new luma plane was drawn with old chroma. With this flag the video planes (IsVideoPlane) are hashed in full every
+// frame and never trusted (~1.4 MB a frame while a video is on screen).
+REXCVAR_DEFINE_BOOL(p2_native_exact_video_planes, false, "Prototype2",
+                    "Check the cutscene video planes in full every frame (no sampled/trusted skips)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(p2_native_3d_textures, true, "Prototype2",
                     "Upload 3D (volume) textures as Vulkan 3D images (Prototype 2 colour grading LUT). "
                     "false = drawn with an empty texture, as before");
@@ -556,6 +617,7 @@ REXCVAR_DEFINE_UINT32(p2_native_sync_texture_kb, 32, "Prototype2",
                       "Largest new texture (KB of host data) made on the spot");
 REXCVAR_DEFINE_BOOL(p2_frame_pacing_report, false, "Prototype2",
     "Optional 10-second frame-interval and staging-reuse CSV report; no stack sampling");
+extern "C" bool P2DevTelemetry();  // switch_quality.cpp
 extern "C" bool P2LightFrameReportEnabled() { return staging_reuse_counters.report_enabled.load(std::memory_order_acquire); }
 REXCVAR_DEFINE_UINT32(p2_native_staging_pool_mb, 0, "Prototype2",
     "MiB of GPU-complete texture upload buffers retained for reuse; 0 = old allocation path. "
@@ -582,6 +644,10 @@ REXCVAR_DEFINE_BOOL(p2_native_reap_unused_streams, true, "Prototype2",
 REXCVAR_DEFINE_UINT32(p2_native_texture_cache_mb, 128, "Prototype2",
     "Keep idle material textures while the cached host payload is below this many MiB; "
     "0 restores age-only eviction. Driver overhead and in-flight images are additional");
+
+REXCVAR_DEFINE_BOOL(p2_native_texture_trim_sort_guard, false, "Prototype2",
+    "Skip sorting idle texture eviction candidates while payload is within budget; rollback=false")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 struct TextureCache::Texture {
   VkImage image = VK_NULL_HANDLE;
@@ -615,6 +681,11 @@ struct TextureCache::Impl {
   // round trip (memory map) per changed texture, about 50 a second in play.
   std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures;
   uint64_t cached_payload_bytes = 0, cache_evictions = 0;
+  bool trim_sort_guard = false;
+  uint64_t trim_sorts = 0, trim_sorts_skipped = 0, trim_candidates_skipped = 0;
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+  uint64_t trim_sort_ns[2] = {}, trim_sort_candidates[2] = {};
+#endif
   // Layout key hash -> content hash of the last check, per frame, so the data
   // of a texture used by many draws is hashed once per frame.
   struct Checked {
@@ -1213,7 +1284,8 @@ bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* m
   im.staging_pool_budget = uint64_t(std::min(REXCVAR_GET(p2_native_staging_pool_mb), 64u)) << 20;
   im.staging_pool_stopping = false;
   staging_reuse_counters.budget_bytes.store(im.staging_pool_budget, std::memory_order_relaxed);
-  staging_reuse_counters.report_enabled.store(REXCVAR_GET(p2_frame_pacing_report), std::memory_order_release);
+  staging_reuse_counters.report_enabled.store(REXCVAR_GET(p2_frame_pacing_report) || P2DevTelemetry(),
+                                              std::memory_order_release);
   im.upload_thread = std::thread([&im]() { im.UploadThread(); });
   for (std::thread& thread : im.stream_threads) {
     thread = std::thread([&im]() { im.StreamThread(); });
@@ -1222,6 +1294,7 @@ bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* m
   im.device = device;
   im.memory = memory;
   im.texture_pool = REXCVAR_GET(p2_native_texture_pool);
+  im.trim_sort_guard = REXCVAR_GET(p2_native_texture_trim_sort_guard);
   REXLOG_INFO("[native] texture memory pool {}", im.texture_pool);
   im.max_anisotropy =
       device->properties().samplerAnisotropy
@@ -1467,9 +1540,27 @@ void TextureCache::BeginFrame(uint64_t frame, uint64_t completed_frame) {
     stream_lifetime_counters.ready.store(ready_count, std::memory_order_relaxed);
     stream_lifetime_counters.ready_staging_bytes.store(ready_staging_bytes, std::memory_order_relaxed);
     const uint64_t budget = uint64_t(REXCVAR_GET(p2_native_texture_cache_mb)) << 20;
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-      return a.last_used < b.last_used;
-    });
+    // The eviction loop cannot consume candidates at or below budget. Keep the
+    // scan above (stream reaping/statistics) and the exact sort under pressure,
+    // including its ordering of equal ages, unchanged.
+    if (!im.trim_sort_guard || payload > budget) {
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+      const auto sort_start = std::chrono::steady_clock::now();
+#endif
+      std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        return a.last_used < b.last_used;
+      });
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+      const unsigned pressure = payload > budget;
+      im.trim_sort_ns[pressure] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - sort_start).count());
+      im.trim_sort_candidates[pressure] += candidates.size();
+#endif
+      ++im.trim_sorts;
+    } else {
+      ++im.trim_sorts_skipped;
+      im.trim_candidates_skipped += candidates.size();
+    }
     for (const auto& candidate : candidates) {
       if (payload <= budget) break;
       auto t = im.textures.find(candidate.key);
@@ -1517,6 +1608,12 @@ void TextureCache::BeginFrame(uint64_t frame, uint64_t completed_frame) {
     REXLOG_INFO("[native] material cache: {} live, {} MiB payload, {} MiB retention budget, {} evicted total",
                 im.textures.size(), im.cached_payload_bytes >> 20,
                 REXCVAR_GET(p2_native_texture_cache_mb), im.cache_evictions);
+    REXLOG_INFO("[native] texture trim sorts: {} performed, {} skipped ({} candidates), guard={}",
+                im.trim_sorts, im.trim_sorts_skipped, im.trim_candidates_skipped, im.trim_sort_guard);
+#if !defined(P2_RELEASE_DIAGNOSTICS_OFF)
+    REXLOG_INFO("[native] texture trim sort CPU: within_budget_ns={} candidates={} over_budget_ns={} candidates={}",
+                im.trim_sort_ns[0], im.trim_sort_candidates[0], im.trim_sort_ns[1], im.trim_sort_candidates[1]);
+#endif
     last = stats_;
     last_report_frame = frame;
   }
@@ -2431,13 +2528,19 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
 
   // The content, hashed at most once per frame for each layout.
   Impl::Checked& checked = im.checked[key_hash];
+  static const bool exact_video_planes = REXCVAR_GET(p2_native_exact_video_planes);
+  const bool exact_video = exact_video_planes && base_size && !mip_size &&
+                           IsVideoPlane(fetch.dimension == xenos::DataDimension::k3D, fetch.tiled,
+                                        format == xenos::TextureFormat::k_8, mip_max_level + 1, layers, width,
+                                        height, base_size);
   uint64_t texture_hash;
   if (checked.frame == im.frame) {
     texture_hash = checked.texture_hash;
   } else {
     uint64_t content = key_hash;
     if (base_size) {
-      content ^= checked.base.Check(base_data, base_size, im.frame, key_hash, stats_.hash_bytes);
+      content ^= exact_video ? checked.base.CheckExact(base_data, base_size, stats_.hash_bytes)
+                             : checked.base.Check(base_data, base_size, im.frame, key_hash, stats_.hash_bytes);
     }
     if (mip_size) {
       content ^= checked.mips.Check(mip_data, mip_size, im.frame, key_hash >> 8,
@@ -2447,7 +2550,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     checked.frame = im.frame;
     checked.texture_hash = texture_hash;
   }
-  const uint64_t valid_until =
+  const uint64_t valid_until = exact_video ? im.frame :
       std::min(base_size ? checked.base.TrustedUntil(im.frame, key_hash) : UINT64_MAX,
                mip_size ? checked.mips.TrustedUntil(im.frame, key_hash >> 8) : UINT64_MAX);
 

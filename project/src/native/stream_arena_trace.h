@@ -12,5 +12,11 @@ extern "C" void P2ArenaTraceRecord(uint32_t kind, uint32_t object,
 extern "C" bool P2ArenaOverflowEnabled();
 extern "C" uint32_t P2ArenaOverflowAlloc(uint8_t* base, uint32_t arena, uint32_t size, uint32_t alignment,
                                          uint32_t part);
+extern "C" uint32_t P2ArenaOverflowAlloc2(uint8_t* base, uint32_t arena, uint32_t size, uint32_t alignment,
+                                          uint32_t gpu);
 extern "C" void P2ArenaOverflowFree(uint8_t* base, uint32_t arena, uint32_t address);
 extern "C" void P2ArenaOverflowDestroy(uint8_t* base, uint32_t arena);
+// B-014 (stream_arena_overflow.cpp): fallback block of a new second-class stream arena when the game's allocator
+// returns NULL (sub_82CA2970), released at sub_822BD600. Hooked by tools/p2_arena2_block_patch.py.
+extern "C" uint32_t P2Arena2BlockFallback(uint8_t* base, uint32_t heap_index, uint32_t size);
+extern "C" bool P2Arena2BlockFree(uint8_t* base, uint32_t heap_index, uint32_t address);

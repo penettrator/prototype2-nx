@@ -11,7 +11,7 @@ source=(root/'project/src/native/native_renderer.cpp').read_text();header=(root/
 part=source[source.index('  static constexpr uint32_t kRecordQueueSize'):source.index('  RendererStats& stats()')]
 assert 'std::this_thread::yield' not in part and 'wait_for' not in part
 assert 'record_work.Drain();' in part and 'record_work.Close();' in source
-assert part.index('ExecuteDrawCommand(*draw);')<part.index('record_work.CompleteFront();')
+assert part.index('std::visit([this](const auto& value) { Execute(value); }, *command);')<part.index('record_work.CompleteFront();')
 assert 'wait_for' not in header and 'yield' not in header
 asm=(root/'build/switch-hot/blocking_record_thread.asm').read_text()
 assert ('RecordThread' in asm or 'Initialize()::{lambda()#2}' in asm) and re.search(r'condition_variable.*wait',asm)
@@ -23,6 +23,6 @@ elf=(root/'build/nro-archive'/(r['tag']+'.elf')).read_bytes()
 assert b'periodic polls=0' in elf and b'Native draw recorder closed before submission' in elf
 prof=(root/'reference/masseffect-nx/sdk/src/ui/switch_perf.cpp').read_text()
 assert 'ms >= 2 && ms <= 100' in prof and 'elapsed < uint64_t(p2_delay_seconds)+p2_duration_seconds' in prof
-r.update({'queue_capacity':4096,'queue_batch':32,'blocking_recorder_disassembly_verified':True,'runtime_settings_identical_to':'35-arm-cpu-lowering','sampling_flag':flag.decode(),'sampling_flag_sha256':hashlib.sha256(flag).hexdigest(),'queue_header_sha256':hashlib.sha256((root/'project/src/native/blocking_record_queue.h').read_bytes()).hexdigest(),'limits':'Hardware park/counter/FPS/collision/visual validation pending; exclude bounded180–220scene-second sampling window from performance comparisons'})
+r.update({'queue_capacity':4096,'queue_batch':32,'blocking_recorder_disassembly_verified':True,'runtime_settings_identical_to':'35-arm-cpu-lowering','sampling_flag':flag.decode(),'sampling_flag_sha256':hashlib.sha256(flag).hexdigest(),'queue_header_sha256':hashlib.sha256((root/'project/src/native/blocking_record_queue.h').read_bytes()).hexdigest(),'limits':'Hardware park/counter/FPS/collision/visual validation pending; exclude bounded180вЂ“220scene-second sampling window from performance comparisons'})
 (root/'build/switch-hot/blocking_record_build_check.json').write_text(json.dumps(r,indent=2))
 print('PASS ARM condition-variable waits/no yield loops in consumer and producer wait, execute-before-complete/drain/close, settings36==35, bounded2ms/180s/40s sampling',r['tag'])

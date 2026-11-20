@@ -74,6 +74,49 @@ index 0000000..4427f70
 +void OnShaders(bool memexport_vertex, bool memexport_pixel);
 +
 +}  // namespace rex::graphics::edram_census
+diff --git a/sdk/include/rex/graphics/pipeline/shader/shader.h b/sdk/include/rex/graphics/pipeline/shader/shader.h
+index 4cf3854..a7aa382 100644
+--- a/sdk/include/rex/graphics/pipeline/shader/shader.h
++++ b/sdk/include/rex/graphics/pipeline/shader/shader.h
+@@ -806,6 +806,16 @@ class Shader {
+     // If there was some failure during preparation on the implementation side.
+     void MakeInvalid() { is_valid_ = false; }
+ 
++    // For a backend restoring a trusted, versioned cache before publishing this translation.
++    void SetCachedBinary(std::vector<uint8_t> binary) {
++      translated_binary_ = std::move(binary);
++      is_valid_ = is_translated_ = true;
++    }
++    void ResetCachedBinary() {
++      translated_binary_.clear();
++      is_valid_ = is_translated_ = false;
++    }
++
+    private:
+     friend class Shader;
+     friend class ShaderTranslator;
+diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv.h b/sdk/include/rex/graphics/pipeline/shader/spirv.h
+index dd90ef7..ffe7bd6 100644
+--- a/sdk/include/rex/graphics/pipeline/shader/spirv.h
++++ b/sdk/include/rex/graphics/pipeline/shader/spirv.h
+@@ -58,6 +58,17 @@ class SpirvShader : public Shader {
+     return sampler_bindings_;
+   }
+ 
++  // Must be called by the owning worker before publishing the shader.
++  void RestoreCachedBindings(std::vector<TextureBinding> textures,
++                             std::vector<SamplerBinding> samplers) {
++    if (bindings_setup_entered_.test_and_set(std::memory_order_relaxed)) return;
++    texture_bindings_ = std::move(textures);
++    sampler_bindings_ = std::move(samplers);
++    for (const auto& texture : texture_bindings_) {
++      used_texture_mask_ |= uint32_t(1) << texture.fetch_constant;
++    }
++  }
++
+  protected:
+   Translation* CreateTranslationInstance(uint64_t modification) override;
+ 
 diff --git a/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h b/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h
 index dbd6b01..d72a31a 100644
 --- a/sdk/include/rex/graphics/pipeline/shader/spirv_builder.h
@@ -288,6 +331,25 @@ index 9d2a848..2f7d822 100644
    struct ArgsVkResetQueryPool {
      VkQueryPool query_pool;
      uint32_t first_query;
+diff --git a/sdk/include/rex/graphics/vulkan/shader.h b/sdk/include/rex/graphics/vulkan/shader.h
+index 28e87e3..6338729 100644
+--- a/sdk/include/rex/graphics/vulkan/shader.h
++++ b/sdk/include/rex/graphics/vulkan/shader.h
+@@ -27,6 +27,14 @@ class VulkanShader : public SpirvShader {
+     ~VulkanTranslation() override;
+ 
+     VkShaderModule GetOrCreateShaderModule();
++
++    bool RestoreCachedModule(std::vector<uint8_t> binary) {
++      if (is_translated() || binary.empty()) return false;
++      SetCachedBinary(std::move(binary));
++      if (GetOrCreateShaderModule()) return true;
++      ResetCachedBinary();
++      return false;
++    }
+     VkShaderModule shader_module() const { return shader_module_; }
+ 
+    private:
 diff --git a/sdk/include/rex/math.h b/sdk/include/rex/math.h
 index ab7960f..2035d67 100644
 --- a/sdk/include/rex/math.h
@@ -470,7 +532,7 @@ index 9b9cf9e..20b88ea 100644
  
  class KernelState {
 diff --git a/sdk/include/rex/system/xthread.h b/sdk/include/rex/system/xthread.h
-index a72911e..6694899 100644
+index a72911e..82ebd75 100644
 --- a/sdk/include/rex/system/xthread.h
 +++ b/sdk/include/rex/system/xthread.h
 @@ -333,6 +333,7 @@ class XThread : public XObject {
@@ -481,6 +543,18 @@ index a72911e..6694899 100644
    uint32_t last_error();
    void set_last_error(uint32_t error_code);
    void set_name(const std::string_view name);
+@@ -371,6 +372,11 @@ class XThread : public XObject {
+ 
+   bool GetTLSValue(uint32_t slot, uint32_t* value_out);
+   bool SetTLSValue(uint32_t slot, uint32_t value);
++  // PERF pass 50 [SHARED]: KeTlsGetValue/KeTlsSetValue for the calling thread with a per-host-thread
++  // cache of the TLS block's host address (no GetCurrentThread call or heap lookup per call). Same checks and
++  // results as GetCurrentThread()->GetTLSValue/SetTLSValue; false when there is no bound thread.
++  static bool CurrentGetTLSValueFast(uint32_t slot, uint32_t* value_out);
++  static bool CurrentSetTLSValueFast(uint32_t slot, uint32_t value, bool* handled);
+ 
+   uint32_t suspend_count();
+   X_STATUS Resume(uint32_t* out_suspend_count = nullptr);
 diff --git a/sdk/include/rex/ui/gpu_wait_diagnostics.h b/sdk/include/rex/ui/gpu_wait_diagnostics.h
 new file mode 100644
 index 0000000..1afb1fb
@@ -976,10 +1050,10 @@ index d155038..05e8dc8 100644
  }
  
 diff --git a/sdk/src/core/threading_posix.cpp b/sdk/src/core/threading_posix.cpp
-index 425b53b..093732d 100644
+index 425b53b..d2acb63 100644
 --- a/sdk/src/core/threading_posix.cpp
 +++ b/sdk/src/core/threading_posix.cpp
-@@ -75,6 +75,35 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -75,6 +75,68 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
  #define REX_HAS_SIGEV_THREAD_ID 0
  #endif
  
@@ -1012,10 +1086,77 @@ index 425b53b..093732d 100644
 +REXCVAR_DEFINE_UINT32(p2_semaphore_notify_one, 0, "Threading",
 +                      "Semaphore wakes: 0 = notify_all (original), 1 = one waiter per token, 2 = Switch A/B (one in "
 +                      "odd 30 s periods)");
++REXCVAR_DEFINE_BOOL(p2_semaphore_empty_poll_fast, false, "Threading",
++                    "Return timeout for a zero-timeout wait on an empty semaphore before taking its mutex")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++// PERF pass 72 (pass 71: about 2/3 of the critical-path jobs' time is spent in PosixSemaphore::Release waiting
++// for the semaphore mutex): the count is an atomic, Release never takes the mutex, single-object waiters park on
++// a sequence word with svcWaitForAddress. Consumers (Wait, WaitMultiple) still take the token under the mutex,
++// so WaitMultiple keeps its check-and-consume atomicity. Switch only; elsewhere the flag is ignored.
++REXCVAR_DEFINE_BOOL(p2_semaphore_futex, false, "Threading",
++                    "Semaphore release without its mutex: atomic count, waiters park on a Horizon address "
++                    "(svcWaitForAddress)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++#if defined(__SWITCH__)
++// <switch.h> is deliberately not included in this file (see threading_switch.h); libnx declarations.
++extern "C" uint32_t svcWaitForAddress(void* address, uint32_t arb_type, int64_t value, int64_t timeout);
++extern "C" uint32_t svcSignalToAddress(void* address, uint32_t signal_type, int32_t value, int32_t count);
++namespace {
++constexpr uint32_t kP2ArbitrationWaitIfEqual = 2;  // ArbitrationType_WaitIfEqual
++constexpr uint32_t kP2SignalTypeSignal = 0;        // SignalType_Signal
++// Returns when *addr != expected, on a signal, on timeout (ns, -1 = none) or spuriously; callers re-check.
++inline void P2FutexWait(std::atomic<uint32_t>* addr, uint32_t expected, int64_t timeout_ns) {
++  svcWaitForAddress(static_cast<void*>(addr), kP2ArbitrationWaitIfEqual,
++                    static_cast<int64_t>(static_cast<int32_t>(expected)), timeout_ns);
++}
++// Wakes up to count threads parked on addr (-1 = all).
++inline void P2FutexWake(std::atomic<uint32_t>* addr, int32_t count) {
++  svcSignalToAddress(static_cast<void*>(addr), kP2SignalTypeSignal, 0, count);
++}
++}  // namespace
++#endif
++REXCVAR_DEFINE_BOOL(p2_wait_borrow_conditions, false, "Threading",
++                    "Alertable WaitMultiple reuses its local converted condition-pointer vector instead of copying it "
++                    "for each poll (startup A/B)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
  REXCVAR_DEFINE_BOOL(thread_wait_blocking, true, "Threading",
                      "Event-driven waits: WaitMultiple parks on a wake point instead of polling every 1 ms, "
                      "and alertable waits are woken by the queued APC hint instead of a 1 ms poll slice. "
-@@ -400,6 +429,8 @@ class PosixConditionBase {
+@@ -353,8 +415,15 @@ class PosixConditionBase {
+   // Wakes a thread blocked in Wait() on this condition without signalling it (alertable wait interrupted by
+   // a queued callback). The waiter's predicate sees its interrupt flag.
+   void InterruptWaiters() {
+-    std::lock_guard<std::mutex> lock(mutex_);
+-    cond_.notify_all();
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      cond_.notify_all();
++    }
++#if defined(__SWITCH__)
++    if (futex_semaphore_) {
++      FutexInterrupt();
++    }
++#endif
+   }
+ 
+   // `interrupt` (optional): an alertable wait passes the flag "a user callback is queued for me"; the wait
+@@ -366,6 +435,15 @@ class PosixConditionBase {
+       return this->signaled() || (interrupt && interrupt->load(std::memory_order_acquire));
+     };
+ #if defined(__SWITCH__)
++    if (futex_semaphore_) {
++      return FutexWait(timeout, interrupt);
++    }
++    // A published zero is a valid timeout point. Only non-alertable polls
++    // can use it; all token consumption still goes through mutex_.
++    if (!interrupt && timeout == std::chrono::milliseconds::zero() &&
++        empty_semaphore_poll_.load(std::memory_order_acquire)) {
++      return WaitResult::kTimeout;
++    }
+     // The timeout includes acquiring the internal lock. lock() ignored it, and a
+     // zero-timeout query could block behind another thread indefinitely.
+     const auto deadline = timeout == std::chrono::milliseconds::max()
+@@ -400,6 +478,8 @@ class PosixConditionBase {
      if (predicate()) {
        executed = true;
      } else {
@@ -1024,7 +1165,7 @@ index 425b53b..093732d 100644
        if (timeout == std::chrono::milliseconds::max()) {
          cond_.wait(lock, predicate);
          executed = true;  // Did not time out;
-@@ -411,6 +442,7 @@ class PosixConditionBase {
+@@ -411,6 +491,7 @@ class PosixConditionBase {
          executed = cond_.wait_for(lock, timeout, predicate);
  #endif
        }
@@ -1032,10 +1173,46 @@ index 425b53b..093732d 100644
      }
      if (executed) {
        if (interrupt && !signaled()) {
-@@ -608,6 +640,10 @@ class PosixConditionBase {
+@@ -426,7 +507,7 @@ class PosixConditionBase {
+   // `wake` (optional): wake point registered by the caller (and, for alertable calls, with its thread). With
+   // it the call parks instead of sleeping 1 ms between polls: it re-polls when a registered handle is
+   // signalled (poke), when `interrupt` is raised, at the end of the timeout, or after the safety interval.
+-  static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
++  static std::pair<WaitResult, size_t> WaitMultiple(const std::vector<PosixConditionBase*>& handles,
+                                                     bool wait_all,
+                                                     std::chrono::milliseconds timeout,
+                                                     WakePoint* wake = nullptr,
+@@ -445,9 +526,9 @@ class PosixConditionBase {
+ 
+     // Registered for the whole call; the guard unregisters on every exit path.
+     struct MultiRegistration {
+-      std::vector<PosixConditionBase*>& handles;
++      const std::vector<PosixConditionBase*>& handles;
+       WakePoint* wake;
+-      MultiRegistration(std::vector<PosixConditionBase*>& h, WakePoint* w) : handles(h), wake(w) {
++      MultiRegistration(const std::vector<PosixConditionBase*>& h, WakePoint* w) : handles(h), wake(w) {
+         if (wake) {
+           for (auto* handle : handles) handle->RegisterMulti(wake);
+         }
+@@ -606,8 +687,25 @@ class PosixConditionBase {
+  protected:
+   inline virtual bool signaled() const = 0;
    inline virtual void post_execution() = 0;
++#if defined(__SWITCH__)
++  // PERF pass 72: set once in a semaphore constructor with p2_semaphore_futex; never changes afterwards.
++  bool futex_semaphore_ = false;
++  virtual WaitResult FutexWait(std::chrono::milliseconds, const std::atomic<bool>*) {
++    return WaitResult::kFailed;
++  }
++  virtual void FutexInterrupt() {}
++#endif
    std::condition_variable cond_;
    std::mutex mutex_;
++#if defined(__SWITCH__)
++  // Only an opted-in semaphore publishes this under mutex_. Other handles
++  // keep the initial false value and use the existing wait path.
++  std::atomic<bool> empty_semaphore_poll_{false};
++#endif
 +  // PERF pass 30: threads inside Wait() between a failed predicate and their return; guarded by mutex_.
 +  uint32_t cond_waiters_ = 0;
 +  // With mutex_ held, in the critical section that changed the state: may anyone be waiting on cond_?
@@ -1043,7 +1220,7 @@ index 425b53b..093732d 100644
  
   private:
    std::mutex multi_mutex_;
-@@ -630,13 +666,15 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -630,13 +728,15 @@ class PosixCondition<Event> : public PosixConditionBase {
    virtual ~PosixCondition() = default;
  
    bool Signal() override {
@@ -1060,21 +1237,49 @@ index 425b53b..093732d 100644
      NotifyMulti();
      return true;
    }
-@@ -661,7 +699,9 @@ template <>
+@@ -661,11 +761,30 @@ template <>
  class PosixCondition<Semaphore> : public PosixConditionBase {
   public:
    PosixCondition(uint32_t initial_count, uint32_t maximum_count)
 -      : count_(initial_count), maximum_count_(maximum_count) {}
 +      : count_(initial_count), maximum_count_(maximum_count),
 +        skip_empty_wake_(REXCVAR_GET(p2_semaphore_skip_empty_wake)),
-+        notify_one_(REXCVAR_GET(p2_semaphore_notify_one)) {}
++        notify_one_(REXCVAR_GET(p2_semaphore_notify_one)) {
++#if defined(__SWITCH__)
++    if (REXCVAR_GET(p2_semaphore_futex) &&
++        maximum_count_ <= static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
++      futex_semaphore_ = true;
++      fcount_.store(static_cast<int32_t>(count_), std::memory_order_relaxed);
++      return;  // empty_semaphore_poll_ stays false: the futex path reads the count itself.
++    }
++    if (empty_poll_fast_ && count_ == 0) {
++      empty_semaphore_poll_.store(true, std::memory_order_relaxed);
++    }
++#endif
++  }
  
    bool Signal() override { return Release(1, nullptr); }
  
-@@ -674,8 +714,14 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+   bool Release(uint32_t release_count, int* out_previous_count) {
++#if defined(__SWITCH__)
++    if (futex_semaphore_) {
++      return FutexRelease(release_count, out_previous_count);
++    }
++#endif
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+     if (release_count > maximum_count_ - count_) {
+       return false;
+@@ -674,20 +793,187 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
        *out_previous_count = count_;
      }
      count_ += release_count;
++#if defined(__SWITCH__)
++    // On a 0 -> positive transition, publish the new state before unlocking
++    // or waking anyone. Other positive counts already have a false snapshot.
++    if (empty_poll_fast_ && count_ == release_count) {
++      empty_semaphore_poll_.store(false, std::memory_order_release);
++    }
++#endif
 +    const bool notify = may_have_cond_waiters();
      lock.unlock();
 -    cond_.notify_all();
@@ -1087,11 +1292,32 @@ index 425b53b..093732d 100644
      NotifyMulti();
      return true;
    }
-@@ -684,10 +730,42 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
-   inline bool signaled() const override { return count_ > 0; }
+ 
+  private:
+-  inline bool signaled() const override { return count_ > 0; }
++  inline bool signaled() const override {
++#if defined(__SWITCH__)
++    if (futex_semaphore_) {
++      return fcount_.load(std::memory_order_acquire) > 0;
++    }
++#endif
++    return count_ > 0;
++  }
    inline void post_execution() override {
++#if defined(__SWITCH__)
++    // Every consumer holds mutex_ and has just seen signaled(); Release only adds, so this cannot go below 0.
++    if (futex_semaphore_) {
++      fcount_.fetch_sub(1, std::memory_order_acq_rel);
++      return;
++    }
++#endif
      count_--;
 -    cond_.notify_all();
++#if defined(__SWITCH__)
++    if (empty_poll_fast_ && count_ == 0) {
++      empty_semaphore_poll_.store(true, std::memory_order_release);
++    }
++#endif
 +    // Waiters test count_ > 0 under this same mutex. Consuming the final
 +    // token cannot satisfy another wait. Release and APC keep their wakes.
 +    // Runs with mutex_ held (Wait and WaitMultiple).
@@ -1101,7 +1327,7 @@ index 425b53b..093732d 100644
 +    } else if (count_ || !SkipEmptyWake()) {
 +      cond_.notify_all();
 +    }
-+  }
+   }
 +  bool NotifyOne() const {
 +#if defined(__SWITCH__)
 +    if (notify_one_ == 2) {
@@ -1123,15 +1349,118 @@ index 425b53b..093732d 100644
 +    }
 +#endif
 +    return skip_empty_wake_ == 1;
-   }
++  }
++#if defined(__SWITCH__)
++  bool FutexRelease(uint32_t release_count, int* out_previous_count) {
++    int32_t c = fcount_.load(std::memory_order_relaxed);
++    do {
++      if (release_count > maximum_count_ - static_cast<uint32_t>(c)) {
++        return false;
++      }
++    } while (!fcount_.compare_exchange_weak(c, c + static_cast<int32_t>(release_count),
++                                            std::memory_order_seq_cst, std::memory_order_relaxed));
++    if (out_previous_count) {
++      *out_previous_count = c;
++    }
++    // Dekker with FutexWait: count, then sequence, then the waiter count (all seq_cst). A waiter that
++    // registers after this load re-reads the count and sees the tokens.
++    fseq_.fetch_add(1, std::memory_order_seq_cst);
++    const uint32_t waiters = fwaiters_.load(std::memory_order_seq_cst);
++    if (waiters) {
++      P2FutexWake(&fseq_, static_cast<int32_t>(std::min(release_count, waiters)));
++    }
++    NotifyMulti();
++    return true;
++  }
++  // 1 = token taken, 0 = no token, -1 = the mutex could not be taken before the deadline.
++  int FutexTryConsume(std::chrono::steady_clock::time_point deadline) {
++    std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
++    if (deadline == std::chrono::steady_clock::time_point::max()) {
++      lock.lock();
++    } else {
++      while (!lock.try_lock()) {
++        const auto now = std::chrono::steady_clock::now();
++        if (now >= deadline) {
++          return -1;
++        }
++        const auto remaining = std::chrono::ceil<std::chrono::microseconds>(deadline - now);
++        std::this_thread::sleep_for(std::min(remaining, std::chrono::microseconds(100)));
++      }
++    }
++    int32_t c = fcount_.load(std::memory_order_acquire);
++    while (c > 0) {
++      if (fcount_.compare_exchange_weak(c, c - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
++        return 1;
++      }
++    }
++    return 0;
++  }
++  WaitResult FutexWait(std::chrono::milliseconds timeout, const std::atomic<bool>* interrupt) override {
++    const auto deadline = timeout == std::chrono::milliseconds::max()
++                              ? std::chrono::steady_clock::time_point::max()
++                              : std::chrono::steady_clock::now() + timeout;
++    bool registered = false;
++    auto leave = [&](WaitResult result) {
++      if (registered) {
++        fwaiters_.fetch_sub(1, std::memory_order_seq_cst);
++      }
++      return result;
++    };
++    while (true) {
++      const uint32_t seen = fseq_.load(std::memory_order_seq_cst);
++      // A token wins over an interrupt or a timeout, as in the mutex path.
++      if (fcount_.load(std::memory_order_seq_cst) > 0) {
++        const int taken = FutexTryConsume(deadline);
++        if (taken > 0) {
++          return leave(WaitResult::kSuccess);
++        }
++        if (taken < 0) {
++          return leave(WaitResult::kTimeout);
++        }
++        continue;  // another consumer took it; re-read the sequence first
++      }
++      if (interrupt && interrupt->load(std::memory_order_acquire)) {
++        return leave(WaitResult::kTimeout);
++      }
++      int64_t timeout_ns = -1;
++      if (deadline != std::chrono::steady_clock::time_point::max()) {
++        const auto now = std::chrono::steady_clock::now();
++        if (now >= deadline) {
++          return leave(WaitResult::kTimeout);
++        }
++        timeout_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
++      }
++      if (!registered) {
++        fwaiters_.fetch_add(1, std::memory_order_seq_cst);
++        registered = true;
++        continue;  // re-check count/sequence after becoming visible to Release
++      }
++      P2FutexWait(&fseq_, seen, timeout_ns);
++    }
++  }
++  void FutexInterrupt() override {
++    fseq_.fetch_add(1, std::memory_order_seq_cst);
++    if (fwaiters_.load(std::memory_order_seq_cst)) {
++      P2FutexWake(&fseq_, -1);
++    }
++  }
++#endif
    uint32_t count_;
    const uint32_t maximum_count_;
 +  const uint32_t skip_empty_wake_;
 +  const uint32_t notify_one_;
++#if defined(__SWITCH__)
++  const bool empty_poll_fast_ = REXCVAR_GET(p2_semaphore_empty_poll_fast);
++  // PERF pass 72 futex state (used only with futex_semaphore_): token count, wake sequence (the parked
++  // address) and threads registered in FutexWait.
++  std::atomic<int32_t> fcount_{0};
++  std::atomic<uint32_t> fseq_{0};
++  std::atomic<uint32_t> fwaiters_{0};
++#endif
  };
  
  template <>
-@@ -705,14 +783,18 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+@@ -705,14 +991,18 @@ class PosixCondition<Mutant> : public PosixConditionBase {
    bool Release() {
      if (owner_ == std::this_thread::get_id() && count_ > 0) {
        bool released = false;
@@ -1151,7 +1480,7 @@ index 425b53b..093732d 100644
          NotifyMulti();
        }
        return true;
-@@ -743,11 +825,13 @@ class PosixCondition<Timer> : public PosixConditionBase {
+@@ -743,11 +1033,13 @@ class PosixCondition<Timer> : public PosixConditionBase {
    virtual ~PosixCondition() { Cancel(); }
  
    bool Signal() override {
@@ -1166,7 +1495,7 @@ index 425b53b..093732d 100644
      NotifyMulti();
      return true;
    }
-@@ -849,7 +933,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -849,7 +1141,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
      pthread_attr_t attr;
      if (pthread_attr_init(&attr) != 0)
        return false;
@@ -1178,7 +1507,7 @@ index 425b53b..093732d 100644
        pthread_attr_destroy(&attr);
        return false;
      }
-@@ -865,7 +952,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -865,7 +1160,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
          return false;
        }
      }
@@ -1189,6 +1518,35 @@ index 425b53b..093732d 100644
 +                   create_result, params.stack_size, params.initial_priority);
        pthread_attr_destroy(&attr);
        return false;
+     }
+@@ -1543,9 +1841,10 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
+   WakePoint wake_point;
+   WakePoint* wake = blocking && conditions.size() > 1 ? &wake_point : nullptr;
+   if (!is_alertable) {
+-    return PosixConditionBase::WaitMultiple(std::move(conditions), wait_all, timeout, wake, nullptr);
++    return PosixConditionBase::WaitMultiple(conditions, wait_all, timeout, wake, nullptr);
+   }
+ 
++  const bool borrow_conditions = REXCVAR_GET(p2_wait_borrow_conditions);
+   ScopedAlertableState alertable_state_guard(true);
+   auto deadline = ComputeAlertableDeadline(timeout);
+   // A single handle parks in Wait() itself; several park on the wake point.
+@@ -1555,9 +1854,13 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
+     if (DispatchCurrentThreadUserCallback()) {
+       return std::make_pair(WaitResult::kUserCallback, 0);
+     }
+-    auto result = PosixConditionBase::WaitMultiple(std::vector<PosixConditionBase*>(conditions),
+-                                                   wait_all, ComputeAlertableWaitTimeout(deadline),
+-                                                   wake, interrupt);
++    auto result = borrow_conditions
++                      ? PosixConditionBase::WaitMultiple(conditions, wait_all,
++                                                         ComputeAlertableWaitTimeout(deadline), wake,
++                                                         interrupt)
++                      : PosixConditionBase::WaitMultiple(
++                            std::vector<PosixConditionBase*>(conditions), wait_all,
++                            ComputeAlertableWaitTimeout(deadline), wake, interrupt);
+     if (result.first != WaitResult::kTimeout) {
+       return result;
      }
 diff --git a/sdk/src/core/threading_switch.cpp b/sdk/src/core/threading_switch.cpp
 index d083c32..0bc4a8f 100644
@@ -74394,11 +74752,65 @@ index 670c446..e1f424b 100644
    KeBugCheckEx_entry(code, 0, 0, 0, 0);
  }
  
+diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+index 8684eda..8c28509 100644
+--- a/sdk/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
++++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+@@ -15,6 +15,7 @@
+ #include <cstring>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -23,6 +24,10 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xtypes.h>
+ 
++REXCVAR_DEFINE_UINT32(p2_mm_available_reserve_mb, 0, "Prototype2",
++    "B-013: MmQueryStatistics reports this many MiB less available title memory (0 = original); restart required")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
+@@ -488,6 +493,7 @@ struct X_MM_QUERY_STATISTICS_RESULT {
+ };
+ static_assert_size(X_MM_QUERY_STATISTICS_RESULT, 104);
+ 
++
+ u32 MmQueryStatistics_entry(ppc_ptr_t<X_MM_QUERY_STATISTICS_RESULT> stats_ptr) {
+   if (!stats_ptr) {
+     return X_STATUS_INVALID_PARAMETER;
+@@ -528,6 +534,14 @@ u32 MmQueryStatistics_entry(ppc_ptr_t<X_MM_QUERY_STATISTICS_RESULT> stats_ptr) {
+ 
+   stats_ptr->title.available_pages =
+       stats_ptr->total_physical_pages - stats_ptr->kernel_pages - used_pages;
++  // [SHARED] Prototype 2 B-013: the game sizes its main heap as "available - fixed reserve",
++  // so every later physical allocation (streaming arenas) lives in that reserve. Reporting less
++  // leaves the difference for them. 0 = original value.
++  {
++    const uint32_t reserve_pages = REXCVAR_GET(p2_mm_available_reserve_mb) * 256u;
++    const uint32_t available = stats_ptr->title.available_pages;
++    stats_ptr->title.available_pages = available > reserve_pages ? available - reserve_pages : 0u;
++  }
+   stats_ptr->title.total_virtual_memory_bytes = 0x2FFE0000;
+   stats_ptr->title.reserved_virtual_memory_bytes = reserved_pages_bytes;
+   stats_ptr->title.physical_pages = 0x00001000;  // TODO(gibbed): FIXME
 diff --git a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
-index 57fd161..388d851 100644
+index 57fd161..4c3787d 100644
 --- a/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 +++ b/sdk/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
-@@ -112,6 +112,13 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
+@@ -19,6 +19,7 @@
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/kernel/xboxkrnl/threading.h>
+@@ -112,6 +113,13 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
        "ExCreateThread", "stack={:#x} xapi_startup={:#x} start={:#x} context={:#x} flags={:#x}",
        (uint32_t)stack_size, (uint32_t)xapi_thread_startup, start_address.guest_address(),
        start_context.guest_address(), (uint32_t)creation_flags);
@@ -74412,7 +74824,7 @@ index 57fd161..388d851 100644
    // http://jafile.com/uploads/scoop/main.cpp.txt
    // DWORD
    // LPHANDLE Handle,
-@@ -283,6 +290,13 @@ u32 KeSetAffinityThread_entry(mapped_void thread_ptr, u32 affinity,
+@@ -283,6 +291,13 @@ u32 KeSetAffinityThread_entry(mapped_void thread_ptr, u32 affinity,
                                mapped_u32 previous_affinity_ptr) {
    REXKRNL_IMPORT_TRACE("KeSetAffinityThread", "thread={:#x} affinity={:#x}",
                         thread_ptr.guest_address(), (uint32_t)affinity);
@@ -74426,7 +74838,7 @@ index 57fd161..388d851 100644
    // The Xbox 360, according to disassembly of KeSetAffinityThread, unlike
    // Windows NT, stores the previous affinity via the pointer provided as an
    // argument, not in the return value - the return value is used for the
-@@ -320,6 +334,13 @@ u32 KeQueryBasePriorityThread_entry(mapped_void thread_ptr) {
+@@ -320,6 +335,13 @@ u32 KeQueryBasePriorityThread_entry(mapped_void thread_ptr) {
  u32 KeSetBasePriorityThread_entry(mapped_void thread_ptr, u32 increment) {
    REXKRNL_IMPORT_TRACE("KeSetBasePriorityThread", "thread={:#x} increment={}",
                         thread_ptr.guest_address(), (int32_t)increment);
@@ -74440,6 +74852,45 @@ index 57fd161..388d851 100644
    int32_t prev_priority = 0;
    auto thread = XObject::GetNativeObject<XThread>(REX_KERNEL_STATE(), thread_ptr);
  
+@@ -424,11 +446,19 @@ u32 KeTlsFree_entry(u32 tls_index) {
+   return 1;
+ }
+ 
++// PERF pass 50 [SHARED]: per-host-thread cache of the TLS block for the two calls the game's job workers
++// make constantly (profile pass 47: 2-2.5 % of the workers). Same checks and values.
++REXCVAR_DEFINE_BOOL(kernel_tls_fast_path, false, "Kernel",
++                    "KeTlsGetValue/KeTlsSetValue through a per-thread cache of the TLS block's address");
+ // https://msdn.microsoft.com/en-us/library/ms686812
+ u32 KeTlsGetValue_entry(u32 tls_index) {
+   // xboxkrnl doesn't actually have an error branch - it always succeeds, even
+   // if it overflows the TLS.
+   uint32_t value = 0;
++  if (REXCVAR_GET(kernel_tls_fast_path) &&
++      XThread::CurrentGetTLSValueFast(uint32_t(tls_index), &value)) {
++    return value;
++  }
+   if (XThread::GetCurrentThread()->GetTLSValue(tls_index, &value)) {
+     return value;
+   }
+@@ -442,6 +472,18 @@ u32 KeTlsSetValue_entry(u32 tls_index, u32 tls_value) {
+                        (uint32_t)tls_value);
+   // xboxkrnl doesn't actually have an error branch - it always succeeds, even
+   // if it overflows the TLS.
++  if (REXCVAR_GET(kernel_tls_fast_path)) {
++    bool handled = false;
++    const bool ok = XThread::CurrentSetTLSValueFast(uint32_t(tls_index), uint32_t(tls_value), &handled);
++    if (handled) {
++      if (ok) {
++        REXKRNL_IMPORT_RESULT("KeTlsSetValue", "1");
++        return 1;
++      }
++      REXKRNL_IMPORT_RESULT("KeTlsSetValue", "0");
++      return 0;
++    }
++  }
+   if (XThread::GetCurrentThread()->SetTLSValue(tls_index, tls_value)) {
+     REXKRNL_IMPORT_RESULT("KeTlsSetValue", "1");
+     return 1;
 diff --git a/sdk/src/system/function_dispatcher.cpp b/sdk/src/system/function_dispatcher.cpp
 index bd43109..0930dad 100644
 --- a/sdk/src/system/function_dispatcher.cpp
@@ -74709,7 +75160,7 @@ index db830e4..a931b69 100644
    if (out_previous_count) {
      *out_previous_count = previous_count;
 diff --git a/sdk/src/system/xthread.cpp b/sdk/src/system/xthread.cpp
-index c2903c0..da7f3e5 100644
+index c2903c0..c4f4477 100644
 --- a/sdk/src/system/xthread.cpp
 +++ b/sdk/src/system/xthread.cpp
 @@ -49,6 +49,44 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
@@ -74832,7 +75283,62 @@ index c2903c0..da7f3e5 100644
    if (rex::thread::logical_processor_count() >= 6) {
      if (!REXCVAR_GET(ignore_thread_affinities)) {
        thread_->set_affinity_mask(uint64_t(1) << cpu_index);
-@@ -1072,8 +1151,10 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+@@ -960,6 +1039,54 @@ bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
+   return true;
+ }
+ 
++namespace {
++struct TlsFastCache {
++  XThread* thread = nullptr;
++  uint32_t dynamic_address = 0;
++  uint32_t total_size = 0;
++  uint8_t* host = nullptr;
++};
++thread_local TlsFastCache tls_fast_cache_;
++}  // namespace
++
++bool XThread::CurrentGetTLSValueFast(uint32_t slot, uint32_t* value_out) {
++  XThread* t = current_xthread_tls_;
++  if (!t) return false;
++  TlsFastCache& c = tls_fast_cache_;
++  if (c.thread != t || c.dynamic_address != t->tls_dynamic_address_ || c.total_size != t->tls_total_size_) {
++    c.thread = t;
++    c.dynamic_address = t->tls_dynamic_address_;
++    c.total_size = t->tls_total_size_;
++    c.host = t->memory()->TranslateVirtual(t->tls_dynamic_address_);
++  }
++  if (slot * 4 > c.total_size) {
++    *value_out = 0;
++    return true;  // GetTLSValue's failure: the caller returns 0
++  }
++  // The TLS block is one contiguous guest allocation, so its host mapping is contiguous too.
++  *value_out = memory::load_and_swap<uint32_t>(c.host + slot * 4);
++  return true;
++}
++
++bool XThread::CurrentSetTLSValueFast(uint32_t slot, uint32_t value, bool* handled) {
++  XThread* t = current_xthread_tls_;
++  if (!t) {
++    *handled = false;
++    return false;
++  }
++  *handled = true;
++  TlsFastCache& c = tls_fast_cache_;
++  if (c.thread != t || c.dynamic_address != t->tls_dynamic_address_ || c.total_size != t->tls_total_size_) {
++    c.thread = t;
++    c.dynamic_address = t->tls_dynamic_address_;
++    c.total_size = t->tls_total_size_;
++    c.host = t->memory()->TranslateVirtual(t->tls_dynamic_address_);
++  }
++  if (slot * 4 >= c.total_size) return false;
++  memory::store_and_swap<uint32_t>(c.host + slot * 4, value);
++  return true;
++}
++
+ bool XThread::SetTLSValue(uint32_t slot, uint32_t value) {
+   if (slot * 4 >= tls_total_size_) {
+     return false;
+@@ -1072,8 +1199,10 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
      }
    } else {
      if (timeout_ms == 0) {
